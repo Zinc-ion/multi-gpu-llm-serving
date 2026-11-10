@@ -1,6 +1,6 @@
 from enum import Enum, auto
 import math
-from itertools import count 
+from itertools import count
 from myvllm.sampling_parameters import SamplingParams
 from copy import copy
 
@@ -9,13 +9,19 @@ class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
+    CANCELLED = auto()
 
 
 class Sequence:
     counter = count()
 
-    def __init__(self, token_ids: list[int], block_size: int, sampling_params = SamplingParams()):
-        self.block_size = block_size # number of tokens per block
+    def __init__(
+        self,
+        token_ids: list[int],
+        block_size: int,
+        sampling_params: SamplingParams | None = None,
+    ):
+        self.block_size = block_size  # number of tokens per block
         # record sequence id
         self.seq_id = next(Sequence.counter)
         # status
@@ -32,6 +38,7 @@ class Sequence:
         # block_table
         self.block_table = []
         # sampling_params' related things
+        sampling_params = sampling_params or SamplingParams()
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -45,7 +52,10 @@ class Sequence:
 
     @property
     def is_finished(self):
-        return self.status == SequenceStatus.FINISHED
+        return self.status in (
+            SequenceStatus.FINISHED,
+            SequenceStatus.CANCELLED,
+        )
 
     @property
     def num_completion_tokens(self):
@@ -53,11 +63,11 @@ class Sequence:
 
     @property
     def prompt_token_ids(self):
-        return self.token_ids[:self.num_prompt_tokens]
+        return self.token_ids[: self.num_prompt_tokens]
 
     @property
     def completion_token_ids(self):
-        return self.token_ids[self.num_prompt_tokens:]
+        return self.token_ids[self.num_prompt_tokens :]
 
     @property
     def num_cached_blocks(self):
@@ -74,24 +84,24 @@ class Sequence:
     def block(self, i):
         assert 0 <= i < self.num_blocks, f"Block index {i} out of range [0, {self.num_blocks})"
         if i == self.num_blocks - 1:
-            return self.token_ids[-self.last_block_num_tokens:]
+            return self.token_ids[-self.last_block_num_tokens :]
         else:
             start_idx = i * self.block_size
             end_idx = start_idx + self.block_size
-            return self.token_ids[start_idx : end_idx]
+            return self.token_ids[start_idx:end_idx]
 
     def append_token(self, token_id):
         self.token_ids.append(token_id)
         self.last_token = token_id
-        self.num_tokens += 1 
+        self.num_tokens += 1
 
     def __getstate__(self):
         return (
-            self.num_tokens, 
-            self.num_prompt_tokens, 
-            self.num_cached_tokens, 
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
             self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
         )
 
     def __setstate__(self, state):
@@ -100,7 +110,7 @@ class Sequence:
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.block_table,
-            last_token_or_ids
+            last_token_or_ids,
         ) = state
         # Check if this is prefill (num_completion_tokens == 0) or decode phase
         num_completion_tokens = self.num_tokens - self.num_prompt_tokens

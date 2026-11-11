@@ -6,7 +6,7 @@
 
 - 这是基于开源轻量推理框架 MinivLLM 二次开发的学习型项目，用户需要逐行阅读和审查每个 diff。
 - 上游基线 commit：`00db3b4`。上游代码保留 Apache-2.0 许可证与版权信息。
-- 需求和阶段：`docs/llm_serving_project_requirements_zh.md`（M0–M7 模块、实施顺序、简历事实边界）。
+- 需求和阶段：`docs/llm_serving_project_requirements_zh.md`（项目主线、对比方案与评测口径、M0–M9 模块、实施顺序、简历事实边界）。
 - 当前基线说明：`docs/m0_m1_baseline_zh.md`（复现命令、M1 不变量、已知问题）。
 - 硬件：`docs/server_hardware_2026-11-09.md`。
 
@@ -81,5 +81,5 @@
 
 ## 7. 当前已知状态（随阶段更新）
 
-- 当前配置默认 `enforce_eager=true`，CUDA Graph 路径存在上游遗留的形状问题，见 `docs/m0_m1_baseline_zh.md`，计划在 M6 前修复。
+- 当前配置默认 `enforce_eager=true`，CUDA Graph 路径存在上游遗留的形状问题，见 `docs/m0_m1_baseline_zh.md`，计划在 M3 修复。
 - 当前 prefill kernel 不读取 block table，跨请求 prefix 复用保持禁用。在实现 paged prefill 和 RoPE 位置偏移之前，不要重新启用。

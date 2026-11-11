@@ -77,9 +77,9 @@ Scheduler 的请求状态必须满足：
 
 ## 当前范围
 
-M0/M1 只建立可复现基线和调度/KV 生命周期正确性。当前 prefill kernel 仍不消费 prefix-cache block table，因此活动请求之间不会共享 prefix block；哈希表只用于生命周期记录，并在释放时清理。Qwen3.8-27B、TP=2/4、2P+2D、FP8 和端到端优化属于后续 M2-M6，不应在当前阶段写成已完成能力。
+M0/M1 只建立可复现基线和调度/KV 生命周期正确性。当前 prefill kernel 仍不消费 prefix-cache block table，因此活动请求之间不会共享 prefix block；哈希表只用于生命周期记录，并在释放时清理。Qwen3-14B、TP=2、2P+2D、FP8 KV cache 和端到端优化属于后续 M2-M9，不应在当前阶段写成已完成能力。
 
-当前配置默认 `enforce_eager=true`。CUDA Graph 路径仍有上游遗留问题：capture 阶段 `outputs` 的形状为 `(max_bs, vocab_size)`，但 `self.model()` 返回宽度为 `hidden_size` 的 hidden states，赋值形状不匹配。因此本基线的 `enforce_eager=false` 路径不可用，留到 M6 profiling/优化前修复；当前没有执行 GPU 验证。
+当前配置默认 `enforce_eager=true`。CUDA Graph 路径仍有上游遗留问题：capture 阶段 `outputs` 的形状为 `(max_bs, vocab_size)`，但 `self.model()` 返回宽度为 `hidden_size` 的 hidden states，赋值形状不匹配。因此本基线的 `enforce_eager=false` 路径不可用，留到 M3 修复；当前没有执行 GPU 验证。
 
 ## 人工学习/审核清单
 

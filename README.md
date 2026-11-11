@@ -27,6 +27,9 @@ uv sync
 # Run the main inference engine
 uv run python main.py
 
+# Select an explicit config (this is also the default)
+uv run python main.py --config configs/qwen3_0_6b.json
+
 # Run prefilling benchmark
 uv run python benchmark_prefilling.py
 
@@ -34,7 +37,9 @@ uv run python benchmark_prefilling.py
 uv run python benchmark_decoding.py
 ```
 
-To run multi-GPU setting, simply change world_size to n > 1 in config in main.py
+To select a different model or parallel size, edit a JSON config under `configs/`
+and pass it with `--config`. Multi-GPU correctness is tracked separately from the
+single-GPU M0/M1 baseline.
 
 ## What Each Script Does
 
@@ -45,11 +50,11 @@ uv run python main.py
 This is the main inference engine demo
 
 Demonstrates the complete LLM inference pipeline using a custom engine implementation:
-- Create a small version of Qwen3 with random initialization
-- Creates 60 chat prompts (2 base prompts repeated 30 times each)
+- Load the pinned Qwen3-0.6B checkpoint from `configs/qwen3_0_6b.json`
+- Use the fixed prompts, sampling parameters, and random seed from the config
 - Processes them through the custom LLM engine with batch processing
 - Uses paged attention and KV cache management for efficient inference
-- Generates up to 256 tokens per prompt with temperature sampling
+- Applies the configured completion and total-length limits with temperature sampling
 
 This showcases how the custom vLLM implementation handles batched text generation with memory-efficient attention.
 

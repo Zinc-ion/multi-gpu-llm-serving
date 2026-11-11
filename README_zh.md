@@ -27,6 +27,9 @@ uv sync
 # 运行推理引擎
 uv run python main.py
 
+# 显式指定配置（默认即为此配置）
+uv run python main.py --config configs/qwen3_0_6b.json
+
 # prefilling 基准测试
 uv run python benchmark_prefilling.py
 
@@ -42,11 +45,11 @@ uv run python main.py
 主推理引擎演示入口
 
 演示了使用自定义引擎实现的完整 LLM 推理流程：
-- 基于 Qwen3-0.6B，采用随机初始化
-- 创建60个聊天 prompt（2个基础 prompt 各重复30次）
+- 从 `configs/qwen3_0_6b.json` 加载固定 revision 的 Qwen3-0.6B 检查点
+- 使用配置中的固定 prompt、采样参数和随机种子
 - 通过自定义 LLM 引擎使用批处理处理 prompt
 - 使用 Pageattention 和 KV cache 管理来提高推理效率
-- 每个 prompt 生成最多256个 tokens，采用温度采样
+- 按配置的 completion 与总长度上限进行温度采样
 
 展示了自定义vLLM实现如何处理带有内存高效注意力的批量文本生成。
 

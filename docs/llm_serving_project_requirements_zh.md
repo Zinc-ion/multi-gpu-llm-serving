@@ -96,20 +96,41 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 - 是否写入简历按数据决定。绝对性能差距较大时，如实说明差距来源（kernel、Python 开销等），并强调优化收益是相对自身基线、同口径测得的。
 - 是否把优化移植到 vLLM，判断标准是优化机制是否与框架本身的快慢无关，而不是差距大小。见 M9。
 
+### 测量工具
+
+- 自研框架提供 OpenAI 兼容的流式 HTTP 服务（见 M2），自研框架和 vLLM 用**同一个客户端**测量，口径天然一致。
+- 性能：`vllm bench serve`。它支持泊松/gamma 到达、并发上限、按时间戳回放 trace，并内置按 DistServe 定义计算 goodput 的 `--goodput` 参数。
+- 质量：evalscope，通过 OpenAI API 接入。
+- `vllm bench serve` 看不到框架内部的指标（如 KV 传输时间），这类指标由框架自己记录到日志，按请求 ID 与客户端结果对齐。
+
 ### 指标
 
 - **核心指标：单卡 goodput**，即 SLO 达标率不低于 90% 时，每张 GPU 能承载的最大请求速率（DistServe 口径）。
 - SLO 达标率：同时满足 TTFT 和 TPOT 目标的请求比例。
-- TTFT、TPOT、ITL 的 P50/P95/P99，输出 token/s，请求吞吐。
-- PD 专项：KV 传输大小、不可隐藏的传输时间、有效带宽占 PCIe 理论值的比例、第二个 token 延迟。
+- 与 `vllm bench serve` 的输出对齐：请求吞吐、输出 token/s、总 token/s，以及 TTFT、TPOT、ITL、E2EL 的均值和 P50/P90/P99（`--percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99`）。对外展示时按需选取。
+- PD 专项（框架内部记录）：KV 传输大小、不可隐藏的传输时间、有效带宽占 PCIe 理论值的比例、第二个 token 延迟。
 - 峰值显存、失败率、状态泄漏。
 - SLO 的具体数值在 M2 测出 B0 的单请求延迟后确定，并在之后的所有实验中固定。
 
-### 负载
+### 测试层次与数据
 
-- 对话类：ShareGPT，短输入，主要体现 PD 干扰。
-- 长输入类：LongBench 摘要等，主要体现传输瓶颈。
-- 数据集没有时间戳，到达过程用固定随机种子的泊松分布；保存到达计划，支持回放。
+| 层次 | 要回答的问题 | 数据 | 发压方式 | 对应模块 |
+|---|---|---|---|---|
+| L1 受控实验 | KV 传输开销随 prompt 长度怎么变；TTFT 由哪几段组成 | 合成数据：`--dataset-name random`，输入长度扫 1K/4K/16K，输出长度固定，加 `--ignore-eos` | 单请求或固定并发 | M2、M5、M6 |
+| L2 SLO / goodput（简历主要数字） | SLO 约束下每张卡能承载多少请求 | ShareGPT（对话，短输入，体现 PD 干扰）；LongBench（长输入，体现传输瓶颈） | `--request-rate` 扫速率，泊松到达，固定 `--seed`，`--goodput` 设 SLO | M3、M5–M8 |
+| L3 负载变化 | 负载随时间变化时，弹性 P/D 是否有效 | 公开 trace（Azure LLM 推理 trace、Mooncake trace，格式需核实），或合成“对话为主”与“长输入为主”交替的分阶段负载 | 按时间戳回放（`timed_trace`） | M8 必需 |
+| 吞吐模式 | 优化是否损失吞吐 | 合成数据，固定 `[输入, 输出, 并发, 请求数]` 用例 | 不限速率加固定并发 | 补充 |
+
+- 静态泊松负载测不出弹性调度的价值：固定 P/D 配比只有在负载类型变化时才会一侧闲置，所以 M8 必须有 L3。
+- 吞吐模式只作补充。它衡量的是吞吐，而 PD 分离的收益在延迟和 SLO 上，不能作为主线指标。
+- 用例的并发和长度必须先按显存容量测算（见 M2），不能照搬其他场景的配置。
+- 每次实验保存数据集版本、采样后的请求列表和到达计划，支持原样回放。
+
+### 质量与正确性
+
+- **无损改动**（PD 传输、逐层流水、TP、CUDA Graph）：greedy 解码下 token 序列与改动前完全一致，logits 误差不超过预先固定的阈值。不需要任务数据集。
+- **有损改动**（M7 FP8 KV cache）：用 evalscope 测任务精度，至少包括一个推理类数据集（如 math_500 或 GSM8K）和一个长上下文类数据集（LongBench 子集或大海捞针测试）。FP8 KV 的误差会随上下文变长而累积，只测短题看不出问题。
+- 采样设置：正确性对比用 greedy；质量评测按数据集推荐设置，并在实验记录中固定。
 
 ### 实验纪律
 
@@ -132,9 +153,11 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 ### M2：Qwen3-14B 路径与测量底座
 
 - 增加 Qwen3-14B 配置并跑通单卡推理，与 Transformers 参考实现对比 greedy 输出和 logits 误差。
-- 建立压测工具：泊松到达、请求回放，统计第 5 节的全部指标。
+- **OpenAI 兼容流式服务**：实现 `/v1/completions` 和 `/v1/chat/completions`，支持流式返回，使 `vllm bench serve` 和 evalscope 能直接测量本框架。TTFT/ITL 依赖流式返回的 chunk 计时，接入后用单请求实测确认计时口径与 vLLM 一致。当前框架只有离线 `generate()`，服务层需要把同步 step 循环改为可持续接收请求的引擎循环。
+- **容量测算与配置**：按单卡显存、权重大小和每 token KV 大小算出可容纳的 token 数，据此设计 L1/L2 用例的长度和并发。以 Qwen3-14B 粗估：单卡约剩 13 GiB 给 KV，BF16 约 160 KiB/token，约 8.5 万 token；4K+1K 请求约 17 并发，16K+1K 约 5 并发（以实测为准）。同时调大当前的 `max_model_length=128` 和 `max_num_batched_tokens=1024`；在 M3 实现 chunked prefill 之前，Scheduler 要求 `max_model_length ≤ max_num_batched_tokens`。
 - 按阶段记录耗时：schedule、prepare、H2D、forward、sampling、D2H、postprocess，以及后续的状态传输。
 - PCIe 微基准：分别测 D2H、H2D、双向同时、同 NUMA 与跨 NUMA，以及 NCCL send/recv 在无 P2P 下的实际带宽。
+- 准备 L1/L2 的数据集和请求列表，固定数据集版本和随机种子。
 - 产出 B0 的完整数据，并据此确定 SLO。
 
 ### M3：强基线（paged prefill、chunked prefill、CUDA Graph）
@@ -173,14 +196,14 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 
 - KV cache 以 FP8 存储，attention kernel 读取时反量化；PD 传输直接传 FP8，传输量减半。
 - 4090（Ada 架构）原生支持 FP8，不需要自己开发算子。
-- 验收：与 BF16 对比 KV 显存、可容纳的 decode batch、传输时间、TTFT/TPOT、goodput，以及输出质量误差和 NaN/Inf；误差阈值预先固定。参考 SpectrumKV、HACK 等 KV 传输压缩工作。
+- 验收：与 BF16 对比 KV 显存、可容纳的 decode batch、传输时间、TTFT/TPOT、goodput，以及 NaN/Inf；按第 5 节“质量与正确性”用 evalscope 测推理类和长上下文类数据集的精度变化，可接受的精度下降阈值预先固定。参考 SpectrumKV、HACK 等 KV 传输压缩工作。
 
 ### M8：按阶段选择并行方式与弹性 P/D
 
 - **按阶段选并行**：比较 P 用 TP=2、D 用 TP=1×2 等组合，按 goodput 选择。参考 DistServe 的并行策略搜索。
 - **路由与负载均衡**：多个 D 实例之间按 KV 占用和请求数均衡，多个 P 实例之间按待处理 token 数均衡。参考 DeepSeek 推理系统的负载均衡。
 - **弹性 P/D**：固定 2P+2D 时，负载变化会让一侧闲置。最小可行版是让 decode 实例以 chunked prefill 在本地处理部分 prefill（同时省掉 KV 传输），由路由器按队列长度和 TPOT 余量决定是否分流；GPU2 作为可切换角色的弹性节点。参考 TaiChi、负载感知 prefill 分流、FluidPD。
-- 验收：在 ShareGPT、LongBench 和两者混合的负载下，goodput 相对 B1、B2 和固定配比方案的变化。
+- 验收：在 ShareGPT、LongBench 和两者混合的负载下，goodput 相对 B1、B2 和固定配比方案的变化；弹性 P/D 必须用 L3 随时间变化的负载验证。
 
 ### M9：扩展（可选）
 
@@ -238,6 +261,15 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 - [HACK，arXiv 2502.03589](https://arxiv.org/abs/2502.03589)：在量化 KV 上直接计算，省去反量化。
 - [ReKV，arXiv 2611.08770](https://arxiv.org/abs/2611.08770)：量化 KV 传输与后缀重计算重叠。
 - [Lynx，arXiv 2607.01831](https://arxiv.org/abs/2607.01831)：渐进式推测量化传输。
+
+**评测工具与数据**
+
+- [`vllm bench serve` 文档](https://docs.vllm.ai/en/latest/cli/bench/serve.html)：数据集类型（`random`、`sharegpt`、`timed_trace` 等）、到达过程、`--goodput`、百分位指标参数。
+- [evalscope math_500](https://evalscope.readthedocs.io/zh-cn/v1.5.1/benchmarks/math_500.html)：质量评测示例。
+- [ShareGPT（Hugging Face）](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered)：vLLM 和 DistServe 常用的对话负载。
+- [LongBench](https://github.com/THUDM/LongBench)：长上下文负载和长上下文质量评测。
+- [Azure Public Dataset](https://github.com/Azure/AzurePublicDataset)：含 Splitwise 团队发布的 LLM 推理 trace（格式需核实）。
+- [Mooncake](https://github.com/kvcache-ai/Mooncake)：含 Mooncake 发布的请求 trace（格式需核实）。
 
 **工具**
 

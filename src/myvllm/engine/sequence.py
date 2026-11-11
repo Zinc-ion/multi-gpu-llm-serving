@@ -9,12 +9,13 @@ class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
+    CANCELLED = auto()
 
 
 class Sequence:
     counter = count()
 
-    def __init__(self, token_ids: list[int], block_size: int, sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], block_size: int, sampling_params = None):
         self.block_size = block_size # number of tokens per block
         # record sequence id
         self.seq_id = next(Sequence.counter)
@@ -32,6 +33,7 @@ class Sequence:
         # block_table
         self.block_table = []
         # sampling_params' related things
+        sampling_params = sampling_params or SamplingParams()
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -45,7 +47,7 @@ class Sequence:
 
     @property
     def is_finished(self):
-        return self.status == SequenceStatus.FINISHED
+        return self.status in (SequenceStatus.FINISHED, SequenceStatus.CANCELLED)
 
     @property
     def num_completion_tokens(self):

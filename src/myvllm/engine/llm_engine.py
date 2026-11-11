@@ -3,7 +3,7 @@ import torch.distributed as dist
 import time
 import torch.multiprocessing as mp
 
-from myvllm.engine.sequence import Sequence
+from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.engine.scheduler import Scheduler
 from myvllm.engine.model_runner import ModelRunner
 from myvllm.sampling_parameters import SamplingParams
@@ -50,7 +50,8 @@ class LLMEngine:
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
-            eos=config.get("eos", 50256)
+            eos=config.get("eos", 50256),
+            max_model_length=config["max_model_length"]
         )
 
         atexit.register(self.exit)
@@ -86,16 +87,24 @@ class LLMEngine:
 
 
     # add prompt string to the waiting queue by first transforming it to Sequence object
-    def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> None:
-        self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'],sampling_params=sampling_params))
+    def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> Sequence:
+        seq = Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'],sampling_params=sampling_params)
+        self.scheduler.add_sequence(seq)
+        return seq
 
     # given a list of prompts
     # add_prompt for each prompt
     # call step until all sequences are finished
     # return the generated texts
-    def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
-        for prompt in prompts:
-            self.add_prompt(prompt, sampling_params)
+    def generate(self, prompts: list[str], sampling_params: SamplingParams) -> dict:
+        seqs = []
+        try:
+            for prompt in prompts:
+                seqs.append(self.add_prompt(prompt, sampling_params))
+        except Exception:
+            for seq in seqs:
+                self.scheduler.cancel(seq.seq_id)
+            raise
         generated_tokens = {}
         while not self.scheduler.is_finished():
             start_t = time.time()
@@ -108,6 +117,10 @@ class LLMEngine:
                 print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during decoding")
             generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
 
-        generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
-        output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens}
+        generated_tokens = [generated_tokens.get(seq.seq_id, []) for seq in seqs]
+        finish_reasons = ['cancelled' if seq.status == SequenceStatus.CANCELLED else 'stop' for seq in seqs]
+        output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens, 'finish_reason': finish_reasons}
         return output
+
+    def cancel(self, seq_id: int) -> bool:
+        return self.scheduler.cancel(seq_id)

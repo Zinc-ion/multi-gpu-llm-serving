@@ -15,9 +15,8 @@ def worker_process(config, rank, event):
     # FIRST print before any other code
     import sys
     import os
-
-    sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)  # Line buffering
-    sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
+    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line buffering
+    sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 
     model_runner = ModelRunner(config, rank, event)
     model_runner.loop()
@@ -38,12 +37,9 @@ class LLMEngine:
             process.start()
         # start the engine only on the master thread with rank = 0
         self.model_runner = ModelRunner(config, rank=0, event=self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            config.get("model_name_or_path", "gpt2"),
-            revision=config.get("tokenizer_revision"),
-            cache_dir=config.get("cache_dir"),
-        )
-
+        self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"),
+                                                       revision=config.get("tokenizer_revision"), cache_dir=config.get("cache_dir"))
+        
         # scheduler needs to init after model_runner: when world_size > 1,
         # ModelRunner.__init__ calls dist.init_process_group() which is a
         # collective barrier — rank-0 blocks until all worker ranks have joined.
@@ -55,10 +51,11 @@ class LLMEngine:
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
             eos=config.get("eos", 50256),
-            max_model_length=config["max_model_length"],
+            max_model_length=config["max_model_length"]
         )
 
         atexit.register(self.exit)
+
 
     def exit(self):
         self.model_runner.call("exit")
@@ -88,28 +85,25 @@ class LLMEngine:
 
         return outputs, num_processed_tokens, is_prefill
 
+
     # add prompt string to the waiting queue by first transforming it to Sequence object
     def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> Sequence:
-        sequence = Sequence(
-            token_ids=self.tokenizer.encode(prompt),
-            block_size=self.config["block_size"],
-            sampling_params=sampling_params,
-        )
-        self.scheduler.add_sequence(sequence)
-        return sequence
+        seq = Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'],sampling_params=sampling_params)
+        self.scheduler.add_sequence(seq)
+        return seq
 
     # given a list of prompts
     # add_prompt for each prompt
     # call step until all sequences are finished
     # return the generated texts
     def generate(self, prompts: list[str], sampling_params: SamplingParams) -> dict:
-        sequences = []
+        seqs = []
         try:
             for prompt in prompts:
-                sequences.append(self.add_prompt(prompt, sampling_params))
+                seqs.append(self.add_prompt(prompt, sampling_params))
         except Exception:
-            for sequence in sequences:
-                self.scheduler.cancel(sequence.seq_id)
+            for seq in seqs:
+                self.scheduler.cancel(seq.seq_id)
             raise
         generated_tokens = {}
         while not self.scheduler.is_finished():
@@ -118,34 +112,15 @@ class LLMEngine:
             end_t = time.time()
             running_time = end_t - start_t + 1e-10
             if is_prefill:
-                print(
-                    num_processed_tokens,
-                    "number of processed tokens",
-                    num_processed_tokens / running_time,
-                    "tokens/sec during prefilling",
-                )
+                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during prefilling")
             else:
-                print(
-                    num_processed_tokens,
-                    "number of processed tokens",
-                    num_processed_tokens / running_time,
-                    "tokens/sec during decoding",
-                )
+                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during decoding")
             generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
 
-        generated_tokens = [generated_tokens.get(sequence.seq_id, []) for sequence in sequences]
-        finish_reasons = []
-        for sequence in sequences:
-            if sequence.status == SequenceStatus.CANCELLED:
-                finish_reasons.append("cancelled")
-            else:
-                finish_reasons.append("stop")
-        output = {
-            "text": [self.tokenizer.decode(tokens) for tokens in generated_tokens],
-            "token_ids": generated_tokens,
-            "finish_reason": finish_reasons,
-        }
+        generated_tokens = [generated_tokens.get(seq.seq_id, []) for seq in seqs]
+        finish_reasons = ['cancelled' if seq.status == SequenceStatus.CANCELLED else 'stop' for seq in seqs]
+        output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens, 'finish_reason': finish_reasons}
         return output
 
-    def cancel(self, sequence_id: int) -> bool:
-        return self.scheduler.cancel(sequence_id)
+    def cancel(self, seq_id: int) -> bool:
+        return self.scheduler.cancel(seq_id)

@@ -62,5 +62,3 @@ def test_config_loader_rejects_unpinned_revision(tmp_path):
         assert "40-character commit SHA" in str(exc)
     else:
         raise AssertionError("unpinned model revision was accepted")
-
-

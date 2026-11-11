@@ -11,6 +11,7 @@ from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.utils import *
+from myvllm.config import resolve_dtype, seed_everything
 
 class ModelRunner:
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
@@ -23,12 +24,14 @@ class ModelRunner:
         self.enforce_eager = config.get('enforce_eager', False)
 
         self.rank = rank
+        seed_everything(config.get('seed', 0))
+        torch.set_default_dtype(resolve_dtype(config.get('dtype', 'float32')))
         dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
 
         # set model
         path_str = self.config['model_name_or_path']
-        model_name = Path(path_str).name
+        model_name = config.get('model_type', Path(path_str).name)
         match model_name:
             case 'Qwen3-0.6B':
                 self.model = Qwen3ForCausalLM(
@@ -74,7 +77,8 @@ class ModelRunner:
         # Load pretrained weights if model_name_or_path is provided
         if config.get('model_name_or_path'):
             from myvllm.utils.loader import load_weights_from_checkpoint
-            load_weights_from_checkpoint(self.model, config['model_name_or_path'])
+            load_weights_from_checkpoint(self.model, config['model_name_or_path'],
+                                         revision=config.get('model_revision'), cache_dir=config.get('cache_dir'))
 
         # Load weights in CPU (move the model to GPU after loading weights)
         # self.model = self.model.cuda(rank)
@@ -186,7 +190,7 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_tokens = self.config['max_num_batch_tokens']
+        max_tokens = self.config['max_num_batched_tokens']
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
         seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
@@ -211,7 +215,7 @@ class ModelRunner:
         # check whether the current free memory can hold at least one block
         # compute the actual byte required of each block
         block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
-        num_available_kv_blocks = int(available_mem // block_bytes)
+        num_available_kv_blocks = min(int(available_mem // block_bytes), self.config['max_cached_blocks'])
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
         
         # Synchronize max_cached_blocks across all ranks.
@@ -238,6 +242,8 @@ class ModelRunner:
         else:
             # Single GPU: no cross-rank sync needed; use the local value directly.
             self.config['max_cached_blocks'] = num_available_kv_blocks
+        if self.config['max_model_length'] > self.config['max_cached_blocks'] * self.block_size:
+            raise RuntimeError("Profiled KV cache cannot hold max_model_length; lower the model length or increase gpu_memory_utilization.")
         if self.rank == 0:
             print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
 
@@ -404,7 +410,7 @@ class ModelRunner:
     # (later use graph.replay() to run the captured graph)
     @torch.inference_mode()
     def capture_cudagraph(self) -> None:
-        max_bs = self.config['max_num_seqs']
+        max_bs = self.config['max_num_sequences']
         max_len = self.config['max_model_length']
         max_num_blocks = math.ceil(max_len / self.block_size)
         # for decoding, input is always of shape (batch_size, 1)

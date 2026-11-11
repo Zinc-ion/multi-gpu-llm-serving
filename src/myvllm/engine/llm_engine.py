@@ -37,7 +37,8 @@ class LLMEngine:
             process.start()
         # start the engine only on the master thread with rank = 0
         self.model_runner = ModelRunner(config, rank=0, event=self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
+        self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"),
+                                                       revision=config.get("tokenizer_revision"), cache_dir=config.get("cache_dir"))
         
         # scheduler needs to init after model_runner: when world_size > 1,
         # ModelRunner.__init__ calls dist.init_process_group() which is a

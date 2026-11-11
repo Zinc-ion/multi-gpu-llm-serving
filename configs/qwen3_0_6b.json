@@ -1,0 +1,42 @@
+{
+  "model_name_or_path": "Qwen/Qwen3-0.6B",
+  "model_type": "Qwen3-0.6B",
+  "model_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+  "tokenizer_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+  "cache_dir": "/Data2/zincion/huggingface",
+  "dtype": "float32",
+  "seed": 0,
+  "max_num_sequences": 16,
+  "max_num_batched_tokens": 1024,
+  "max_cached_blocks": 1024,
+  "block_size": 256,
+  "world_size": 1,
+  "enforce_eager": true,
+  "vocab_size": 151936,
+  "hidden_size": 1024,
+  "num_heads": 16,
+  "head_dim": 128,
+  "num_kv_heads": 8,
+  "intermediate_size": 3072,
+  "num_layers": 28,
+  "tie_word_embeddings": true,
+  "base": 1000000,
+  "rms_norm_epsilon": 1e-6,
+  "qkv_bias": false,
+  "scale": 1,
+  "max_position": 32768,
+  "ffn_bias": false,
+  "max_model_length": 128,
+  "gpu_memory_utilization": 0.9,
+  "eos": 151645,
+  "sampling": {
+    "temperature": 0.6,
+    "max_tokens": 256,
+    "ignore_eos": false
+  },
+  "prompts": [
+    "introduce yourself",
+    "list all prime numbers within 100",
+    "give me your opinion on the impact of artificial intelligence on society"
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "model_name_or_path": "meta-llama/Llama-3.2-1B-Instruct",
+  "model_type": "Llama-3.2-1B-Instruct",
+  "model_revision": "9213176726f574b556790deb65791e0c5aa438b6",
+  "tokenizer_revision": "9213176726f574b556790deb65791e0c5aa438b6",
+  "cache_dir": "/Data2/zincion/huggingface",
+  "dtype": "float32",
+  "seed": 0,
+  "max_num_sequences": 16,
+  "max_num_batched_tokens": 1024,
+  "max_model_length": 128,
+  "max_cached_blocks": 1024,
+  "block_size": 256,
+  "world_size": 1,
+  "enforce_eager": true,
+  "vocab_size": 128256,
+  "hidden_size": 2048,
+  "head_dim": 64,
+  "num_qo_heads": 32,
+  "num_kv_heads": 8,
+  "has_attn_bias": false,
+  "rms_norm_epsilon": 1e-5,
+  "rope_base": 500000,
+  "max_position_embeddings": 32768,
+  "intermediate_size": 8192,
+  "ffn_bias": false,
+  "num_layers": 16,
+  "tie_word_embeddings": true,
+  "eos": 128009,
+  "gpu_memory_utilization": 0.9,
+  "sampling": {
+    "temperature": 0.6,
+    "max_tokens": 256,
+    "ignore_eos": false
+  },
+  "prompts": [
+    "introduce yourself",
+    "list all prime numbers within 100",
+    "give me your opinion on the impact of artificial intelligence on society"
+  ]
+}

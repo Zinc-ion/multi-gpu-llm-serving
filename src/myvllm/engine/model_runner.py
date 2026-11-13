@@ -1,4 +1,5 @@
 import math
+import json
 import torch
 import pickle
 import torch.distributed as dist
@@ -12,11 +13,13 @@ from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.utils import *
 from myvllm.config import resolve_dtype, seed_everything
+from myvllm.utils.timing import StepTimings
 
 class ModelRunner:
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
         self.config = config
         self.event = event
+        self.timings = None
 
         # set distributed config
         self.block_size = config['block_size']
@@ -101,6 +104,9 @@ class ModelRunner:
 
         torch.set_default_device(f'cuda:{rank}')
         torch.set_default_dtype(self.default_dtype)
+
+        if config.get("timing_path"):
+            self.timings = StepTimings()
 
         # IMPORTANT: Set up shared memory and barrier AFTER all model initialization
         # This ensures both ranks complete warmup/allocation before rank 1 enters its event loop
@@ -247,6 +253,19 @@ class ModelRunner:
         if self.rank == 0:
             print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
 
+        if self.rank == 0:
+            print(json.dumps({
+                "event": "capacity", "total_gpu_bytes": total_mem,
+                "free_before_kv_bytes": free_mem,
+                "parameter_bytes": sum(p.numel() * p.element_size() for p in self.model.parameters()),
+                "rope_cache_bytes": sum(b.numel() * b.element_size() for n, b in self.model.named_buffers() if n.endswith('cos_sin_cache')),
+                "warmup_peak_allocated_bytes": peak_mem_usage,
+                "current_allocated_bytes": current_mem_usage,
+                "warmup_extra_bytes": peak_mem_usage - current_mem_usage,
+                "block_bytes": block_bytes, "block_count": self.config['max_cached_blocks'],
+                "kv_token_capacity": self.config['max_cached_blocks'] * self.block_size,
+            }), flush=True)
+
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
@@ -304,6 +323,8 @@ class ModelRunner:
             for i, seq in enumerate(seqs):
                 block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
                 block_tables.append(block_table)
+        if self.timings:
+            self.timings.h2d()
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
 
@@ -335,6 +356,8 @@ class ModelRunner:
         for i, seq in enumerate(seqs):
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
+        if self.timings:
+            self.timings.h2d()
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         set_context(
             is_prefill=False,
@@ -390,15 +413,30 @@ class ModelRunner:
     # sample logits
     # reset context
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        if self.timings:
+            self.timings.prepare()
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
         else:
             input_ids = self.prepare_decode(seqs)
+        if self.timings:
+            self.timings.end_gpu("h2d")
+            self.timings.start_gpu("forward")
         logits = self.run_model(input_ids, is_prefill)
+        if self.timings:
+            self.timings.end_gpu("forward")
         # only sample when rank == 0
         token_ids = None
         if self.rank == 0:
-            token_ids = self.sampler(logits, self.prepare_sample(seqs))
+            if self.timings:
+                self.timings.start_gpu("sample_h2d")
+            temperature = self.prepare_sample(seqs)
+            if self.timings:
+                self.timings.end_gpu("sample_h2d")
+                self.timings.start_gpu("sampling")
+            token_ids = self.sampler(logits, temperature)
+            if self.timings:
+                self.timings.end_gpu("sampling")
         reset_context()
         return token_ids
 

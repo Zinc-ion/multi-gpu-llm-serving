@@ -1248,8 +1248,10 @@ name = "myvllm"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "fastapi" },
     { name = "torch" },
     { name = "transformers" },
+    { name = "uvicorn" },
     { name = "vllm" },
     { name = "xxhash" },
 ]
@@ -1271,10 +1273,12 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "black", marker = "extra == 'dev'" },
+    { name = "fastapi", specifier = "==0.128.0" },
     { name = "isort", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "torch" },
     { name = "transformers" },
+    { name = "uvicorn", specifier = "==0.40.0" },
     { name = "vllm", specifier = ">=0.15.0" },
     { name = "xxhash" },
 ]

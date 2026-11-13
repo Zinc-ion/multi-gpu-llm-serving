@@ -61,8 +61,6 @@ def copies(args, size):
     reverse = torch.cuda.Stream(device=a)
     torch.cuda.synchronize(a)
     torch.cuda.synchronize(b)
-    if args.mode == "twohop" and a == b:
-        raise ValueError("twohop requires two distinct GPUs")
     samples = []
     wall_samples = []
     links = []

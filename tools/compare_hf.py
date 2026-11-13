@@ -4,6 +4,7 @@ import argparse
 import atexit
 import json
 import subprocess
+import zipfile
 from pathlib import Path
 from contextlib import nullcontext
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from unittest.mock import patch
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from huggingface_hub import hf_hub_download
 
 from myvllm.config import load_config, resolve_dtype, seed_everything
 from myvllm.sampling_parameters import SamplingParams
@@ -44,6 +46,30 @@ def prepare(args):
         ids = tokenizer.encode(text)[:length]
         assert len(ids) == length
         cases.append({"name": f"tokens-{length}", "prompt": tokenizer.decode(ids), "input_ids": ids})
+    if args.lengths:
+        # Keep a natural long-context case alongside the repetitive position stress.
+        revision = "5e628be450b7e67fb7ae6e201bd6d8f7056f7672"
+        path = hf_hub_download(
+            "THUDM/LongBench", "data.zip", revision=revision,
+            repo_type="dataset", cache_dir=config["cache_dir"],
+        )
+        with zipfile.ZipFile(path) as archive:
+            rows = [json.loads(line) for line in archive.read("data/qasper.jsonl").decode().splitlines()]
+        length = max(args.lengths)
+        for row in sorted(rows, key=lambda row: row["length"], reverse=True):
+            ids = tokenizer.encode(row["context"] + "\n\n" + row["input"])
+            if len(ids) >= length:
+                break
+        else:
+            raise ValueError(f"No qasper example contains {length} tokens")
+        cases.append({
+            "name": f"qasper-{length}", "prompt": tokenizer.decode(ids[:length]), "input_ids": ids[:length],
+            "source": {
+                "dataset": "THUDM/LongBench", "revision": revision,
+                "file": "data/qasper.jsonl", "id": row["_id"],
+                "original_tokens": len(ids), "start_token": 0, "selected_tokens": length,
+            },
+        })
     Path(args.output).write_text(json.dumps({
         "model_revision": config["model_revision"],
         "tokenizer_revision": config["tokenizer_revision"],

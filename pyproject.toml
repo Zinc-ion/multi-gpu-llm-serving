@@ -11,6 +11,7 @@ dependencies = [
     "fastapi==0.128.0",
     "uvicorn==0.40.0",
     "vllm>=0.15.0",
+    "pandas",
 ]
 
 [project.optional-dependencies]

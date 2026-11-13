@@ -33,7 +33,7 @@ class ModelRunner:
         path_str = self.config['model_name_or_path']
         model_name = config.get('model_type', Path(path_str).name)
         match model_name:
-            case 'Qwen3-0.6B':
+            case 'Qwen3-0.6B' | 'Qwen3-14B':
                 self.model = Qwen3ForCausalLM(
                     vocab_size=config['vocab_size'],
                     hidden_size=config['hidden_size'],
@@ -77,7 +77,7 @@ class ModelRunner:
         # Load pretrained weights if model_name_or_path is provided
         if config.get('model_name_or_path'):
             from myvllm.utils.loader import load_weights_from_checkpoint
-            load_weights_from_checkpoint(self.model, config['model_name_or_path'],
+            self.loaded_params = load_weights_from_checkpoint(self.model, config['model_name_or_path'],
                                          revision=config.get('model_revision'), cache_dir=config.get('cache_dir'))
 
         # Load weights in CPU (move the model to GPU after loading weights)

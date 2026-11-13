@@ -1,6 +1,7 @@
 """Run the unmodified, locked vLLM client against an already running instance."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,16 +18,28 @@ def main():
     parser.add_argument("--mode", choices=["l1", "l2"], required=True)
     parser.add_argument("--concurrency", nargs="+", type=int, default=[1])
     parser.add_argument("--request-rates", nargs="+", type=float, default=[1, 2, 4])
-    parser.add_argument("--num-prompts", type=int, default=100)
+    parser.add_argument("--num-prompts", type=int, help="Default: all materialized requests; never oversample")
+    parser.add_argument("--repetitions", type=int, help="Default: L1 once, L2 five arrival seeds")
     parser.add_argument("--num-warmups", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
+    content = Path(args.dataset).read_bytes()
+    manifest = json.loads(Path(args.dataset + ".manifest.json").read_text())
+    if hashlib.sha256(content).hexdigest() != manifest["sha256"]:
+        parser.error("dataset SHA256 does not match its manifest; regenerate the workload")
+    available = len(content.splitlines())
+    num_prompts = args.num_prompts if args.num_prompts is not None else available
+    if not 0 < num_prompts <= available:
+        parser.error("num-prompts must fit the materialized list without oversampling")
+    repetitions = args.repetitions if args.repetitions is not None else (5 if args.mode == "l2" else 1)
+    if repetitions <= 0:
+        parser.error("repetitions must be positive")
     directory = Path(args.output_dir)
     directory.mkdir(parents=True, exist_ok=True)
     values = args.concurrency if args.mode == "l1" else args.request_rates
-    for value in values:
-        label = f"{Path(args.dataset).stem}-{args.mode}-{value}"
+    for value, repeat in ((value, repeat) for value in values for repeat in range(repetitions)):
+        label = f"{Path(args.dataset).stem}-{args.mode}-{value}-rep{repeat}"
         command = [
             sys.executable, "-m", "vllm.entrypoints.cli.main", "bench", "serve",
             "--backend", "openai", "--endpoint", "/v1/completions",
@@ -34,9 +47,9 @@ def main():
             "--tokenizer", args.tokenizer,
             "--dataset-name", "custom", "--dataset-path", args.dataset,
             "--skip-chat-template", "--disable-shuffle",
-            "--num-prompts", str(args.num_prompts), "--temperature", "0", "--ignore-eos",
+            "--num-prompts", str(num_prompts), "--no-oversample", "--temperature", "0", "--ignore-eos",
             "--num-warmups", str(args.num_warmups),
-            "--seed", str(args.seed),
+            "--seed", str(args.seed + repeat),
             "--percentile-metrics", "ttft,tpot,itl,e2el", "--metric-percentiles", "50,90,99",
             "--save-result", "--save-detailed", "--result-dir", str(directory),
             "--result-filename", label + ".json", "--request-id-prefix", label + "-",
@@ -48,7 +61,7 @@ def main():
             "command": command, "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
             "client_cpu_affinity": sorted(os.sched_getaffinity(0)),
             "client_numa_maps": Path("/proc/self/numa_maps").read_text(),
-            "dataset_manifest": json.loads(Path(args.dataset + ".manifest.json").read_text()),
+            "dataset_manifest": manifest, "repetition": repeat,
         }
         (directory / (label + ".command.json")).write_text(json.dumps(metadata, indent=2) + "\n")
         with (directory / (label + ".log")).open("w") as log:

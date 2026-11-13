@@ -30,9 +30,9 @@ def test_materialized_workload_filters_after_template_and_repeats_seed(tmp_path,
     config_path.write_text(json.dumps(config))
     source = tmp_path / "source.json"
     source.write_text(json.dumps([
-        {"conversations": [{"from": "human", "value": "world " * 8}]},
-        {"conversations": [{"from": "human", "value": "world"}]},
-        {"conversations": [{"from": "human", "value": "hello world"}]},
+        {"conversations": [{"from": "human", "value": "world " * 8}, {"from": "gpt", "value": "hello"}]},
+        {"conversations": [{"from": "human", "value": "world " * 4}, {"from": "gpt", "value": "hello"}]},
+        {"conversations": [{"from": "human", "value": "hello world " * 2}, {"from": "gpt", "value": "hello"}]},
     ]))
     # Substitute the network download only, preserving conversion and tokenization.
     monkeypatch.setattr("tools.prepare_workloads.hf_hub_download", lambda *a, **kw: str(source))

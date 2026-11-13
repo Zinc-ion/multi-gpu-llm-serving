@@ -213,8 +213,8 @@ def validate_request(body, model, chat):
     if type(max_tokens) is not int or max_tokens <= 0:
         raise ValueError("max_tokens must be a positive integer")
     temperature = body.get("temperature", 1.0)
-    if type(temperature) not in (int, float) or not math.isfinite(temperature) or temperature < 0:
-        raise ValueError("temperature must be finite and nonnegative")
+    if type(temperature) not in (int, float) or not math.isfinite(temperature):
+        raise ValueError("temperature must be a finite number")
     if type(body.get("ignore_eos", False)) is not bool:
         raise ValueError("ignore_eos must be boolean")
     options = body.get("stream_options")

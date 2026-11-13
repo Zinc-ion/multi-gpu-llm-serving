@@ -133,7 +133,7 @@ LongBench 使用固定输出 128（可覆盖），不套 ShareGPT 的短输入�
 
 当前 random 请求共用同一个合成 prompt；prefix 复用禁用时适合 L1 长度控制。M3 如开启 prefix 复用，应先生成独立前缀的新列表，并用同一新列表重跑所有对照方案，不能直接沿用本列表解释 prefill 的优化收益。
 
-bench 使用 `--skip-chat-template --disable-shuffle`，防止对已经物化的请求二次套模板、再次改变顺序。换 tokenizer revision、template 或长度配置后必须重新物化。
+bench 使用 `--skip-chat-template --disable-shuffle`，防止对已经物化的请求二次套模板、再次改变顺序。还必须显式传 `--custom-output-len -1`：vLLM 0.15.0 的 `add_dataset_parser` 默认值为 256，`get_samples` 会把它传给 `CustomDataset.sample` 并覆盖文件中的 `output_tokens`。wrapper 和 manifest 均固定为 -1，以逐请求预算为准。换 tokenizer revision、template 或长度配置后必须重新物化。
 
 ## B0 与计时口径
 
@@ -179,7 +179,7 @@ uv run python tools/analyze_bench.py \
   --output /Data2/zincion/experiments/m2/timing-check.json
 ```
 
-逐请求核对 `len(itl) + 1 == output_tokens`，并按 request id 比较客户端 TTFT 与服务端“收到请求至首次 ASGI send 返回”。两者相差包含客户端/网络/HTTP 开销；不能预先认定为零。客户端的初始验证请求会复用第一条 ID，分析工具采用该 ID 最后的首 chunk 记录。
+逐请求核对 `len(itl) + 1 == output_tokens`，同时核对 detailed 结果的 `output_lens` 是否与物化列表各行的 `output_tokens` 一致；chunk 计数正确不能证明预算没有被 CLI 覆盖或总长度上限截断。再按 request id 比较客户端 TTFT 与服务端“收到请求至首次 ASGI send 返回”。两者相差包含客户端/网络/HTTP 开销；不能预先认定为零。客户端的初始验证请求会复用第一条 ID，分析工具采用该 ID 最后的首 chunk 记录。
 
 再用相同请求列表和 seed 运行一次，把输出放到另一个目录；对齐同一 `rep`，用 `analyze_bench.py --compare-arrivals <第二次详细结果>` 比较实际相对发送时间。vLLM 0.15.0 的 `serve.py` 会保存 `start_times`（详细结果分支），其 `get_request` 采样 gamma 间隔并归一化累计时间；seed 控制随机计划，事件循环与并发排队仍影响实际发送时间。保存了实际时间不代表能按原时间戳回放；这个版本没有 `timed_trace`。
 

@@ -64,7 +64,7 @@ class RotaryEmbedding(nn.Module):
         self.rotary_embedding = rotary_embedding
         # max position that the long context can reach
         self.max_position = max_position
-        self.inv_freq = 1/(base ** (torch.arange(0, self.rotary_embedding, 2)/self.rotary_embedding))
+        self.inv_freq = 1/(base ** (torch.arange(0, self.rotary_embedding, 2, dtype=torch.float32)/self.rotary_embedding))
 
         if is_llama3:
             # specifically for llama3.2
@@ -104,8 +104,8 @@ class RotaryEmbedding(nn.Module):
         cos_sin = self.cos_sin_cache[positions]  # (seq_len, rotary_embedding)
         cos, sin = cos_sin.chunk(2, dim=-1)
         return (
-            apply_rotary_pos_emb(query, cos, sin),
-            apply_rotary_pos_emb(key, cos, sin)
+            apply_rotary_pos_emb(query, cos.to(query.dtype), sin.to(query.dtype)),
+            apply_rotary_pos_emb(key, cos.to(key.dtype), sin.to(key.dtype))
         )
 
 

@@ -115,6 +115,7 @@ def materialize(args):
         "command": subprocess.list2cmdline(sys.argv),
         "bench_parameters": {
             "dataset_name": "custom", "dataset_path": str(destination),
+            "custom_output_len": -1,
             "skip_chat_template": True, "disable_shuffle": True,
             "num_prompts": len(selected), "seed": args.seed,
             "temperature": 0, "ignore_eos": True,

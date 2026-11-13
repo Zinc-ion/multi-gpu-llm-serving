@@ -46,6 +46,7 @@ def main():
             "--base-url", args.base_url, "--model", args.model,
             "--tokenizer", args.tokenizer,
             "--dataset-name", "custom", "--dataset-path", args.dataset,
+            "--custom-output-len", "-1",
             "--skip-chat-template", "--disable-shuffle",
             "--num-prompts", str(num_prompts), "--no-oversample", "--temperature", "0", "--ignore-eos",
             "--num-warmups", str(args.num_warmups),

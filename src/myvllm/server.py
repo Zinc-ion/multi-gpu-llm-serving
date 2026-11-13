@@ -29,28 +29,36 @@ logger = logging.getLogger("myvllm.server")
 
 
 class IncrementalDecoder:
-    """Buffer unfinished words, following Transformers TextStreamer."""
+    """Decode a rolling suffix, using vLLM's prefix/read-offset approach."""
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.tokens = []
         self.printed = 0
+        self.prefix_tokens = 0
+        self.special_ids = set(tokenizer.all_special_ids)
 
     def push(self, token, finished=False):
-        self.tokens.append(token)
+        if token not in self.special_ids:
+            self.tokens.append(token)
         text = self.tokenizer.decode(
             self.tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
-        if finished or text.endswith("\n"):
-            end = len(text)
-        else:
-            # Keep incomplete UTF-8 and unfinished words until they are stable.
-            end = text.rfind(" ") + 1
-        delta = text[self.printed:end]
-        self.printed = end
-        if finished or text.endswith("\n"):
+        # A trailing replacement may be an unfinished byte-level UTF-8 character.
+        if not finished and text.endswith("\ufffd"):
+            return ""
+        delta = text[self.printed:]
+        if finished:
             self.tokens.clear()
             self.printed = 0
+            self.prefix_tokens = 0
+        elif delta:
+            # Retain the last emitted span as context, not the entire output.
+            self.tokens = self.tokens[self.prefix_tokens:]
+            self.printed = len(self.tokenizer.decode(
+                self.tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            ))
+            self.prefix_tokens = len(self.tokens)
         return delta
 
 

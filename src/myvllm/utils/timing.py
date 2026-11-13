@@ -1,6 +1,7 @@
 """Opt-in step timings; CUDA events are read after the existing token D2H."""
 
 import json
+from collections import deque
 from time import perf_counter
 
 import torch
@@ -14,8 +15,10 @@ def write_record(path, record):
 class StepTimings:
     def __init__(self):
         self.step = 0
+        self.pending = deque()
 
     def begin(self):
+        self.flush()
         self.started = perf_counter()
         self.cpu = {}
         self.events = {}
@@ -36,13 +39,25 @@ class StepTimings:
         self.events[name][1].record()
 
     def write(self, path, is_prefill, seqs, token_count, request_ids):
-        gpu = {name + "_ms": start.elapsed_time(end) for name, (start, end) in self.events.items()}
-        gpu["h2d_ms"] += gpu.pop("sample_h2d_ms")
-        write_record(path, {
+        record = {
             "event": "step", "step": self.step, "is_prefill": is_prefill,
             "num_sequences": len(seqs), "num_tokens": token_count,
             "request_ids": [request_ids.get(seq.seq_id, str(seq.seq_id)) for seq in seqs],
             "step_ms": (perf_counter() - self.started) * 1000,
-            **self.cpu, **gpu,
-        })
+            **self.cpu,
+        }
+        self.pending.append((path, record, self.events))
+        self.flush()
         self.step += 1
+
+    def flush(self):
+        # The end event recorded after the blocking D2H may still be queued.
+        # Defer its row instead of introducing another device synchronization.
+        while self.pending:
+            path, record, events = self.pending[0]
+            if not all(end.query() for _, end in events.values()):
+                break
+            gpu = {name + "_ms": start.elapsed_time(end) for name, (start, end) in events.items()}
+            gpu["h2d_ms"] += gpu.pop("sample_h2d_ms")
+            write_record(path, {**record, **gpu})
+            self.pending.popleft()

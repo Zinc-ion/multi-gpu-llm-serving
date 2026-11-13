@@ -105,7 +105,7 @@ class ModelRunner:
         torch.set_default_device(f'cuda:{rank}')
         torch.set_default_dtype(self.default_dtype)
 
-        if config.get("timing_path"):
+        if config.get("timing_path") and self.rank == 0:
             self.timings = StepTimings()
 
         # IMPORTANT: Set up shared memory and barrier AFTER all model initialization
@@ -162,6 +162,8 @@ class ModelRunner:
             del self.graphs
             del self.graph_vars
         torch.cuda.synchronize()
+        if self.timings:
+            self.timings.flush()
         # Check if process group exists before destroying
         if dist.is_initialized():
             dist.destroy_process_group()

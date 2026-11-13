@@ -79,16 +79,21 @@ class LLMEngine:
         num_processed_tokens = 0
         if not scheduled_sequences:
             return [], num_processed_tokens, is_prefill
-        token_count = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
+        if timings:
+            token_count = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
         # Move outputs to CPU and convert them to a list
         if timings:
             d2h_start = time.perf_counter()
+            timings.start_gpu("d2h")
         if outputs is not None:
-            outputs = outputs.cpu().tolist()
+            outputs = outputs.cpu()
+            if timings:
+                timings.end_gpu("d2h")
+            outputs = outputs.tolist()
         if timings:
-            timings.cpu["d2h_ms"] = (time.perf_counter() - d2h_start) * 1000
+            timings.cpu["d2h_host_ms"] = (time.perf_counter() - d2h_start) * 1000
             postprocess_start = time.perf_counter()
         # postprocess the outputs
         self.scheduler.postprocess(scheduled_sequences, outputs)

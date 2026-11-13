@@ -83,11 +83,12 @@ class EngineThread:
     def admit(self, pending):
         body = pending.body
         try:
-            prompt = body["prompt"]
             if pending.chat:
                 prompt = self.engine.tokenizer.apply_chat_template(
                     body["messages"], tokenize=False, add_generation_prompt=True
                 )
+            else:
+                prompt = body["prompt"]
             params = SamplingParams(
                 temperature=body.get("temperature", 1.0),
                 max_tokens=body.get("max_tokens", 64),
@@ -216,7 +217,9 @@ def validate_request(body, model, chat):
         raise ValueError("temperature must be finite and nonnegative")
     if type(body.get("ignore_eos", False)) is not bool:
         raise ValueError("ignore_eos must be boolean")
-    options = body.get("stream_options") or {}
+    options = body.get("stream_options")
+    if options is None:
+        options = {}
     if not isinstance(options, dict) or set(options) - {"include_usage"}:
         raise ValueError("Unsupported stream_options")
     if type(options.get("include_usage", False)) is not bool:
@@ -233,8 +236,10 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
     async def lifespan(app):
         worker.start()
         await asyncio.to_thread(worker.ready.wait)
-        yield
-        await asyncio.to_thread(worker.close)
+        try:
+            yield
+        finally:
+            await asyncio.to_thread(worker.close)
 
     app = FastAPI(lifespan=lifespan)
     app.state.worker = worker
@@ -244,12 +249,12 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
         try:
             body = await request.json()
             validate_request(body, model_name, chat)
-        except (ValueError, json.JSONDecodeError) as exc:
+        except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         pending = PendingRequest(
-            request_id, {**body, "prompt": body.get("prompt", "")}, chat,
+            request_id, body, chat,
             arrival, loop, loop.create_future(), asyncio.Queue(),
         )
         worker.commands.put(("add", pending))
@@ -262,11 +267,13 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
             decoder = IncrementalDecoder(worker.engine.tokenizer)
             completed = False
             first = True
+            emitted_tokens = 0
             identifier = f"cmpl-{request_id}"
             created = int(time.time())
             try:
                 while not completed:
                     token, completed, reason = await pending.tokens.get()
+                    emitted_tokens += 1
                     decode_start = time.perf_counter()
                     text = decoder.push(token, completed)
                     decode_ms = (time.perf_counter() - decode_start) * 1000
@@ -282,14 +289,15 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
                         "created": created, "model": model_name, "choices": [choice],
                     }
                     send_start = time.perf_counter()
-                    yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+                    # The locked bench parser decodes each network chunk as UTF-8.
+                    yield "data: " + json.dumps(payload) + "\n\n"
                     sent = time.perf_counter()
                     if first or config.get("timing_path"):
                         record = {
                             "event": "chunk_sent", "request_id": request_id,
                             "first": first, "arrival_to_chunk_ms": (sent - arrival) * 1000,
                             "detokenize_ms": decode_ms, "send_ms": (sent - send_start) * 1000,
-                            "completion_tokens": seq.num_completion_tokens,
+                            "completion_tokens": emitted_tokens,
                         }
                         logger.info(json.dumps(record))
                         if config.get("timing_path"):
@@ -316,27 +324,33 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
                 headers={"x-request-id": request_id, "cache-control": "no-cache"},
             )
         # EvalScope's fixed OpenAI adapter also uses ordinary completions.
-        decoder = IncrementalDecoder(worker.engine.tokenizer)
-        parts = []
-        completed = False
-        try:
-            while not completed:
-                token, completed, reason = await pending.tokens.get()
-                parts.append(decoder.push(token, completed))
-        finally:
-            if not completed:
-                worker.commands.put(("cancel", seq.seq_id))
-        choice = {"index": 0, "finish_reason": reason}
-        if chat:
-            choice["message"] = {"role": "assistant", "content": "".join(parts)}
-        else:
-            choice.update(text="".join(parts), logprobs=None)
-        return {
-            "id": f"cmpl-{request_id}", "object": "chat.completion" if chat else "text_completion",
-            "created": int(time.time()), "model": model_name, "choices": [choice],
-            "usage": {"prompt_tokens": seq.num_prompt_tokens,
-                      "completion_tokens": seq.num_completion_tokens, "total_tokens": seq.num_tokens},
-        }
+        async def whole_response():
+            decoder = IncrementalDecoder(worker.engine.tokenizer)
+            parts = []
+            completed = False
+            try:
+                while not completed:
+                    token, completed, reason = await pending.tokens.get()
+                    parts.append(decoder.push(token, completed))
+                choice = {"index": 0, "finish_reason": reason}
+                if chat:
+                    choice["message"] = {"role": "assistant", "content": "".join(parts)}
+                else:
+                    choice.update(text="".join(parts), logprobs=None)
+                yield json.dumps({
+                    "id": f"cmpl-{request_id}", "object": "chat.completion" if chat else "text_completion",
+                    "created": int(time.time()), "model": model_name, "choices": [choice],
+                    "usage": {"prompt_tokens": seq.num_prompt_tokens,
+                              "completion_tokens": seq.num_completion_tokens, "total_tokens": seq.num_tokens},
+                })
+            finally:
+                if not completed:
+                    worker.commands.put(("cancel", seq.seq_id))
+
+        # A single JSON body also gets StreamingResponse's disconnect cancellation.
+        return StreamingResponse(
+            whole_response(), media_type="application/json", headers={"x-request-id": request_id}
+        )
 
     @app.post("/v1/completions")
     async def completions(request: Request):
@@ -357,7 +371,13 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    uvicorn.run(create_app(load_config(args.config), args.served_model_name), host=args.host, port=args.port)
+    config = load_config(args.config)
+    logger.info(json.dumps({
+        "event": "server_start", "arguments": vars(args), "config": config,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "cpu_affinity": sorted(os.sched_getaffinity(0)),
+    }))
+    uvicorn.run(create_app(config, args.served_model_name), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

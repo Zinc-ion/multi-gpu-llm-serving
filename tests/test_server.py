@@ -1,10 +1,13 @@
 import json
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import socket
 import threading
 import time
 
 import httpx
+import aiohttp
+from openai import OpenAI
 import pytest
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 import torch
@@ -139,7 +142,7 @@ def test_length_and_nonstream_response(service):
     {"model": "wrong"}, {"repetition_penalty": 1.2}, {"logprobs": 1},
     {"n": 2}, {"stop": ["x"]}, {"top_p": 0.5}, {"top_k": 2},
     {"temperature": -1}, {"max_tokens": 0}, {"unknown": True},
-    {"prompt": "x" * 256},
+    {"prompt": "x" * 256}, {"prompt": ""}, {"stream_options": []},
 ])
 def test_bad_request_does_not_break_other_requests(service, extra):
     client, _, _, _ = service
@@ -149,15 +152,17 @@ def test_bad_request_does_not_break_other_requests(service, extra):
     assert client.post("/v1/completions", json=body).status_code == 200
 
 
-def test_disconnect_cancels_and_returns_all_blocks(service):
+@pytest.mark.parametrize("streaming", [True, False])
+def test_disconnect_cancels_and_returns_all_blocks(service, streaming):
     client, app, _, _ = service
     with client.stream("POST", "/v1/completions", json={
-        "model": "tiny", "prompt": "hello", "stream": True,
+        "model": "tiny", "prompt": "hello", "stream": streaming,
         "max_tokens": 100, "ignore_eos": True,
     }) as response:
-        for line in response.iter_lines():
-            if line.startswith("data: "):
-                break
+        if streaming:
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    break
     deadline = time.monotonic() + 3
     while app.state.worker.requests:
         assert time.monotonic() < deadline
@@ -182,3 +187,52 @@ def test_overlapping_requests_keep_separate_token_counts(service):
         results = list(executor.map(complete, [5, 10]))
     assert [chunks[-1]["usage"]["completion_tokens"] for chunks in results] == [5, 10]
     assert not app.state.worker.engine.scheduler.block_manager.used_block_ids
+
+
+def test_openai_sdk_uses_the_nonstream_chat_contract(service):
+    client, _, _, _ = service
+    with OpenAI(
+        base_url=str(client.base_url).rstrip("/") + "/v1", api_key="test",
+        http_client=httpx.Client(trust_env=False),
+    ) as sdk:
+        result = sdk.chat.completions.create(
+            model="tiny", messages=[{"role": "user", "content": "hello"}],
+            temperature=0, max_tokens=2,
+        )
+    assert result.choices[0].finish_reason == "length"
+    assert result.usage.completion_tokens == 2
+
+
+def test_locked_vllm_client_counts_one_chunk_per_token(service, monkeypatch):
+    from vllm.benchmarks.lib.endpoint_request_func import (
+        RequestFuncInput, async_request_openai_completions,
+    )
+
+    client, _, tokenizer, _ = service
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+
+    async def run():
+        async with aiohttp.ClientSession() as session:
+            return await async_request_openai_completions(RequestFuncInput(
+                prompt="hello", api_url=str(client.base_url).rstrip("/") + "/v1/completions",
+                prompt_len=len(tokenizer.encode("hello")), output_len=5,
+                model="tiny", ignore_eos=True, extra_body={"temperature": 0},
+                request_id="locked-client",
+            ), session)
+
+    result = asyncio.run(run())
+    assert result.success, result.error
+    assert result.output_tokens == 5
+    assert len(result.itl) + 1 == result.output_tokens
+
+
+def test_model_length_stop_has_length_reason(service):
+    client, _, tokenizer, _ = service
+    prompt = "x" * 126
+    assert len(tokenizer.encode(prompt)) == 126
+    chunks = stream_chunks(client, "/v1/completions", {
+        "model": "tiny", "prompt": prompt, "stream": True,
+        "max_tokens": 10, "ignore_eos": True, "stream_options": {"include_usage": True},
+    })
+    assert chunks[-1]["usage"]["completion_tokens"] == 2
+    assert chunks[-2]["choices"][0]["finish_reason"] == "length"

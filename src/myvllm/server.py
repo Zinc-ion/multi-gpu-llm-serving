@@ -20,6 +20,7 @@ import uvicorn
 
 from myvllm.config import load_config
 from myvllm.engine.llm_engine import LLMEngine
+from myvllm.engine.sequence import Sequence
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.utils.timing import write_record
 
@@ -56,8 +57,8 @@ class IncrementalDecoder:
 @dataclass
 class PendingRequest:
     request_id: str
-    body: dict
-    chat: bool
+    token_ids: list[int]
+    params: SamplingParams
     arrival: float
     loop: asyncio.AbstractEventLoop
     admitted: asyncio.Future
@@ -81,21 +82,9 @@ class EngineThread:
         self.thread.join()
 
     def admit(self, pending):
-        body = pending.body
         try:
-            if pending.chat:
-                prompt = self.engine.tokenizer.apply_chat_template(
-                    body["messages"], tokenize=False, add_generation_prompt=True
-                )
-            else:
-                prompt = body["prompt"]
-            params = SamplingParams(
-                temperature=body.get("temperature", 1.0),
-                max_tokens=body.get("max_tokens", 64),
-                ignore_eos=body.get("ignore_eos", False),
-                max_model_length=self.config["max_model_length"],
-            )
-            seq = self.engine.add_prompt(prompt, params)
+            seq = Sequence(pending.token_ids, self.config["block_size"], pending.params)
+            self.engine.scheduler.add_sequence(seq)
         except ValueError as exc:
             pending.loop.call_soon_threadsafe(self.reject, pending, str(exc))
             return
@@ -226,6 +215,16 @@ def validate_request(body, model, chat):
         raise ValueError("include_usage must be boolean")
 
 
+def tokenize_request(tokenizer, body, chat):
+    if chat:
+        prompt = tokenizer.apply_chat_template(
+            body["messages"], tokenize=False, add_generation_prompt=True
+        )
+    else:
+        prompt = body["prompt"]
+    return tokenizer.encode(prompt)
+
+
 def create_app(config, model_name=None, engine_factory=LLMEngine):
     if config["world_size"] != 1:
         raise ValueError("HTTP serving requires world_size == 1")
@@ -249,12 +248,19 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
         try:
             body = await request.json()
             validate_request(body, model_name, chat)
+            params = SamplingParams(
+                temperature=body.get("temperature", 1.0),
+                max_tokens=body.get("max_tokens", 64),
+                ignore_eos=body.get("ignore_eos", False),
+                max_model_length=config["max_model_length"],
+            )
+            token_ids = await asyncio.to_thread(tokenize_request, worker.engine.tokenizer, body, chat)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         pending = PendingRequest(
-            request_id, body, chat,
+            request_id, token_ids, params,
             arrival, loop, loop.create_future(), asyncio.Queue(),
         )
         worker.commands.put(("add", pending))

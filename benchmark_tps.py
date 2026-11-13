@@ -40,7 +40,7 @@ config = {
     'ffn_bias': False,  # Fixed: HF Qwen3 doesn't use MLP bias
     'max_model_length': 128,
     'gpu_memory_utilization': 0.9,
-    'eos': [151645, 151643],  # Fixed: should match tokenizer.eos_token_id
+    'eos': [151645, 151643],  # Fixed: should match generation_config.eos_token_id
 }
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"

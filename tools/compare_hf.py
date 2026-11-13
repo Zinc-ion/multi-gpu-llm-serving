@@ -5,8 +5,11 @@ import atexit
 import json
 import subprocess
 from pathlib import Path
+from contextlib import nullcontext
+from unittest.mock import patch
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from myvllm.config import load_config, resolve_dtype, seed_everything
@@ -19,6 +22,7 @@ def metadata(config):
         "config": config,
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name(),
+        "working_tree_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"])),
     }
 
 
@@ -36,8 +40,9 @@ def prepare(args):
         cases.append({"name": f"chat-{index}", "prompt": text, "input_ids": tokenizer.encode(text)})
     for length in args.lengths:
         # Fixed text and token IDs are materialized, so no dataset sampling occurs later.
-        text = "Explain the following observations about inference systems. " * length
+        text = "Explain the following observations about inference systems. " * (length // 7 + 1)
         ids = tokenizer.encode(text)[:length]
+        assert len(ids) == length
         cases.append({"name": f"tokens-{length}", "prompt": tokenizer.decode(ids), "input_ids": ids})
     Path(args.output).write_text(json.dumps({
         "model_revision": config["model_revision"],
@@ -56,14 +61,27 @@ def custom(args):
         missing = set(dict(engine.model_runner.model.named_parameters())) - engine.model_runner.loaded_params
         if missing:
             raise RuntimeError(f"Unloaded parameters: {sorted(missing)}")
-        index_path = Path(config["model_name_or_path"]) / "model.safetensors.index.json"
-        if index_path.exists():
-            checkpoint_names = set(json.loads(index_path.read_text())["weight_map"])
-            skipped = checkpoint_names - engine.model_runner.loaded_params
-            if skipped:
-                raise RuntimeError(f"Checkpoint tensors not loaded: {sorted(skipped)}")
+        from huggingface_hub import snapshot_download
+        from safetensors import safe_open
+        checkpoint = Path(config["model_name_or_path"])
+        if not checkpoint.is_dir():
+            checkpoint = Path(snapshot_download(
+                config["model_name_or_path"], revision=config["model_revision"],
+                cache_dir=config["cache_dir"], local_files_only=True,
+            ))
+        checkpoint_names = set()
+        for shard in checkpoint.glob("*.safetensors"):
+            with safe_open(shard, framework="pt", device="cpu") as weights:
+                checkpoint_names.update(weights.keys())
+        skipped = checkpoint_names - engine.model_runner.loaded_params
+        if skipped:
+            raise RuntimeError(f"Checkpoint tensors not loaded: {sorted(skipped)}")
+        prompts = json.loads(Path(args.prompts).read_text())
+        for field in ("model_revision", "tokenizer_revision"):
+            if prompts[field] != config[field]:
+                raise ValueError(f"Prompt manifest has a different {field}")
         rows = []
-        for case in json.loads(Path(args.prompts).read_text())["cases"]:
+        for case in prompts["cases"]:
             logits = []
             # A forward hook observes the actual LM head used by step(), including decode.
             handle = engine.model_runner.model.lm_head.register_forward_hook(
@@ -93,21 +111,40 @@ def reference(args):
     config = load_config(args.config)
     seed_everything(config["seed"])
     custom_data = torch.load(args.custom, map_location="cpu", weights_only=False)
-    if config["model_revision"] != custom_data["metadata"]["config"]["model_revision"]:
-        raise ValueError("Reference and custom model revisions must match")
+    for field in ("model_revision", "tokenizer_revision", "dtype"):
+        if config[field] != custom_data["metadata"]["config"][field]:
+            raise ValueError(f"Reference and custom {field} must match")
     model = AutoModelForCausalLM.from_pretrained(
         config["model_name_or_path"], revision=config["model_revision"],
         cache_dir=config["cache_dir"], dtype=resolve_dtype(config["dtype"]),
         attn_implementation=args.attention,
     ).cuda().eval()
     results = []
-    raw = []
-    with torch.inference_mode():
+    output = Path(args.output)
+    report = {
+        "metadata": metadata(config), "attention": args.attention,
+        "sdpa_backend": args.sdpa_backend, "expand_kv": args.expand_kv,
+        "custom_metadata": custom_data["metadata"], "results": results, "status": "running",
+        "acceptance_threshold": "pending user decision; measurements are not a pass/fail gate",
+    }
+    output.write_text(json.dumps(report, indent=2) + "\n")
+    backend = {
+        "efficient": SDPBackend.EFFICIENT_ATTENTION,
+        "flash": SDPBackend.FLASH_ATTENTION,
+        "math": SDPBackend.MATH,
+    }[args.sdpa_backend]
+    # Select HF's existing repeat_kv branch explicitly for FP32 efficient SDPA:
+    # PyTorch 2.9.1's efficient backend does not accept enable_gqa=True.
+    expansion = patch(
+        "transformers.integrations.sdpa_attention.use_gqa_in_sdpa", return_value=False
+    ) if args.expand_kv else nullcontext()
+    with torch.inference_mode(), sdpa_kernel(backend), expansion:
         for case in custom_data["cases"]:
             input_ids = torch.tensor([case["input_ids"]], device="cuda")
             generation = model.generate(
                 input_ids, attention_mask=torch.ones_like(input_ids),
-                do_sample=False, max_new_tokens=args.max_tokens,
+                do_sample=False,
+                max_new_tokens=min(args.max_tokens, config["max_model_length"] - input_ids.shape[1]),
                 eos_token_id=config["eos"], pad_token_id=config["eos"][-1],
                 return_dict_in_generate=True, output_scores=True,
             )
@@ -140,15 +177,15 @@ def reference(args):
                 "top1_agreement": (actual.argmax(-1) == hf_logits.argmax(-1)).float().mean().item(),
             }
             print(json.dumps(row), flush=True)
+            raw_path = str(output) + "." + case["name"] + ".pt"
+            torch.save({
+                "name": case["name"], "reference_tokens": reference_tokens, "logits": hf_logits,
+            }, raw_path)
+            row["raw_reference"] = raw_path
             results.append(row)
-            raw.append({"name": case["name"], "reference_tokens": reference_tokens, "logits": hf_logits})
-    output = Path(args.output)
-    torch.save(raw, str(output) + ".pt")
-    output.write_text(json.dumps({
-        "metadata": metadata(config), "attention": args.attention,
-        "custom_metadata": custom_data["metadata"], "results": results,
-        "acceptance_threshold": "pending user decision; measurements are not a pass/fail gate",
-    }, indent=2) + "\n")
+            output.write_text(json.dumps(report, indent=2) + "\n")
+    report["status"] = "complete"
+    output.write_text(json.dumps(report, indent=2) + "\n")
 
 
 def main():
@@ -166,8 +203,10 @@ def main():
         else:
             child.add_argument("--custom", required=True)
             child.add_argument("--attention", choices=["sdpa", "eager"], default="sdpa")
+            child.add_argument("--sdpa-backend", choices=["efficient", "flash", "math"], default="efficient")
+            child.add_argument("--expand-kv", action="store_true")
     args = parser.parse_args()
-    globals()[args.mode](args)
+    {"prepare": prepare, "custom": custom, "reference": reference}[args.mode](args)
 
 
 if __name__ == "__main__":

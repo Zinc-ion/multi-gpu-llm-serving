@@ -25,7 +25,7 @@ def make_scheduler(
         max_num_batched_tokens=max_num_batched_tokens,
         max_cached_blocks=max_cached_blocks,
         block_size=block_size,
-        eos=0,
+        eos=[0],
         max_model_length=max_model_length,
     )
 
@@ -82,7 +82,7 @@ def test_eos_releases_all_blocks():
     scheduler.add_sequence(sequence)
     scheduled, _ = scheduler.schedule()
 
-    scheduler.postprocess(scheduled, [scheduler.eos])
+    scheduler.postprocess(scheduled, [0])
 
     assert sequence.status == SequenceStatus.FINISHED
     assert sequence.block_table == []
@@ -194,7 +194,7 @@ def test_preemption_releases_the_newest_request_and_retries_the_oldest():
     assert newest.block_table == []
     assert_block_pool_consistent(scheduler)
 
-    scheduler.postprocess([oldest], [scheduler.eos])
+    scheduler.postprocess([oldest], [0])
     resumed, is_prefill = scheduler.schedule()
     assert is_prefill
     assert resumed == [newest]
@@ -216,14 +216,14 @@ def test_prefill_budget_and_sequence_limit_preserve_waiters():
     first_batch, _ = scheduler.schedule()
     assert first_batch == sequences[:2]
     assert list(scheduler.waiting) == [sequences[2]]
-    scheduler.postprocess(first_batch, [scheduler.eos, scheduler.eos])
+    scheduler.postprocess(first_batch, [0, 0])
 
     second_batch, is_prefill = scheduler.schedule()
     assert is_prefill
     assert second_batch == [sequences[2]]
     assert sequences[2].status == SequenceStatus.RUNNING
     assert_block_pool_consistent(scheduler)
-    scheduler.postprocess(second_batch, [scheduler.eos])
+    scheduler.postprocess(second_batch, [0])
     assert scheduler.is_finished()
     assert_block_pool_consistent(scheduler)
 

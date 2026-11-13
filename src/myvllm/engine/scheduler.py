@@ -4,7 +4,7 @@ from myvllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
-    def __init__(self, max_num_sequences: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: int, max_model_length: int):
+    def __init__(self, max_num_sequences: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: list[int], max_model_length: int):
         if max_num_sequences <= 0:
             raise ValueError("max_num_sequences must be positive")
         if max_num_batched_tokens <= 0:
@@ -21,7 +21,7 @@ class Scheduler:
         # sequence queue
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
-        self.eos = eos
+        self.eos = set(eos)
 
 
     def is_finished(self):
@@ -128,7 +128,7 @@ class Scheduler:
             # EOS token
             # Reached max_tokens limit (number of completion tokens)
             # Reached max_model_length limit (total sequence length including prompt)
-            stop_due_to_eos = not seq.ignore_eos and token_id == self.eos
+            stop_due_to_eos = not seq.ignore_eos and token_id in self.eos
             stop_due_to_max_tokens = seq.num_completion_tokens >= seq.max_tokens
             stop_due_to_max_length = seq.max_model_length is not None and seq.num_tokens >= seq.max_model_length
 

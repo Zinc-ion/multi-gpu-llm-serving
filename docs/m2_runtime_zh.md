@@ -27,8 +27,6 @@ CPU 单元测试使用 `torch.compiler.set_stance("force_eager")` 隔离算术�
 CUDA_VISIBLE_DEVICES="" uv run python -m pytest -q
 ```
 
-2026-11-13 的 CPU 验证记录：代码 `7380450`，PyTorch `2.9.1+cu128`、Transformers `4.57.3`，71 项通过、1 项 CUDA 测试跳过。原始输出保存于 `/home/zincion/ai_infra/experiments/m2-local-20261113/final-cpu-tests.log`，命令如上。覆盖真实 HTTP、tokenizer、Scheduler、BlockManager、OpenAI SDK 和锁定 vLLM 请求函数；HTTP 测试仅替换模型执行。这不是 GPU 计时或端到端模型质量的验收。
-
 ## 14B 配置与容量候选
 
 `configs/qwen3_14b.json` 固定模型和 tokenizer revision：
@@ -46,11 +44,13 @@ Qwen/Qwen3-14B
 |---|---:|---|
 | `max_model_length` | 17408 | 覆盖 16384 输入加最多 1024 输出 |
 | `max_num_batched_tokens` | 17408 | 当前 Scheduler 要求总长度上限不超过一次 prefill 预算 |
-| `max_num_sequences` | 4 | 初始批次上限；不是实测稳定并发 |
-| `max_cached_blocks` | 272 | `4 × 17408 / 256`，仅为配置上限 |
+| `max_num_sequences` | 2048 | 覆盖配置 block 上限，避免 resident 请求被 decode 批次限额饿住 |
+| `max_cached_blocks` | 2048 | 每块 40 MiB，配置池为 80 GiB，超过目标单卡全部显存，使 profiling 决定实际容量 |
 | `gpu_memory_utilization` | 0.9 | 沿用原运行参数，待日志及实验确定 |
 
-运行时仍按原 profiling 语义取 `min(profiled_blocks, configured_blocks)`，实际块数可能小于 272。未实测前，不能据此宣称可同时容纳四个长请求。若启动时不足以容纳单个 `max_model_length`，应保存失败日志并调整候选配置后重测。
+运行时仍按原 profiling 语义取 `min(profiled_blocks, configured_blocks)`；2048 是不限制目标卡 profiling 的配置上界，不是可实现的并发或容量。若启动时不足以容纳单个 `max_model_length`，应保存失败日志并调整候选配置后重测。
+
+上游 Scheduler 的 `max_num_sequences` 只限制单步 prefill/decode 批次，不限制累计的 running 数；decode 后队头保持原顺序。若 running 超过 decode 限额，队尾请求会等到队头完成才推进，污染 B0 的 TPOT 尾部。prefix 复用禁用时，每条 running 请求独占至少一块，因此 `running ≤ 实际 block 数 ≤ 2048`。配置同时满足 `max_num_sequences ≥ 2048` 与 `max_num_batched_tokens ≥ 2048`，从两个预算上避免这种限额饥饿。prefill 优先和 KV 不足时的抢占仍存在，没有改变上游调度策略。调整实验配置或在 M3 启用 prefix 复用时须重新检查这个界限。warmup batch 仍为 `17408 // 17408 = 1`，提高 sequence 限额不会改变当前 warmup 形状。
 
 BF16 KV 每 token 的结构字节数为 `40 × 2 × 8 × 128 × 2 = 163840 B`。每层仍各有一个 FP32 RoPE cache，40960 个位置的结构大小合计为 800 MiB；没有为节省显存改变其结构。实际配置验收以启动日志里的 parameter/cache 字节数、warmup 峰值和实际 block 数为准。
 
@@ -67,9 +67,9 @@ uv run python -m myvllm.server \
   --host 127.0.0.1 --port 8000
 ```
 
-只支持 `world_size == 1`。只有一个推理线程创建和调用 ModelRunner、Scheduler；HTTP 层通过线程安全队列提交新增、取消及关闭命令，通过事件循环的线程安全回调接收 token。空闲时阻塞等待命令。这样避免多个推理调用同时改写模块级 `utils/context.py`。
+只支持 `world_size == 1`。只有一个推理线程创建和调用 ModelRunner、Scheduler；HTTP 层在线程池中应用 chat template 并分词，再通过线程安全队列提交 token IDs、采样参数、取消及关闭命令，通过事件循环的线程安全回调接收 token。空闲时阻塞等待命令。这样避免多个推理调用同时改写模块级 `utils/context.py`，也避免在 model step 之间执行长输入分词。线程池与推理线程仍共享 CPU/GIL，真实负载中的剩余影响需实测。
 
-接口为 `POST /v1/completions` 和 `POST /v1/chat/completions`，支持 SSE 和普通 JSON 响应。普通 JSON chat 是为 EvalScope 1.5.1 的 OpenAI 适配器提供的：该版本 `GenerateConfig.stream` 默认为 `None`，适配器会调用 `client.chat.completions.create`；这属于源码及 SDK 契约核对，未执行 EvalScope 数据集评测。没有实现 `/v1/models`，bench 必须显式传 `--model`。
+接口为 `POST /v1/completions` 和 `POST /v1/chat/completions`，支持 SSE 和普通 JSON 响应。普通 JSON chat 是为 EvalScope 1.5.1 的 OpenAI 适配器提供的：该 tag 的 `evalscope/api/model/generate_config.py::GenerateConfig.stream` 默认为 `None`，`evalscope/models/openai_compatible.py::OpenAICompatibleAPI.generate` 调用 `client.chat.completions.create`；这属于源码及 SDK 契约核对，未安装 EvalScope 或执行其数据集评测。没有实现 `/v1/models`，bench 必须显式传 `--model`。
 
 ### 请求契约
 
@@ -84,7 +84,9 @@ uv run python -m myvllm.server \
 
 每个生成 token 都产生且只产生一个带 choices 的 SSE 消息，包括没有可见文字的 token。最后一个 token 的同一条消息带 `finish_reason`，不额外发送带 choices 的结束消息。EOS 为 `stop`，输出或总长度上限为 `length`，从 Sequence 的现有状态推导。
 
-增量反分词借鉴 Transformers 的 `TextStreamer`，缓冲尚未完成的词和 UTF-8 字符，在空格、换行或结束时输出稳定文本。中文或 emoji 可以暂时输出空 text，但 token 消息继续立即发送。拼接文本与使用 `skip_special_tokens=True, clean_up_tokenization_spaces=False` 整体 decode 的结果一致。SSE JSON 使用 ASCII 转义，以兼容锁定 bench 客户端逐网络块做 UTF-8 decode 的实现。
+增量反分词借鉴 vLLM 0.15.0 的 `vllm/tokenizers/detokenizer_utils.py::detokenize_incrementally` 中 prefix/read-offset 方法，只保留上一段已输出 token 和待完成的 UTF-8 后缀。稳定文字直接输出，不等空格、换行或请求结束，中文也可逐步显示。末尾的替换字符可能是尚未完成的字节，暂时缓冲；结束时 flush，包括确实残缺的最后字符。拼接文本与使用 `skip_special_tokens=True, clean_up_tokenization_spaces=False` 整体 decode 的结果一致。SSE JSON 使用 ASCII 转义，以兼容锁定 bench 客户端逐网络块做 UTF-8 decode 的实现。
+
+正常无换行文本的解码窗口随已输出段滚动；如果持续生成以替换字符结尾的非法字节，待完成后缀仍可能增长，不宣称对所有非法 token 流都有固定窗口上界。每 token 的 choices 消息不因文本缓冲而省略。
 
 请求 `include_usage` 时，末尾再发送 choices 为空的 usage 消息，然后发送 `data: [DONE]`。usage 包括 prompt/completion/total token 数。流式和普通 JSON 连接断开都经命令队列取消，在两个 step 之间释放 block；不会中断已提交的 GPU kernel。
 

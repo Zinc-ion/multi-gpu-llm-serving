@@ -21,7 +21,7 @@ nvidia-smi topo -p2p w > /Data2/zincion/experiments/m2/p2p-write.txt
 numactl --hardware > /Data2/zincion/experiments/m2/numa.txt
 ```
 
-需要系统已有 `uv` 和 `numactl`。单独记录驱动、Python、框架、NCCL 和代码版本。锁文件中的 vLLM 为 0.15.0、Transformers 为 4.57.3；不要通过升级依赖掩盖验证失败。
+需要系统已有 `uv` 和 `numactl`。单独记录驱动、Python、框架、NCCL 和代码版本。锁文件中的 vLLM 为 0.15.0、Transformers 为 4.57.3；custom JSONL 的读取还使用 `pandas`，已显式声明并锁定。不要通过升级依赖掩盖验证失败。
 
 ## HF 输出及 logits 对齐
 
@@ -48,7 +48,7 @@ CUDA_VISIBLE_DEVICES=0 numactl --cpunodebind=0 --membind=0 \
   > /Data2/zincion/experiments/m2/reference-14b.log 2>&1
 ```
 
-manifest 物化三条套 chat template 的配置 prompt，以及 1024/4096/16384 个 token 的长输入。custom 输出保存每个 step 的 logits，包括 prefill 最后一个位置和所有 decode 位置；参考输出逐 case 落盘，summary 的 `status=complete` 才表示所有 case 完成。
+manifest 物化三条套 chat template 的配置 prompt、1024/4096/16384 个 token 的重复合成长输入，以及一条固定 LongBench revision 的 qasper 自然长文本。自然用例从按原始 length 降序排列的样本中取首条 token 数足够的 context + input，截取至最长请求长度（默认 16384）；记录 `_id`、revision、原始 token 数和截取范围。它是自然文本续写数值检查，不是 qasper 任务准确率评测；重复输入继续作为位置压力用例。`prepare` 会把数据集缓存到配置的 `cache_dir`。custom 输出保存每个 step 的 logits，包括 prefill 最后一个位置和所有 decode 位置；参考输出逐 case 落盘，summary 的 `status=complete` 才表示所有 case 完成。
 
 参考端同时测独立 greedy generation 和同前缀 teacher forcing；后者使用 `prompt + custom_tokens[:-1]`，只生成所需后缀 logits，避免长 prompt 的完整词表输出占满显存。记录首个分歧、该位置 HF top1/top2 margin、max/mean abs error、top1 一致率。
 
@@ -105,13 +105,18 @@ CUDA_VISIBLE_DEVICES=0 numactl --cpunodebind=0 --membind=0 \
 - LongBench：`THUDM/LongBench`，revision `5e628be450b7e67fb7ae6e201bd6d8f7056f7672`，`data.zip` 中的 `qasper` 子集，prompt 为 context 与 input 拼接后套 chat template。
 
 ```bash
-for m2_dataset in sharegpt longbench; do
-  uv run python tools/prepare_workloads.py \
-    --config configs/qwen3_14b.json --dataset "$m2_dataset" \
-    --num-requests 100 --output-tokens 128 --seed 7 \
-    --cache-dir /Data2/zincion/huggingface \
-    --output "/Data2/zincion/experiments/m2/${m2_dataset}.jsonl"
-done
+uv run python tools/prepare_workloads.py \
+  --config configs/qwen3_14b.json --dataset sharegpt \
+  --num-requests 1000 --seed 7 \
+  --cache-dir /Data2/zincion/huggingface \
+  --output /Data2/zincion/experiments/m2/sharegpt.jsonl
+
+# 不指定数量时使用全部有效 qasper 样本，避免对小子集静默过采样。
+uv run python tools/prepare_workloads.py \
+  --config configs/qwen3_14b.json --dataset longbench --subset qasper \
+  --output-tokens 128 --seed 7 \
+  --cache-dir /Data2/zincion/huggingface \
+  --output /Data2/zincion/experiments/m2/longbench.jsonl
 
 for m2_length in 1024 4096 16384; do
   uv run python tools/prepare_workloads.py \
@@ -122,7 +127,11 @@ for m2_length in 1024 4096 16384; do
 done
 ```
 
-ShareGPT 取首个人类消息；两个真实数据集先套 template，再按完整输入加固定输出是否超过 `max_model_length` 过滤，不截断原样本。固定 seed 打乱后取样；不足请求数会报错。random 输入逐条验证 tokenizer round trip 后的准确长度。输出为 vLLM custom JSONL，旁边的 manifest 记录 revision、seed、过滤数、SHA256 和 bench 参数。
+ShareGPT 取首个 human/gpt 消息对，默认按首个 gpt 回复的 token 数设置每条 `output_tokens`，保留输出长度分布；这只是生成预算，不要求模型复现原回复。原始 prompt/reply 长度采用 vLLM 0.15.0 `ShareGPTDataset.sample` / `is_valid_sequence` 的过滤值：输入和回复至少 4 token、输入至多 1024、合计至多 2048。可显式 `--output-tokens` 覆盖为受控固定长度，此时与 vLLM 一样跳过回复最小长度筛选。之后本项目还会套 chat template 并按真实输入加输出预算是否超过 `max_model_length` 过滤，因此不是与 vLLM 原生 ShareGPT 完全相同的请求列表。跨框架对比必须共用本项目物化的 custom 列表。
+
+LongBench 使用固定输出 128（可覆盖），不套 ShareGPT 的短输入过滤。两个真实数据集不截断原样本，固定 seed 打乱后取样；显式请求数不足会报错，不复制补齐。qasper 原始子集只有 200 条，长度过滤后可能更少；manifest 保存最终数量。random 输入验证 tokenizer round trip 后的准确长度。输出为 custom JSONL，旁边的 manifest 记录 revision、长度策略、seed、过滤数、SHA256 和 bench 参数。
+
+当前 random 请求共用同一个合成 prompt；prefix 复用禁用时适合 L1 长度控制。M3 如开启 prefix 复用，应先生成独立前缀的新列表，并用同一新列表重跑所有对照方案，不能直接沿用本列表解释 prefill 的优化收益。
 
 bench 使用 `--skip-chat-template --disable-shuffle`，防止对已经物化的请求二次套模板、再次改变顺序。换 tokenizer revision、template 或长度配置后必须重新物化。
 
@@ -145,7 +154,7 @@ done
 # L2：这些速率仅是起始扫描点，不是已测容量。
 for m2_dataset in sharegpt longbench; do
   numactl --cpunodebind=0 --membind=0 uv run python tools/run_b0.py \
-    --mode l2 --request-rates 1 2 4 --num-prompts 100 \
+    --mode l2 --request-rates 1 2 4 --repetitions 5 \
     --dataset "/Data2/zincion/experiments/m2/${m2_dataset}.jsonl" \
     --model Qwen3-14B --tokenizer "$M2_MODEL_SNAPSHOT" \
     --output-dir /Data2/zincion/experiments/m2/b0-l2
@@ -156,19 +165,23 @@ wrapper 使用未修改的 vLLM 0.15.0 CLI 模块，统一传 `--temperature 0 -
 
 wrapper 默认另发 8 次 warmup，可显式覆盖 `--num-warmups`。这只是固定的实验控制值；应从日志/trace 确认正式测量期间是否仍发生编译，不能把预热充分当成已验证事实。
 
+wrapper 默认使用完整物化列表，校验 SHA256，并禁止请求数超出列表或由 bench 过采样。L1 默认运行一次，L2 每个速率默认运行五次，到达 seed 依次为 `seed + 0..4`，物化列表保持不变。文件名和 request id 前缀带 `-rep0` 等后缀，防止不同重复覆盖。比较方案使用同一组 seed，复跑时另建输出目录。可显式 `--repetitions 1` 做连通性检查，但不能将小样本 smoke test 当作尾延迟结论。
+
+ShareGPT 默认每次 1000 请求增加了尾部样本，但不保证 P99 已稳定；应同时报告各次结果、样本数、失败数和运行间波动。LongBench 使用全部有效样本加多次到达，五次运行不会增加独立文本数；200 样本的一次 P99 仍接近最高两三个值。不要平均五个 P99 后称为一个统计稳定的 P99；需要时保留逐请求数据做合并描述，同时注明文本复用和到达重复，或在比较前固定更大的子集集合。
+
 例如检查 L1 单并发结果：
 
 ```bash
 uv run python tools/analyze_bench.py \
-  --result /Data2/zincion/experiments/m2/b0-l1/random-1024-l1-1.json \
+  --result /Data2/zincion/experiments/m2/b0-l1/random-1024-l1-1-rep0.json \
   --server-timings /Data2/zincion/experiments/m2/server-timing.jsonl \
-  --request-id-prefix random-1024-l1-1- \
+  --request-id-prefix random-1024-l1-1-rep0- \
   --output /Data2/zincion/experiments/m2/timing-check.json
 ```
 
 逐请求核对 `len(itl) + 1 == output_tokens`，并按 request id 比较客户端 TTFT 与服务端“收到请求至首次 ASGI send 返回”。两者相差包含客户端/网络/HTTP 开销；不能预先认定为零。客户端的初始验证请求会复用第一条 ID，分析工具采用该 ID 最后的首 chunk 记录。
 
-再用相同请求列表和 seed 运行一次，把输出放到另一个目录；`analyze_bench.py --compare-arrivals <第二次详细结果>` 比较实际相对发送时间。vLLM 0.15.0 的 `serve.py` 会保存 `start_times`（详细结果分支），其 `get_request` 采样 gamma 间隔并归一化累计时间；seed 控制随机计划，事件循环与并发排队仍影响实际发送时间。保存了实际时间不代表能按原时间戳回放；这个版本没有 `timed_trace`。
+再用相同请求列表和 seed 运行一次，把输出放到另一个目录；对齐同一 `rep`，用 `analyze_bench.py --compare-arrivals <第二次详细结果>` 比较实际相对发送时间。vLLM 0.15.0 的 `serve.py` 会保存 `start_times`（详细结果分支），其 `get_request` 采样 gamma 间隔并归一化累计时间；seed 控制随机计划，事件循环与并发排队仍影响实际发送时间。保存了实际时间不代表能按原时间戳回放；这个版本没有 `timed_trace`。
 
 分别关闭/开启 `timing_path`，用同一单并发请求文件、相同 seed、预热和重复次数重测，保存每次 detailed JSON 后再比较开销。当前没有该 GPU 实测结果。
 

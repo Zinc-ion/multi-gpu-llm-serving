@@ -17,9 +17,10 @@ class LayerNorm(torch.nn.Module):
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
         # RMSNorm(x) = (x / sqrt(mean(x²) + ε)) ⊙ γ
 
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
         variance = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
-        sqrt_variance = variance.sqrt()
-        x_norm = (x / sqrt_variance * self.weight)
+        x_norm = self.weight * (x * torch.rsqrt(variance)).to(input_dtype)
 
         return x_norm
 

@@ -1,25 +1,39 @@
 # M2 GPU 验收与测量复现
 
-以下命令用于有空闲 GPU 时执行，命令本身不表示验收通过。已有的 GPU0 / 同 NUMA 结果见 [2026-11-14 实测记录](m2_measurements_2026-11-14_zh.md)。模型和实验数据均放在 `/Data2/zincion`。先将对应代码放到服务器仓库目录，再在仓库根目录操作；以记录的 commit 和固定模型 revision 标识实验。
+以下命令用于有空闲 GPU 时执行，命令本身不表示验收通过。已有的 GPU0 / 同 NUMA 结果见 [2026-11-14 实测记录](m2_measurements_2026-11-14_zh.md)。服务器工作目录为 `/Data2/zincion/ai-infra`；新增模型缓存、实验数据、日志和临时文件均写入此目录。先将对应代码放到服务器仓库目录，再在仓库根目录操作；以记录的 commit 和固定模型 revision 标识实验。
 
 ## 环境与原始记录
 
 ```bash
-export UV_CACHE_DIR=/Data2/zincion/uv-cache
-export UV_PYTHON_INSTALL_DIR=/Data2/zincion/python
+export M2_WORKSPACE=/Data2/zincion/ai-infra
+export UV_CACHE_DIR="$M2_WORKSPACE/.cache/uv"
+export UV_PYTHON_INSTALL_DIR="$M2_WORKSPACE/python"
+export XDG_CACHE_HOME="$M2_WORKSPACE/.cache"
+export HF_HOME="$M2_WORKSPACE/.cache/huggingface"
+export HF_HUB_CACHE="$M2_WORKSPACE/huggingface"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export TORCHINDUCTOR_CACHE_DIR="$M2_WORKSPACE/.cache/torchinductor"
+export TRITON_CACHE_DIR="$M2_WORKSPACE/.cache/triton"
+export CUDA_CACHE_PATH="$M2_WORKSPACE/.cache/cuda"
+export VLLM_CACHE_ROOT="$M2_WORKSPACE/.cache/vllm"
+export NUMBA_CACHE_DIR="$M2_WORKSPACE/.cache/numba"
+export TMPDIR="$M2_WORKSPACE/.tmp/m2"
+mkdir -p "$TMPDIR"
 uv python install 3.11.16
 uv sync --locked --python 3.11.16
-mkdir -p /Data2/zincion/experiments/m2
-git rev-parse HEAD > /Data2/zincion/experiments/m2/code-commit.txt
+mkdir -p /Data2/zincion/ai-infra/experiments/m2
+git rev-parse HEAD > /Data2/zincion/ai-infra/experiments/m2/code-commit.txt
 uv run python -c "import sys; print(sys.version)"
 uv run python -c "import torch, transformers; print(torch.__version__, transformers.__version__, torch.version.cuda, torch.cuda.nccl.version())" \
-  > /Data2/zincion/experiments/m2/versions.txt
-nvidia-smi > /Data2/zincion/experiments/m2/nvidia-smi.txt
-nvidia-smi topo -m > /Data2/zincion/experiments/m2/topology.txt
-nvidia-smi topo -p2p r > /Data2/zincion/experiments/m2/p2p-read.txt
-nvidia-smi topo -p2p w > /Data2/zincion/experiments/m2/p2p-write.txt
-numactl --hardware > /Data2/zincion/experiments/m2/numa.txt
+  > /Data2/zincion/ai-infra/experiments/m2/versions.txt
+nvidia-smi > /Data2/zincion/ai-infra/experiments/m2/nvidia-smi.txt
+nvidia-smi topo -m > /Data2/zincion/ai-infra/experiments/m2/topology.txt
+nvidia-smi topo -p2p r > /Data2/zincion/ai-infra/experiments/m2/p2p-read.txt
+nvidia-smi topo -p2p w > /Data2/zincion/ai-infra/experiments/m2/p2p-write.txt
+numactl --hardware > /Data2/zincion/ai-infra/experiments/m2/numa.txt
 ```
+
+这些环境变量也应在其他服务端/客户端终端中设置。旧模型 snapshot 和既有 Python 环境可以只读使用；不要把新下载、编译缓存或日志写回工作目录外。0.6B 配置保留 M0 基线，服务器运行时在工作目录内另存临时配置，覆盖 `cache_dir`，已有模型可用本地 snapshot 绝对路径。
 
 需要系统已有 `uv` 和 `numactl`。单独记录驱动、Python、框架、NCCL 和代码版本。锁文件中的 vLLM 为 0.15.0、Transformers 为 4.57.3；custom JSONL 的读取还使用 `pandas`，已显式声明并锁定。不要通过升级依赖掩盖验证失败。
 
@@ -30,22 +44,22 @@ numactl --hardware > /Data2/zincion/experiments/m2/numa.txt
 ```bash
 uv run python tools/compare_hf.py prepare \
   --config configs/qwen3_14b.json \
-  --output /Data2/zincion/experiments/m2/prompts-14b.json
+  --output /Data2/zincion/ai-infra/experiments/m2/prompts-14b.json
 
 CUDA_VISIBLE_DEVICES=0 numactl --cpunodebind=0 --membind=0 \
   uv run python tools/compare_hf.py custom \
   --config configs/qwen3_14b.json \
-  --prompts /Data2/zincion/experiments/m2/prompts-14b.json \
-  --max-tokens 32 --output /Data2/zincion/experiments/m2/custom-14b.pt \
-  > /Data2/zincion/experiments/m2/custom-14b.log 2>&1
+  --prompts /Data2/zincion/ai-infra/experiments/m2/prompts-14b.json \
+  --max-tokens 32 --output /Data2/zincion/ai-infra/experiments/m2/custom-14b.pt \
+  > /Data2/zincion/ai-infra/experiments/m2/custom-14b.log 2>&1
 
 CUDA_VISIBLE_DEVICES=0 numactl --cpunodebind=0 --membind=0 \
   uv run python tools/compare_hf.py reference \
   --config configs/qwen3_14b.json \
-  --custom /Data2/zincion/experiments/m2/custom-14b.pt \
+  --custom /Data2/zincion/ai-infra/experiments/m2/custom-14b.pt \
   --max-tokens 32 --attention sdpa --sdpa-backend flash \
-  --output /Data2/zincion/experiments/m2/alignment-14b.json \
-  > /Data2/zincion/experiments/m2/reference-14b.log 2>&1
+  --output /Data2/zincion/ai-infra/experiments/m2/alignment-14b.json \
+  > /Data2/zincion/ai-infra/experiments/m2/reference-14b.log 2>&1
 ```
 
 manifest 物化三条套 chat template 的配置 prompt、1024/4096/16384 个 token 的重复合成长输入，以及一条固定 LongBench revision 的 qasper 自然长文本。自然用例从按原始 length 降序排列的样本中取首条 token 数足够的 context + input，截取至最长请求长度（默认 16384）；记录 `_id`、revision、原始 token 数和截取范围。它是自然文本续写数值检查，不是 qasper 任务准确率评测；重复输入继续作为位置压力用例。`prepare` 会把数据集缓存到配置的 `cache_dir`。custom 输出保存每个 step 的 logits，包括 prefill 最后一个位置和所有 decode 位置；参考输出逐 case 落盘，summary 的 `status=complete` 才表示所有 case 完成。
@@ -70,9 +84,9 @@ uv run python tools/compare_hf.py reference \
 
 ```bash
 uv run python tools/capacity_report.py \
-  --log /Data2/zincion/experiments/m2/custom-14b.log \
+  --log /Data2/zincion/ai-infra/experiments/m2/custom-14b.log \
   --config configs/qwen3_14b.json --output-tokens 128 \
-  --output /Data2/zincion/experiments/m2/capacity-14b.json
+  --output /Data2/zincion/ai-infra/experiments/m2/capacity-14b.json
 ```
 
 先核对参数加载完整性、RoPE cache、warmup 峰值、实际 block 数和三档长度的 block-rounded 并发上界，再选择服务及 bench 的并发。GPU0 已实测 367 块、93,952 个 KV token，见实测记录；换卡或环境后仍需重新 profiling。调整配置时使用仓库外的实验 JSON，并与原始数据一起保存。
@@ -84,15 +98,15 @@ uv run python - <<'PY'
 import json
 from pathlib import Path
 config = json.loads(Path("configs/qwen3_14b.json").read_text())
-config["timing_path"] = "/Data2/zincion/experiments/m2/server-timing.jsonl"
-Path("/Data2/zincion/experiments/m2/server-timed.json").write_text(json.dumps(config, indent=2))
+config["timing_path"] = "/Data2/zincion/ai-infra/experiments/m2/server-timing.jsonl"
+Path("/Data2/zincion/ai-infra/experiments/m2/server-timed.json").write_text(json.dumps(config, indent=2))
 PY
 
 CUDA_VISIBLE_DEVICES=0 numactl --cpunodebind=0 --membind=0 \
   uv run python -m myvllm.server \
-  --config /Data2/zincion/experiments/m2/server-timed.json \
+  --config /Data2/zincion/ai-infra/experiments/m2/server-timed.json \
   --served-model-name Qwen3-14B --port 8000 \
-  > /Data2/zincion/experiments/m2/server.log 2>&1
+  > /Data2/zincion/ai-infra/experiments/m2/server.log 2>&1
 ```
 
 该命令在前台运行；另一个终端启动客户端。启动第二个模型实例前先关闭前一个，HTTP 端口不同仍会冲突于固定 rendezvous。关闭服务也会在既有退出同步后刷新最后的 event 记录。
@@ -108,22 +122,22 @@ CUDA_VISIBLE_DEVICES=0 numactl --cpunodebind=0 --membind=0 \
 uv run python tools/prepare_workloads.py \
   --config configs/qwen3_14b.json --dataset sharegpt \
   --num-requests 1000 --seed 7 \
-  --cache-dir /Data2/zincion/huggingface \
-  --output /Data2/zincion/experiments/m2/sharegpt.jsonl
+  --cache-dir /Data2/zincion/ai-infra/huggingface \
+  --output /Data2/zincion/ai-infra/experiments/m2/sharegpt.jsonl
 
 # 不指定数量时使用全部有效 qasper 样本，避免对小子集静默过采样。
 uv run python tools/prepare_workloads.py \
   --config configs/qwen3_14b.json --dataset longbench --subset qasper \
   --output-tokens 128 --seed 7 \
-  --cache-dir /Data2/zincion/huggingface \
-  --output /Data2/zincion/experiments/m2/longbench.jsonl
+  --cache-dir /Data2/zincion/ai-infra/huggingface \
+  --output /Data2/zincion/ai-infra/experiments/m2/longbench.jsonl
 
 for m2_length in 1024 4096 16384; do
   uv run python tools/prepare_workloads.py \
     --config configs/qwen3_14b.json --dataset random --input-length "$m2_length" \
     --num-requests 100 --output-tokens 128 --seed 7 \
-    --cache-dir /Data2/zincion/huggingface \
-    --output "/Data2/zincion/experiments/m2/random-${m2_length}.jsonl"
+    --cache-dir /Data2/zincion/ai-infra/huggingface \
+    --output "/Data2/zincion/ai-infra/experiments/m2/random-${m2_length}.jsonl"
 done
 ```
 
@@ -140,24 +154,24 @@ bench 使用 `--skip-chat-template --disable-shuffle`，防止对已经物化的
 客户端 tokenizer 应使用服务器缓存中对应 revision 的**本地 snapshot 目录**。下例固定到本次 14B revision；若 Hugging Face cache 路径不同，显式修改路径。
 
 ```bash
-export M2_MODEL_SNAPSHOT=/Data2/zincion/huggingface/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18
+export M2_MODEL_SNAPSHOT=/Data2/zincion/ai-infra/huggingface/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18
 
 # L1：示例并发为 1；其他固定并发先从实际容量报告选择。
 for m2_length in 1024 4096 16384; do
   numactl --cpunodebind=0 --membind=0 uv run python tools/run_b0.py \
     --mode l1 --concurrency 1 --num-prompts 100 \
-    --dataset "/Data2/zincion/experiments/m2/random-${m2_length}.jsonl" \
+    --dataset "/Data2/zincion/ai-infra/experiments/m2/random-${m2_length}.jsonl" \
     --model Qwen3-14B --tokenizer "$M2_MODEL_SNAPSHOT" \
-    --output-dir /Data2/zincion/experiments/m2/b0-l1
+    --output-dir /Data2/zincion/ai-infra/experiments/m2/b0-l1
 done
 
 # L2：这些速率仅是起始扫描点，不是已测容量。
 for m2_dataset in sharegpt longbench; do
   numactl --cpunodebind=0 --membind=0 uv run python tools/run_b0.py \
     --mode l2 --request-rates 1 2 4 --repetitions 5 \
-    --dataset "/Data2/zincion/experiments/m2/${m2_dataset}.jsonl" \
+    --dataset "/Data2/zincion/ai-infra/experiments/m2/${m2_dataset}.jsonl" \
     --model Qwen3-14B --tokenizer "$M2_MODEL_SNAPSHOT" \
-    --output-dir /Data2/zincion/experiments/m2/b0-l2
+    --output-dir /Data2/zincion/ai-infra/experiments/m2/b0-l2
 done
 ```
 
@@ -173,10 +187,10 @@ ShareGPT 默认每次 1000 请求增加了尾部样本，但不保证 P99 已稳
 
 ```bash
 uv run python tools/analyze_bench.py \
-  --result /Data2/zincion/experiments/m2/b0-l1/random-1024-l1-1-rep0.json \
-  --server-timings /Data2/zincion/experiments/m2/server-timing.jsonl \
+  --result /Data2/zincion/ai-infra/experiments/m2/b0-l1/random-1024-l1-1-rep0.json \
+  --server-timings /Data2/zincion/ai-infra/experiments/m2/server-timing.jsonl \
   --request-id-prefix random-1024-l1-1-rep0- \
-  --output /Data2/zincion/experiments/m2/timing-check.json
+  --output /Data2/zincion/ai-infra/experiments/m2/timing-check.json
 ```
 
 逐请求核对 `len(itl) + 1 == output_tokens`，同时核对 detailed 结果的 `output_lens` 是否与物化列表各行的 `output_tokens` 一致；chunk 计数正确不能证明预算没有被 CLI 覆盖或总长度上限截断。再按 request id 比较客户端 TTFT 与服务端“收到请求至首次 ASGI send 返回”。两者相差包含客户端/网络/HTTP 开销；不能预先认定为零。客户端的初始验证请求会复用第一条 ID，分析工具采用该 ID 最后的首 chunk 记录。
@@ -202,12 +216,12 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m vllm.entrypoints.cli.main serve \
 curl -N http://127.0.0.1:8001/v1/completions \
   -H 'Content-Type: application/json' -H 'x-request-id: protocol-probe' \
   --data-binary '{"model":"Qwen3-0.6B","prompt":"Explain 你好 and emoji 😀.","temperature":0,"max_tokens":16,"ignore_eos":true,"stream":true,"stream_options":{"include_usage":true}}' \
-  > /Data2/zincion/experiments/m2/vllm-probe.sse
+  > /Data2/zincion/ai-infra/experiments/m2/vllm-probe.sse
 
 uv run python - <<'PY'
 import json
 from pathlib import Path
-rows = [json.loads(line[6:]) for line in Path("/Data2/zincion/experiments/m2/vllm-probe.sse").read_text().splitlines()
+rows = [json.loads(line[6:]) for line in Path("/Data2/zincion/ai-infra/experiments/m2/vllm-probe.sse").read_text().splitlines()
         if line.startswith("data: ") and line != "data: [DONE]"]
 choices = [row for row in rows if row.get("choices")]
 usage = [row["usage"] for row in rows if row.get("usage")][-1]
@@ -225,27 +239,27 @@ PY
 执行前用新的 `topo -m` 和 `/sys/bus/pci/devices/<BDF>/numa_node` 核对 GPU 的 NUMA 节点。以下两个主存节点 0/1 来自硬件快照；若实际拓扑不同，调整节点列表。测试应在目标卡空闲且没有其他实验干扰时运行。
 
 ```bash
-mkdir -p /Data2/zincion/experiments/m2/pcie
+mkdir -p /Data2/zincion/ai-infra/experiments/m2/pcie
 unset CUDA_VISIBLE_DEVICES
 for m2_node in 0 1; do
   for m2_gpu in 0 1 2 3 4; do
     for m2_mode in h2d d2h bidirectional; do
       numactl --cpunodebind="$m2_node" --membind="$m2_node" \
         uv run python tools/pcie_benchmark.py --mode "$m2_mode" --gpus "$m2_gpu" \
-        --output "/Data2/zincion/experiments/m2/pcie/${m2_mode}-gpu${m2_gpu}-host${m2_node}.jsonl"
+        --output "/Data2/zincion/ai-infra/experiments/m2/pcie/${m2_mode}-gpu${m2_gpu}-host${m2_node}.jsonl"
     done
   done
   for m2_pair in "0 1" "3 4"; do
     read -r m2_a m2_b <<< "$m2_pair"
     numactl --cpunodebind="$m2_node" --membind="$m2_node" \
       uv run python tools/pcie_benchmark.py --mode dual-d2h --gpus "$m2_a" "$m2_b" \
-      --output "/Data2/zincion/experiments/m2/pcie/dual-${m2_a}-${m2_b}-host${m2_node}.jsonl"
+      --output "/Data2/zincion/ai-infra/experiments/m2/pcie/dual-${m2_a}-${m2_b}-host${m2_node}.jsonl"
   done
   for m2_pair in "0 1" "1 0" "0 3" "3 0"; do
     read -r m2_a m2_b <<< "$m2_pair"
     numactl --cpunodebind="$m2_node" --membind="$m2_node" \
       uv run python tools/pcie_benchmark.py --mode twohop --gpus "$m2_a" "$m2_b" \
-      --output "/Data2/zincion/experiments/m2/pcie/twohop-${m2_a}-${m2_b}-host${m2_node}.jsonl"
+      --output "/Data2/zincion/ai-infra/experiments/m2/pcie/twohop-${m2_a}-${m2_b}-host${m2_node}.jsonl"
   done
   for m2_pair in "0 1" "0 3"; do
     read -r m2_a m2_b <<< "$m2_pair"
@@ -253,8 +267,8 @@ for m2_node in 0 1; do
       NCCL_DEBUG=INFO numactl --cpunodebind="$m2_node" --membind="$m2_node" \
         uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
         tools/pcie_benchmark.py --mode nccl --gpus "$m2_a" "$m2_b" --sender "$m2_sender" \
-        --output "/Data2/zincion/experiments/m2/pcie/nccl-${m2_a}-${m2_b}-sender${m2_sender}-host${m2_node}.jsonl" \
-        > "/Data2/zincion/experiments/m2/pcie/nccl-${m2_a}-${m2_b}-sender${m2_sender}-host${m2_node}.log" 2>&1
+        --output "/Data2/zincion/ai-infra/experiments/m2/pcie/nccl-${m2_a}-${m2_b}-sender${m2_sender}-host${m2_node}.jsonl" \
+        > "/Data2/zincion/ai-infra/experiments/m2/pcie/nccl-${m2_a}-${m2_b}-sender${m2_sender}-host${m2_node}.log" 2>&1
     done
   done
 done

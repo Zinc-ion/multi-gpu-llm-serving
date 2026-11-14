@@ -55,7 +55,7 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 - GPU 拓扑：GPU0-2 位于一个 NUMA/PCIe 域，GPU3-4 位于另一个 NUMA/PCIe 域；跨域连接为 SYS；`nvidia-smi topo -p2p r/w` 显示 `CNS`，不能假设 GPU 间有直接 P2P 通道。
 - 主部署：GPU0/1 为一侧、GPU3/4 为另一侧，共 4 张卡。P 和 D 的方向（哪一侧做 P）用实测传输基准决定。
 - GPU2 作为弹性节点和对照卡。所有对比方案必须使用相同的 4 张卡。
-- 模型和实验数据存放在 `/Data2/zincion`，避免占用根分区；详细硬件记录见 [server_hardware_2026-11-09.md](./server_hardware_2026-11-09.md)。
+- 服务器工作目录为 `/Data2/zincion/ai-infra`，新增模型缓存、实验数据、日志及临时文件均存放于此，避免占用根分区；详细硬件记录见 [server_hardware_2026-11-09.md](./server_hardware_2026-11-09.md)。
 
 ## 3. 模型与精度
 

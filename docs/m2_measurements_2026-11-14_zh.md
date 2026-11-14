@@ -8,11 +8,11 @@
 
 Python 3.11.16、PyTorch 2.9.1+cu128、Transformers 4.57.3、vLLM 0.15.0。`torch.cuda.nccl.version()` 为 2.27.5，NCCL INFO 构建版本为 `2.27.5+cuda12.9`。Python 和锁定依赖迁入独立目录 `/Data2/zincion/envs/m2`，在服务器重新安装 editable 项目并由 `uv sync --locked --offline --no-build-isolation --reinstall-package myvllm` 审计，没有升级包。`numactl` 来自解包到用户目录的 Ubuntu `2.0.14-3ubuntu2` 包。
 
-原始数据根目录为 `/Data2/zincion/experiments/m2/20261114/`，下文文件名均相对此目录。`versions.txt`、`topology.txt`、`numa.txt` 保存环境；`commands.txt`、`campaign-events.jsonl` 和 bench 的 `*.command.json` 保存命令与代码版本。驱动脚本及配置也在该目录，不代替仓库模型、Scheduler、BlockManager 或客户端。
+原始数据根目录为 `/Data2/zincion/ai-infra/experiments/m2/20261114/`，下文文件名均相对此目录。`versions.txt`、`topology.txt`、`numa.txt` 保存环境；`commands.txt`、`campaign-events.jsonl` 和 bench 的 `*.command.json` 保存命令与代码版本。驱动脚本及配置也在该目录，不代替仓库模型、Scheduler、BlockManager 或客户端。旧记录中的 `/Data2/zincion/experiments/` 对应当前 `/Data2/zincion/ai-infra/experiments/`；文件路径、SHA256 和 inode 清单见 `migration/manifest.json`，历史日志及命令保留原值。现有工作目录外的模型 snapshot 与 Python 环境仅读取，新的缓存和临时文件由 `env.sh` 指向工作目录内。
 
 ```bash
-source /Data2/zincion/experiments/m2/20261114/env.sh
-export M2_DATA=/Data2/zincion/experiments/m2/20261114
+source /Data2/zincion/ai-infra/experiments/m2/20261114/env.sh
+export M2_DATA=/Data2/zincion/ai-infra/experiments/m2/20261114
 ```
 
 重跑应另选输出目录，GPU 应先空闲，本框架一次只启动一个实例。标准命令见 [GPU 验收复现](m2_experiments_zh.md)。vLLM 0.15.0 的 `platforms/interface.py::device_id_to_physical_device_id` 对可见设备元素执行 `int()`，相关导入路径不接受 UUID；本次设置 `CUDA_DEVICE_ORDER=PCI_BUS_ID`，用数字编号限制设备，再用 PyTorch 返回的 UUID 核对 GPU0，见 `gpu-mapping.log`。

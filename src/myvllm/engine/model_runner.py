@@ -367,11 +367,15 @@ class ModelRunner:
             graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
             vars = self.graph_vars
             # copy input data into graph variables
+            vars['input_ids'].zero_()
             vars['input_ids'][:bs].copy_(input_ids)
-            vars['slot_mapping'][:bs].fill_(-1)
+            vars['slot_mapping'].fill_(-1)
             vars['slot_mapping'][:bs].copy_(context.slot_mapping)
             vars["context_lens"].zero_()
             vars['context_lens'][:bs].copy_(context.context_lens)
+            vars['positions'].zero_()
+            vars['positions'][:bs].copy_(context.positions)
+            vars["block_tables"].fill_(-1)
             vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             # replay the graph
             graph.replay()
@@ -422,25 +426,27 @@ class ModelRunner:
     # (later use graph.replay() to run the captured graph)
     @torch.inference_mode()
     def capture_cudagraph(self) -> None:
-        max_bs = self.config['max_num_sequences']
+        max_bs = min(self.config['max_num_sequences'], self.config['max_num_batched_tokens'], self.config['max_cached_blocks'])
         max_len = self.config['max_model_length']
         max_num_blocks = math.ceil(max_len / self.block_size)
         # for decoding, input is always of shape (batch_size, 1)
         input_ids = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
         # for paged attention
         # where to write new KV values in the cache
-        slot_mapping = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        slot_mapping = torch.full((max_bs,), -1, dtype=torch.long, device=f'cuda:{self.rank}')
         # how many tokens each sequence has processed
         context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
         # where to read KV values in the cache
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
-        # output logits
-        outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
+        block_tables = torch.full((max_bs, max_num_blocks), -1, dtype=torch.int32, device=f'cuda:{self.rank}')
+        positions = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        # output hidden states; the LM head runs after replay
+        outputs = torch.zeros(max_bs, self.config['hidden_size'], dtype=self.default_dtype, device=f'cuda:{self.rank}')
 
         # graphs to be captured for different batch sizes
-        batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        batch_sizes = sorted({size for size in [1, 2, 4, 8] + list(range(16, max_bs + 1, 16)) + [max_bs] if size <= max_bs})
         self.graphs = {}
         graph_pool = None
+        capture_stream = torch.cuda.Stream(device=self.rank)
 
         for batch_size in reversed(batch_sizes):
             graph = torch.cuda.CUDAGraph()
@@ -453,13 +459,17 @@ class ModelRunner:
                 slot_mapping=slot_mapping[:batch_size],
                 context_lens=context_lens[:batch_size],
                 block_tables=block_tables[:batch_size],
+                positions=positions[:batch_size],
             )
-            outputs[:batch_size] = self.model(input_ids[:batch_size])
-
-            with torch.cuda.graph(graph, graph_pool):
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
                 outputs[:batch_size] = self.model(input_ids[:batch_size])
-                if graph_pool is None:
-                    graph_pool = graph.pool()
+            torch.cuda.current_stream().wait_stream(capture_stream)
+
+            with torch.cuda.graph(graph, graph_pool, stream=capture_stream):
+                outputs[:batch_size] = self.model(input_ids[:batch_size])
+            if graph_pool is None:
+                graph_pool = graph.pool()
             # store the captured graph
             self.graphs[batch_size] = graph
 
@@ -467,10 +477,12 @@ class ModelRunner:
             torch.cuda.synchronize()
             reset_context()
 
+        self.graphs = dict(sorted(self.graphs.items()))
         self.graph_vars = dict(
             input_ids=input_ids,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            positions=positions,
             outputs=outputs,
         )

@@ -388,6 +388,10 @@ def paged_attention_decode_kernel(
     # Load query: (batch_size, num_heads, head_dim)
     offs_d = tl.arange(0, head_dim)
     q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    if context_len == 0:
+        # CUDA Graph padding has no KV and must not divide by a zero normalizer.
+        tl.store(output_ptr + q_offset, tl.full([head_dim], 0, tl.float32))
+        return
     q = tl.load(query_ptr + q_offset)
     
     # Initialize accumulators

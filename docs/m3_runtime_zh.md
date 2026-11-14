@@ -1,4 +1,4 @@
-# M3：paged prefill 与 chunked prefill
+# M3：paged prefill、chunked prefill 与 CUDA Graph
 
 本文说明 M3 代码的接口和后续服务器验收方法。GPU 正确性、显存容量、B1 性能及 vLLM 完整参照数据均待实测，不能由 CPU 测试推定通过。M2 尚未完成的 B0、阈值和 SLO 验收仍独立保留。
 
@@ -39,6 +39,16 @@ CUDA_VISIBLE_DEVICES='' uv run python -m pytest -q
 CPU 测试保留真实 Scheduler、BlockManager、ModelRunner 输入准备、Qwen3/Llama 模型计算、tokenizer 和 HTTP 路径，GPU 数据搬运和 attention kernel 用 CPU 实现替代。覆盖分块、混合、抢占重算、取消和协议计数。tiny 模型 FP32 logits 使用 PyTorch 默认浮点比较规则，BF16 检查 greedy token 与有限值；这些是单元测试约束，不是待用户确认的 14B logits 验收阈值。
 
 GPU kernel 测试带 CUDA skip 条件，比较打乱物理 block 后的 suffix attention 与 PyTorch SDPA，覆盖不同 block 大小和 FP32/BF16。尚未运行的 GPU 测试不能记作通过。
+
+## CUDA Graph decode 的代码修复
+
+`enforce_eager=false` 时只捕获纯 decode，混合 batch 和 prefill 仍 eager 执行。capture output 使用模型 dtype 的 `hidden_size` 宽度，LM head 和 sampling 保留在 graph 外。capture batch 不超过序列上限、每步 token 预算和 profiling 后的实际 block 数，包含边界 batch；replay 选择最小可容纳实际 batch 的 graph。
+
+input、positions、slot mapping、context lengths 和 block tables 都使用固定地址。每步复制前清除 padding 和旧表列：padding 的 slot 为 `-1`，context length 为 0；decode kernel 对零长度行返回零，不访问 KV，也不除以零。warmup 在单独 stream 上完成，capture 后保存 graph pool，启动期间同步，replay 不新增主机同步。
+
+CPU buffer 测试用设备执行替身验证真实 capture/replay 准备逻辑，不能据此宣称 CUDA Graph 可用。另用独立进程 `TRITON_INTERPRET=1` 在 CPU 执行真实 Triton kernel，验证 FP32 paged prefill、sentinel slot 和零长度 decode。解释模式不检验 GPU 代码生成、stream 行为或性能。
+
+`tests/test_cudagraph_gpu.py` 保留真实 GPU 模型、attention、capture/replay，检查 whole/chunked 与 eager/graph 四种组合的 greedy token，并覆盖 batch 缩小及 padding。该测试尚待服务器执行。Graph 本身还有额外内存需求，现有 KV profiling 发生在 capture 前；14B 启用 graph 后必须重新检查峰值和容量，不能沿用 M2 eager 容量数字。
 
 ## 服务器验收顺序
 

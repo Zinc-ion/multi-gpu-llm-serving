@@ -55,7 +55,7 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 - GPU 拓扑：GPU0-2 位于一个 NUMA/PCIe 域，GPU3-4 位于另一个 NUMA/PCIe 域；跨域连接为 SYS；`nvidia-smi topo -p2p r/w` 显示 `CNS`，不能假设 GPU 间有直接 P2P 通道。
 - 主部署：GPU0/1 为一侧、GPU3/4 为另一侧，共 4 张卡。P 和 D 的方向（哪一侧做 P）用实测传输基准决定。
 - GPU2 作为弹性节点和对照卡。所有对比方案必须使用相同的 4 张卡。
-- 模型和实验数据存放在 `/Data2/zincion`，避免占用根分区；详细硬件记录见 [server_hardware_2026-11-09.md](./server_hardware_2026-11-09.md)。
+- 服务器工作目录为 `/Data2/zincion/ai-infra`，新增模型缓存、实验数据、日志及临时文件均存放于此，避免占用根分区；详细硬件记录见 [server_hardware_2026-11-09.md](./server_hardware_2026-11-09.md)。
 
 ## 3. 模型与精度
 
@@ -98,8 +98,8 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 
 ### 测量工具
 
-- 自研框架提供 OpenAI 兼容的流式 HTTP 服务（见 M2），自研框架和 vLLM 用**同一个客户端**测量，口径天然一致。
-- 性能：`vllm bench serve`。它支持泊松/gamma 到达、并发上限、按时间戳回放 trace，并内置按 DistServe 定义计算 goodput 的 `--goodput` 参数。
+- 自研框架提供 OpenAI 兼容的流式 HTTP 服务（见 M2），自研框架和 vLLM 用**同一个客户端**测量。M2 实测自研服务逐 token 发 choices，vLLM 0.15.0 可能合并增量 chunk；其客户端 ITL 是 chunk 间隔，不能直接当成逐 token 间隔，usage 与 TPOT 的 token 计数另行核对，见 [单 NUMA 实测记录](m2_measurements_2026-11-14_zh.md)。
+- 性能：`vllm bench serve`。锁定的 vLLM 0.15.0 支持泊松/gamma 到达、并发上限和 `--goodput`，详细结果可保存实际请求发送时间；其数据集选项没有 `timed_trace`，不支持按原时间戳回放 trace。
 - 质量：evalscope，通过 OpenAI API 接入。
 - `vllm bench serve` 看不到框架内部的指标（如 KV 传输时间），这类指标由框架自己记录到日志，按请求 ID 与客户端结果对齐。
 
@@ -118,13 +118,13 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 |---|---|---|---|---|
 | L1 受控实验 | KV 传输开销随 prompt 长度怎么变；TTFT 由哪几段组成 | 合成数据：`--dataset-name random`，输入长度扫 1K/4K/16K，输出长度固定，加 `--ignore-eos` | 单请求或固定并发 | M2、M5、M6 |
 | L2 SLO / goodput（简历主要数字） | SLO 约束下每张卡能承载多少请求 | ShareGPT（对话，短输入，体现 PD 干扰）；LongBench（长输入，体现传输瓶颈） | `--request-rate` 扫速率，泊松到达，固定 `--seed`，`--goodput` 设 SLO | M3、M5–M8 |
-| L3 负载变化 | 负载随时间变化时，弹性 P/D 是否有效 | 公开 trace（Azure LLM 推理 trace、Mooncake trace，格式需核实），或合成“对话为主”与“长输入为主”交替的分阶段负载 | 按时间戳回放（`timed_trace`） | M8 必需 |
+| L3 负载变化 | 负载随时间变化时，弹性 P/D 是否有效 | 公开 trace（Azure LLM 推理 trace、Mooncake trace，格式需核实），或合成“对话为主”与“长输入为主”交替的分阶段负载 | 按时间戳回放（客户端待核实；vLLM 0.15.0 无 `timed_trace`） | M8 必需 |
 | 吞吐模式 | 优化是否损失吞吐 | 合成数据，固定 `[输入, 输出, 并发, 请求数]` 用例 | 不限速率加固定并发 | 补充 |
 
 - 静态泊松负载测不出弹性调度的价值：固定 P/D 配比只有在负载类型变化时才会一侧闲置，所以 M8 必须有 L3。
 - 吞吐模式只作补充。它衡量的是吞吐，而 PD 分离的收益在延迟和 SLO 上，不能作为主线指标。
 - 用例的并发和长度必须先按显存容量测算（见 M2），不能照搬其他场景的配置。
-- 每次实验保存数据集版本、采样后的请求列表和到达计划，支持原样回放。
+- 每次实验保存数据集版本、物化后的请求列表、seed 和实际发送时间。固定 seed 可复现随机到达计划，不能保证实际发送时刻完全相同；精确时间戳回放是 M8 前需要补齐或核实的能力。
 
 ### 质量与正确性
 
@@ -154,7 +154,7 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 
 - 增加 Qwen3-14B 配置并跑通单卡推理，与 Transformers 参考实现对比 greedy 输出和 logits 误差。
 - **OpenAI 兼容流式服务**：实现 `/v1/completions` 和 `/v1/chat/completions`，支持流式返回，使 `vllm bench serve` 和 evalscope 能直接测量本框架。TTFT/ITL 依赖流式返回的 chunk 计时，接入后用单请求实测确认计时口径与 vLLM 一致。当前框架只有离线 `generate()`，服务层需要把同步 step 循环改为可持续接收请求的引擎循环。
-- **容量测算与配置**：按单卡显存、权重大小和每 token KV 大小算出可容纳的 token 数，据此设计 L1/L2 用例的长度和并发。以 Qwen3-14B 粗估：单卡约剩 13 GiB 给 KV，BF16 约 160 KiB/token，约 8.5 万 token；4K+1K 请求约 17 并发，16K+1K 约 5 并发（以实测为准）。同时调大当前的 `max_model_length=128` 和 `max_num_batched_tokens=1024`；在 M3 实现 chunked prefill 之前，Scheduler 要求 `max_model_length ≤ max_num_batched_tokens`。
+- **容量测算与配置**：按单卡显存、权重大小和每 token KV 大小算出可容纳的 token 数，据此设计 L1/L2 用例的长度和并发。Qwen3-14B BF16 每 token KV 为 160 KiB；GPU0 在 M2 配置下实测得到 367 块、14.3359375 GiB KV、93,952 token，按 block 取整后的 4K+1K、16K+1K 请求容量上界分别为 18、5，并非稳定并发保证，见 [实测环境与推导](m2_measurements_2026-11-14_zh.md)。M2 配置已将 `max_model_length`、`max_num_batched_tokens` 均设为 17408；在 M3 实现 chunked prefill 之前，Scheduler 要求 `max_model_length ≤ max_num_batched_tokens`。
 - 按阶段记录耗时：schedule、prepare、H2D、forward、sampling、D2H、postprocess，以及后续的状态传输。
 - PCIe 微基准：分别测 D2H、H2D、双向同时、同 NUMA 与跨 NUMA，以及 NCCL send/recv 在无 P2P 下的实际带宽。
 - 准备 L1/L2 的数据集和请求列表，固定数据集版本和随机种子。
@@ -264,7 +264,7 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 
 **评测工具与数据**
 
-- [`vllm bench serve` 文档](https://docs.vllm.ai/en/latest/cli/bench/serve.html)：数据集类型（`random`、`sharegpt`、`timed_trace` 等）、到达过程、`--goodput`、百分位指标参数。
+- [`vllm bench serve` 文档](https://docs.vllm.ai/en/latest/cli/bench/serve.html)：数据集类型、到达过程、`--goodput`、百分位指标参数。以锁定的 0.15.0 源码为准，不把最新版文档中的能力视为本环境已支持。
 - [evalscope math_500](https://evalscope.readthedocs.io/zh-cn/v1.5.1/benchmarks/math_500.html)：质量评测示例。
 - [ShareGPT（Hugging Face）](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered)：vLLM 和 DistServe 常用的对话负载。
 - [LongBench](https://github.com/THUDM/LongBench)：长上下文负载和长上下文质量评测。

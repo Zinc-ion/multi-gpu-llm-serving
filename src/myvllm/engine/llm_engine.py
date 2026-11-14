@@ -25,6 +25,7 @@ def worker_process(config, rank, event):
 class LLMEngine:
     def __init__(self, config: dict):
         self.config = config
+        self.request_ids = {}
         world_size = config.get("world_size", 1)
         ctx = mp.get_context("spawn")
         self.processes = []
@@ -50,7 +51,7 @@ class LLMEngine:
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
-            eos=config.get("eos", 50256),
+            eos=config["eos"],
             max_model_length=config["max_model_length"]
         )
 
@@ -67,18 +68,41 @@ class LLMEngine:
     # return scheduled sequences and whether it is for prefilling
     # call model_runner.run() to run the model
     # call postprocessor to process the outputs and update sequences and update block manager
-    def step(self) -> tuple[list[tuple[int, list[int]]], int, bool]:
+    def step(self, on_tokens=None) -> tuple[list[tuple[int, list[int]]], int, bool]:
+        timings = self.model_runner.timings
+        if timings:
+            timings.begin()
+            schedule_start = time.perf_counter()
         scheduled_sequences, is_prefill = self.scheduler.schedule()
+        if timings:
+            timings.cpu["schedule_ms"] = (time.perf_counter() - schedule_start) * 1000
         num_processed_tokens = 0
         if not scheduled_sequences:
             return [], num_processed_tokens, is_prefill
+        if timings:
+            token_count = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
         # Move outputs to CPU and convert them to a list
+        if timings:
+            d2h_start = time.perf_counter()
+            timings.start_gpu("d2h")
         if outputs is not None:
-            outputs = outputs.cpu().tolist()
+            outputs = outputs.cpu()
+            if timings:
+                timings.end_gpu("d2h")
+            outputs = outputs.tolist()
+        if timings:
+            timings.cpu["d2h_host_ms"] = (time.perf_counter() - d2h_start) * 1000
+            postprocess_start = time.perf_counter()
         # postprocess the outputs
         self.scheduler.postprocess(scheduled_sequences, outputs)
+        if timings:
+            timings.cpu["postprocess_ms"] = (time.perf_counter() - postprocess_start) * 1000
+            timings.write(self.config["timing_path"], is_prefill, scheduled_sequences, token_count, self.request_ids)
+        if on_tokens is not None:
+            for seq, token in zip(scheduled_sequences, outputs):
+                on_tokens(seq, token)
 
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
         num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)

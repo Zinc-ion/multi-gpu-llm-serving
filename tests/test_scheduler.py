@@ -21,7 +21,7 @@ def make_scheduler(
         max_num_batched_tokens=max_num_batched_tokens,
         max_cached_blocks=max_cached_blocks,
         block_size=block_size,
-        eos=0,
+        eos=[0],
         max_model_length=max_model_length if max_model_length is not None else min(max_num_batched_tokens, max_cached_blocks * block_size),
     )
 

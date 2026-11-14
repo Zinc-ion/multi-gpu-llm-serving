@@ -32,9 +32,9 @@ M0/M1 改动以最小 diff 方式叠加在上游基线之上，保留上游注�
 | Qwen `head_dim` | `Fixed: was 64, should be 128`；原括号中的 `hidden_size / num_heads` 不适用于此处，`1024 / 16` 为 64，不能据此推得 128；保留入口已有的显式维度 | `128` |
 | Qwen `base` | `Fixed: was 10000, HF uses rope_theta=1000000` | `1000000` |
 | Qwen `ffn_bias` | `Fixed: HF Qwen3 doesn't use MLP bias` | `false` |
-| Qwen `eos` | `Fixed: should match tokenizer.eos_token_id` | `151645` |
+| Qwen `eos` | 原注释为 `Fixed: should match tokenizer.eos_token_id`；M2 按固定 generation config 扩展停止列表 | `[151645, 151643]`（M2） |
 | Qwen `max_position` / Llama `max_position_embeddings` | RoPE 可用位置上限应不小于请求总长度上限 `max_model_length` | `32768` |
-| Llama `eos` | 应匹配 tokenizer；原注释另记 HF 的 EOS 列表为 `[128001, 128008, 128009]`。当前调度器仍只比较配置中的单个 EOS，没有新增多 EOS 支持 | `128009` |
+| Llama `eos` | 应匹配 tokenizer；原注释另记 HF 的 EOS 列表为 `[128001, 128008, 128009]`。M0/M1 基线只比较配置中的单个 EOS；M2 已扩展为列表，Llama 仍只保留该 token | `[128009]`（M2 类型适配） |
 
 `sampling.max_tokens` 是最多生成的 token 数；`max_model_length` 是 prompt 与 completion 的总长度上限，两者任一先到就停止。默认分别为 256 和 128，因此实际 completion 还受 prompt 长度约束。两个入口中原有的三行教学注释继续保留。
 
@@ -76,6 +76,8 @@ Scheduler 的请求状态必须满足：
 - 当前引擎是同步 step loop；取消在 scheduler step 之间生效，不会中断正在运行的 GPU kernel。
 
 ## 当前范围
+
+本文描述 M0/M1 固定基线；M2 的数值修复、EOS 列表、服务接口及 GPU 验收边界见 [M2 运行说明](./m2_runtime_zh.md)。
 
 M0/M1 只建立可复现基线和调度/KV 生命周期正确性。当前 prefill kernel 仍不消费 prefix-cache block table，因此活动请求之间不会共享 prefix block；哈希表只用于生命周期记录，并在释放时清理。Qwen3-14B、TP=2、2P+2D、FP8 KV cache 和端到端优化属于后续 M2-M9，不应在当前阶段写成已完成能力。
 

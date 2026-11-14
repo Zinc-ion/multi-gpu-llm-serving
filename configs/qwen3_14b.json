@@ -3,7 +3,7 @@
   "model_type": "Qwen3-14B",
   "model_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
   "tokenizer_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
-  "cache_dir": "/Data2/zincion/huggingface",
+  "cache_dir": "/Data2/zincion/ai-infra/huggingface",
   "dtype": "bfloat16",
   "seed": 0,
   "max_num_sequences": 2048,

@@ -81,7 +81,7 @@
 
 ## 7. 当前已知状态（随阶段更新）
 
-- M2 已增加 RoPE/RMSNorm 的 FP32 中间计算修复、greedy、多 EOS、14B 分派、单实例 HTTP 服务和测量工具；CPU 测试不代表 14B/GPU/PCIe/B0 验收通过。14B 资源字段仍是待实测候选，logits/token 阈值及 SLO 尚待数据与人工确认。
+- M2 已增加 RoPE/RMSNorm 的 FP32 中间计算修复、greedy、多 EOS、14B 分派、单实例 HTTP 服务和测量工具；GPU0 的 14B 加载、HF 对比、容量及同 NUMA PCIe 实测见 `docs/m2_measurements_2026-11-14_zh.md`。完整 B0、跨 NUMA、logits/token 阈值及 SLO 尚未完成验收，不得仅凭 CPU 测试或小规模测量宣称通过。
 - 当前配置默认 `enforce_eager=true`，CUDA Graph 路径存在上游遗留的形状问题，见 `docs/m0_m1_baseline_zh.md`，计划在 M3 修复。
 - 当前 prefill kernel 不读取 block table，跨请求 prefix 复用保持禁用。在实现 paged prefill 和 RoPE 位置偏移之前，不要重新启用。
 

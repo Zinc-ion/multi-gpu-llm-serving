@@ -1,6 +1,6 @@
 # M2 GPU 验收与测量复现
 
-以下命令用于有空闲 GPU 时手动执行，不表示已获得测量结果。模型和实验数据均放在 `/Data2/zincion`。先将对应代码放到服务器仓库目录，再在仓库根目录操作；以记录的 commit 和固定模型 revision 标识实验。
+以下命令用于有空闲 GPU 时执行，命令本身不表示验收通过。已有的 GPU0 / 同 NUMA 结果见 [2026-11-14 实测记录](m2_measurements_2026-11-14_zh.md)。模型和实验数据均放在 `/Data2/zincion`。先将对应代码放到服务器仓库目录，再在仓库根目录操作；以记录的 commit 和固定模型 revision 标识实验。
 
 ## 环境与原始记录
 
@@ -75,7 +75,7 @@ uv run python tools/capacity_report.py \
   --output /Data2/zincion/experiments/m2/capacity-14b.json
 ```
 
-先核对参数加载完整性、RoPE cache、warmup 峰值、实际 block 数和三档长度的 block-rounded 并发上界，再选择服务及 bench 的并发。候选资源参数尚未实测，不把立项的 13 GiB/8.5 万 token 粗估作为容量结论。调整配置时使用仓库外的实验 JSON，并与原始数据一起保存。
+先核对参数加载完整性、RoPE cache、warmup 峰值、实际 block 数和三档长度的 block-rounded 并发上界，再选择服务及 bench 的并发。GPU0 已实测 367 块、93,952 个 KV token，见实测记录；换卡或环境后仍需重新 profiling。调整配置时使用仓库外的实验 JSON，并与原始数据一起保存。
 
 开启计时的实验配置：
 
@@ -183,7 +183,7 @@ uv run python tools/analyze_bench.py \
 
 再用相同请求列表和 seed 运行一次，把输出放到另一个目录；对齐同一 `rep`，用 `analyze_bench.py --compare-arrivals <第二次详细结果>` 比较实际相对发送时间。vLLM 0.15.0 的 `serve.py` 会保存 `start_times`（详细结果分支），其 `get_request` 采样 gamma 间隔并归一化累计时间；seed 控制随机计划，事件循环与并发排队仍影响实际发送时间。保存了实际时间不代表能按原时间戳回放；这个版本没有 `timed_trace`。
 
-分别关闭/开启 `timing_path`，用同一单并发请求文件、相同 seed、预热和重复次数重测，保存每次 detailed JSON 后再比较开销。当前没有该 GPU 实测结果。
+分别关闭/开启 `timing_path`，用同一单并发请求文件、相同 seed、预热和重复次数重测，保存每次 detailed JSON 后再比较开销。0.6B 的三次配对数据见实测记录，14B 的开关开销仍需单独测量。
 
 为核对 vLLM 服务的 chunk 口径，先停止本项目服务，再在可用卡上启动：
 
@@ -266,4 +266,4 @@ done
 
 脚本在持续 warmup 传输时采样实际 PCIe 代际和宽度。理论单向 Gen4 x16 为 `16 × 16 × 128/130 ÷ 8 ≈ 31.5 GB/s`；JSON 同时给出相对比例。两跳的 event 带宽以一份逻辑 payload 除以两跳 event 时长之和，排除 host handoff；`effective_wall_GB_s` 使用包含该开销的 wall 时间。不是把两份字节相加。并发双向另外给出 aggregate bandwidth。
 
-当前没有 4090/NUMA/NCCL 微基准原始数据。应先完成这些实验，再决定 KV 传输优化的方向，不能用理论链路值替代实测。
+GPU0/1/2 的本地 NUMA 主存、GPU0↔1 的两跳及 NCCL 已有原始数据，见实测记录；跨 NUMA 和 GPU3/4 用例未运行。不能用理论链路值替代实测，也不能将同 NUMA 的结果外推到跨 NUMA。

@@ -98,7 +98,7 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 
 ### 测量工具
 
-- 自研框架提供 OpenAI 兼容的流式 HTTP 服务（见 M2），自研框架和 vLLM 用**同一个客户端**测量；每 token 的 chunk 和 usage 语义仍需按 M2 的要求实测核对。
+- 自研框架提供 OpenAI 兼容的流式 HTTP 服务（见 M2），自研框架和 vLLM 用**同一个客户端**测量。M2 实测自研服务逐 token 发 choices，vLLM 0.15.0 可能合并增量 chunk；其客户端 ITL 是 chunk 间隔，不能直接当成逐 token 间隔，usage 与 TPOT 的 token 计数另行核对，见 [单 NUMA 实测记录](m2_measurements_2026-11-14_zh.md)。
 - 性能：`vllm bench serve`。锁定的 vLLM 0.15.0 支持泊松/gamma 到达、并发上限和 `--goodput`，详细结果可保存实际请求发送时间；其数据集选项没有 `timed_trace`，不支持按原时间戳回放 trace。
 - 质量：evalscope，通过 OpenAI API 接入。
 - `vllm bench serve` 看不到框架内部的指标（如 KV 传输时间），这类指标由框架自己记录到日志，按请求 ID 与客户端结果对齐。
@@ -154,7 +154,7 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 
 - 增加 Qwen3-14B 配置并跑通单卡推理，与 Transformers 参考实现对比 greedy 输出和 logits 误差。
 - **OpenAI 兼容流式服务**：实现 `/v1/completions` 和 `/v1/chat/completions`，支持流式返回，使 `vllm bench serve` 和 evalscope 能直接测量本框架。TTFT/ITL 依赖流式返回的 chunk 计时，接入后用单请求实测确认计时口径与 vLLM 一致。当前框架只有离线 `generate()`，服务层需要把同步 step 循环改为可持续接收请求的引擎循环。
-- **容量测算与配置**：按单卡显存、权重大小和每 token KV 大小算出可容纳的 token 数，据此设计 L1/L2 用例的长度和并发。以 Qwen3-14B 粗估：单卡约剩 13 GiB 给 KV，BF16 约 160 KiB/token，约 8.5 万 token；4K+1K 请求约 17 并发，16K+1K 约 5 并发（以实测为准）。同时调大当前的 `max_model_length=128` 和 `max_num_batched_tokens=1024`；在 M3 实现 chunked prefill 之前，Scheduler 要求 `max_model_length ≤ max_num_batched_tokens`。
+- **容量测算与配置**：按单卡显存、权重大小和每 token KV 大小算出可容纳的 token 数，据此设计 L1/L2 用例的长度和并发。Qwen3-14B BF16 每 token KV 为 160 KiB；GPU0 在 M2 配置下实测得到 367 块、14.3359375 GiB KV、93,952 token，按 block 取整后的 4K+1K、16K+1K 请求容量上界分别为 18、5，并非稳定并发保证，见 [实测环境与推导](m2_measurements_2026-11-14_zh.md)。M2 配置已将 `max_model_length`、`max_num_batched_tokens` 均设为 17408；在 M3 实现 chunked prefill 之前，Scheduler 要求 `max_model_length ≤ max_num_batched_tokens`。
 - 按阶段记录耗时：schedule、prepare、H2D、forward、sampling、D2H、postprocess，以及后续的状态传输。
 - PCIe 微基准：分别测 D2H、H2D、双向同时、同 NUMA 与跨 NUMA，以及 NCCL send/recv 在无 P2P 下的实际带宽。
 - 准备 L1/L2 的数据集和请求列表，固定数据集版本和随机种子。

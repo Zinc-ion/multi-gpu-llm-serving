@@ -218,6 +218,7 @@ def flash_attention_prefill(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """
     Optimized Flash Attention for prefill phase with variable-length sequences.
@@ -260,8 +261,9 @@ def flash_attention_prefill(
     num_seqs = cu_seqlens.shape[0] - 1
     
     # Find max sequence length to determine grid size
-    cu_seqlens_cpu = cu_seqlens.cpu()
-    max_seq_len = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).max().item()
+    if max_seq_len is None:
+        cu_seqlens_cpu = cu_seqlens.cpu()
+        max_seq_len = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).max().item()
     
     # Calculate grid dimensions - launch all kernels at once
     grid = (triton.cdiv(max_seq_len, BLOCK_M), num_heads, num_seqs)
@@ -277,6 +279,74 @@ def flash_attention_prefill(
         BLOCK_N=BLOCK_N,
     )
     
+    return output
+
+
+@triton.jit
+def paged_attention_prefill_kernel(
+    Q, K, V, O, cu_seqlens_q_ptr, cu_seqlens_k_ptr, block_tables_ptr,
+    scale,
+    num_heads: tl.constexpr, num_kv_heads: tl.constexpr, head_dim: tl.constexpr,
+    block_size: tl.constexpr, max_num_blocks: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    start_m, head_idx, seq_idx = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    kv_head_idx = head_idx // (num_heads // num_kv_heads)
+    q_start = tl.load(cu_seqlens_q_ptr + seq_idx)
+    q_len = tl.load(cu_seqlens_q_ptr + seq_idx + 1) - q_start
+    k_len = tl.load(cu_seqlens_k_ptr + seq_idx + 1) - tl.load(cu_seqlens_k_ptr + seq_idx)
+    if start_m * BLOCK_M >= q_len:
+        return
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, head_dim)
+    q_ptrs = Q + (q_start + offs_m[:, None]) * num_heads * head_dim + head_idx * head_dim + offs_d[None, :]
+    q = tl.load(q_ptrs, mask=(offs_m < q_len)[:, None], other=0.0)
+    acc = tl.zeros([BLOCK_M, head_dim], tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    m_i = tl.full([BLOCK_M], -1e10, tl.float32)
+    # Queries are the suffix of the full KV prefix, not positions starting at zero.
+    positions = k_len - q_len + offs_m
+    num_tiles = tl.cdiv(tl.minimum(k_len, k_len - q_len + (start_m + 1) * BLOCK_M), BLOCK_N)
+    for tile in range(num_tiles):
+        offs_n = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+        valid = offs_n < k_len
+        physical_block = tl.load(
+            block_tables_ptr + seq_idx * max_num_blocks + offs_n // block_size,
+            mask=valid, other=0,
+        ).to(tl.int64)
+        cache_offsets = (
+            (physical_block * block_size + offs_n % block_size) * num_kv_heads * head_dim
+            + kv_head_idx * head_dim
+        )
+        k = tl.load(K + cache_offsets[None, :] + offs_d[:, None], mask=valid[None, :], other=0.0)
+        scores = tl.dot(q, k, input_precision="ieee") * scale
+        scores = tl.where(valid[None, :] & (offs_n[None, :] <= positions[:, None]), scores, -1e10)
+        m_new = tl.maximum(m_i, tl.max(scores, 1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        v = tl.load(V + cache_offsets[:, None] + offs_d[None, :], mask=valid[:, None], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision="ieee")
+        l_i = l_i * alpha + tl.sum(p, 1)
+        m_i = m_new
+    o_ptrs = O + (q_start + offs_m[:, None]) * num_heads * head_dim + head_idx * head_dim + offs_d[None, :]
+    tl.store(o_ptrs, (acc / l_i[:, None]).to(O.dtype.element_ty), mask=(offs_m < q_len)[:, None])
+
+
+def paged_attention_prefill(
+    q, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k, block_tables,
+    max_seqlen_q, scale, num_heads, num_kv_heads, head_dim, block_size,
+):
+    """Packed suffix queries read their entire causal prefix through block tables."""
+    q = q.contiguous()
+    output = torch.empty_like(q)
+    tile_size = 64 if head_dim <= 64 else 32 if head_dim <= 128 else 16
+    grid = (triton.cdiv(max_seqlen_q, tile_size), num_heads, cu_seqlens_q.numel() - 1)
+    paged_attention_prefill_kernel[grid](
+        q, k_cache, v_cache, output, cu_seqlens_q, cu_seqlens_k, block_tables,
+        scale, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+        block_size=block_size, max_num_blocks=block_tables.shape[1],
+        BLOCK_M=tile_size, BLOCK_N=tile_size,
+    )
     return output
 
 
@@ -491,14 +561,21 @@ class Attention(nn.Module):
         scale = self.scale / (self.head_dim ** 0.5)
 
         if context.is_prefill:
-            # Prefill: use flash attention
+            # Prefill: paged KV for serving; packed K/V only during cache-free warmup.
             # Varlen mode: (total_tokens, num_heads, head_dim)
             cu_seqlens = context.cu_seqlens_q
             if cu_seqlens is None:
                 raise ValueError("cu_seqlens_q must be provided for varlen attention")
             
-            o = flash_attention_prefill(q, k, v, cu_seqlens, scale, 
-                                        self.num_heads, self.num_kv_heads, self.head_dim)
+            if k_cache.numel() > 0:
+                o = paged_attention_prefill(
+                    q, k_cache, v_cache, cu_seqlens, context.cu_seqlens_k,
+                    context.block_tables, context.max_seqlen_q, scale,
+                    self.num_heads, self.num_kv_heads, self.head_dim, self.block_size,
+                )
+            else:
+                o = flash_attention_prefill(q, k, v, cu_seqlens, scale,
+                                            self.num_heads, self.num_kv_heads, self.head_dim, context.max_seqlen_q)
             # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
         else:

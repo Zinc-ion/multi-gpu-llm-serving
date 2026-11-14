@@ -200,23 +200,10 @@ class Qwen3DecoderLayer(nn.Module):
         else:
             residual = x  # Save BEFORE normalization
             x = self.input_layernorm(x)
-        # Compute positions based on context (respecting sequence boundaries for batched prefill)
+        # Positions are prepared once per batch, including each chunk's cached offset.
         from myvllm.utils import get_context
         context = get_context()
-        if context.is_prefill and context.cu_seqlens_q is not None:
-            # For batched prefill, create positions that restart at 0 for each sequence
-            positions = []
-            cu_seqlens = context.cu_seqlens_q.cpu().tolist()
-            for i in range(len(cu_seqlens) - 1):
-                seq_len = cu_seqlens[i+1] - cu_seqlens[i]
-                positions.extend(range(seq_len))
-            positions = torch.tensor(positions, dtype=torch.long, device=x.device)
-        elif context.is_prefill:
-            # For single sequence prefill, use sequential positions
-            positions = torch.arange(x.size(0), device=x.device)
-        else:
-            # For decode, use context_lens - 1 as positions (current position for each sequence)
-            positions = context.context_lens - 1
+        positions = context.positions
 
         x = self.self_attn(x, positions=positions)
         # Residual connection always on for attention output

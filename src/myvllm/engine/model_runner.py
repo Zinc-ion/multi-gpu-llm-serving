@@ -11,6 +11,7 @@ from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
+from myvllm.engine.input_batch import build_prefill_batch
 from myvllm.utils import *
 from myvllm.config import resolve_dtype, seed_everything
 from myvllm.utils.timing import StepTimings
@@ -200,8 +201,9 @@ class ModelRunner:
         torch.cuda.reset_peak_memory_stats()
         max_tokens = self.config['max_num_batched_tokens']
         max_model_length = self.config['max_model_length']
-        batch_size = max_tokens // max_model_length
-        seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
+        seq_length = min(max_tokens, max_model_length)
+        batch_size = min(self.config['max_num_sequences'], max_tokens // seq_length)
+        seqs = [Sequence(token_ids=[0]*seq_length, block_size=self.config['block_size']) for _ in range(batch_size)]
         self.run(seqs, is_prefill=True)
         torch.cuda.empty_cache()
 
@@ -290,55 +292,23 @@ class ModelRunner:
     #               │  └─────── end of seq1 (position 3)
     #               └────────── start (position 0)
     def prepare_prefill(self, seqs: list[Sequence]) -> torch.Tensor:
-        # length: sum of all input_ids after prefix cache
-        input_ids = []
-        # length: sum of all input_ids after prefix cache
-        slot_mappings = []
-        # length: num_seqs
-        seqlens_q = []
-        # length: num_seqs
-        seqlens_k = []
-        # length: num_seqs + 1
-        cu_seqlens_q = [0]
-        # length: num_seqs + 1
-        cu_seqlens_k = [0]
-        # block_tables: num_seqs x num_blocks (padded)
-        block_tables = []
-        for seq in seqs:
-            token_ids = seq.token_ids
-            num_cached_tokens = seq.num_cached_tokens
-            input_ids.extend(token_ids[num_cached_tokens:])
-            seqlens_q.append(len(token_ids) - num_cached_tokens)
-            seqlens_k.append(len(token_ids))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[-1])
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k[-1])
-            if seq.block_table:
-                for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
-                    if seq.num_cached_blocks + i != seq.num_blocks - 1:
-                        slot_mappings.extend(list(range(block_id * self.block_size, (block_id+1) * self.block_size)))
-                    else:
-                        slot_mappings.extend(list(range(block_id * self.block_size, block_id * self.block_size + seq.last_block_num_tokens)))
-        if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
-            # pad block_tables
-            all_block_tables = [seq.block_table for seq in seqs]
-            max_num_blocks = max(len(bt) for bt in all_block_tables)
-            for i, seq in enumerate(seqs):
-                block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
-                block_tables.append(block_table)
+        batch = build_prefill_batch(seqs, self.block_size)
         if self.timings:
             self.timings.h2d()
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(batch["input_ids"], dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping_tensor = torch.tensor(batch["slot_mapping"], dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
 
         set_context(
             is_prefill=True,
-            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            max_seqlen_q=max(seqlens_q),
-            max_seqlen_k=max(seqlens_k),
+            cu_seqlens_q=torch.tensor(batch["cu_seqlens_q"], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cu_seqlens_k=torch.tensor(batch["cu_seqlens_k"], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            max_seqlen_q=batch["max_seqlen_q"],
+            max_seqlen_k=batch["max_seqlen_k"],
             slot_mapping=slot_mapping_tensor,
             context_lens=None,
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            block_tables=torch.tensor(batch["block_tables"], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if batch["block_tables"] else None,
+            positions=torch.tensor(batch["positions"], dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            logit_indices=torch.tensor(batch["logit_indices"], dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
         )
         return input_ids
 
@@ -370,6 +340,7 @@ class ModelRunner:
             slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            positions=torch.tensor([length - 1 for length in context_lens], dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
         )
         return input_ids    
 
@@ -432,7 +403,8 @@ class ModelRunner:
         if self.rank == 0:
             if self.timings:
                 self.timings.start_gpu("sample_h2d")
-            temperature = self.prepare_sample(seqs)
+            sample_seqs = [seq for seq in seqs if seq.num_cached_tokens + seq.num_scheduled_tokens == len(seq)]
+            temperature = self.prepare_sample(sample_seqs)
             if self.timings:
                 self.timings.end_gpu("sample_h2d")
                 self.timings.start_gpu("sampling")

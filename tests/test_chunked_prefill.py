@@ -101,6 +101,22 @@ def test_resident_limit_avoids_decode_starvation():
     assert_block_pool_consistent(sched)
 
 
+def test_cancel_partial_prefill_releases_all_reserved_blocks():
+    sched = scheduler(budget=3)
+    seq = Sequence(list(range(11)), 4)
+    sched.add_sequence(seq)
+    batch, _ = sched.schedule()
+    sched.postprocess(batch, [])
+    assert seq.num_cached_tokens == 3
+    assert seq.num_completion_tokens == 0
+    assert len(seq.block_table) == 3
+    assert sched.cancel(seq.seq_id)
+    assert seq.status == SequenceStatus.CANCELLED
+    assert sched.is_finished()
+    assert not sched.block_manager.used_block_ids
+    assert_block_pool_consistent(sched)
+
+
 def test_pickle_retains_generated_prefix_for_recompute_after_preemption():
     sched = scheduler(budget=3, blocks=2, model_length=8)
     seqs = [Sequence([i] * 2, 4) for i in (1, 2)]

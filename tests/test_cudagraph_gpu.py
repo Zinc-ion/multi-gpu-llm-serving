@@ -19,11 +19,16 @@ def test_real_cudagraph_replay_matches_eager_and_chunked_tokens(tmp_path, dtype)
     dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
     try:
         torch.manual_seed(8)
-        model = Qwen3ForCausalLM(
-            vocab_size=64, hidden_size=32, num_heads=2, head_dim=16,
-            num_kv_heads=1, intermediate_size=64, num_layers=2,
-            max_position=32, block_size=4,
-        ).to(device="cuda", dtype=dtype).eval()
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(dtype)
+            model = Qwen3ForCausalLM(
+                vocab_size=64, hidden_size=32, num_heads=2, head_dim=16,
+                num_kv_heads=1, intermediate_size=64, num_layers=2,
+                max_position=32, block_size=4,
+            ).cuda().eval()
+        finally:
+            torch.set_default_dtype(previous_dtype)
         for param in model.parameters():
             torch.nn.init.normal_(param, std=.1)
         for module in model.modules():

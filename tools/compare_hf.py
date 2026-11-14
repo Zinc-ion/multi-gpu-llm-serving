@@ -28,6 +28,13 @@ def metadata(config):
     }
 
 
+def kv_expansion(enabled):
+    # Mock call history would retain every key tensor across generation steps.
+    return patch(
+        "transformers.integrations.sdpa_attention.use_gqa_in_sdpa", new=lambda mask, key: False
+    ) if enabled else nullcontext()
+
+
 def prepare(args):
     config = load_config(args.config)
     tokenizer = AutoTokenizer.from_pretrained(
@@ -161,9 +168,7 @@ def reference(args):
     }[args.sdpa_backend]
     # Select HF's existing repeat_kv branch explicitly for FP32 efficient SDPA:
     # PyTorch 2.9.1's efficient backend does not accept enable_gqa=True.
-    expansion = patch(
-        "transformers.integrations.sdpa_attention.use_gqa_in_sdpa", return_value=False
-    ) if args.expand_kv else nullcontext()
+    expansion = kv_expansion(args.expand_kv)
     with torch.inference_mode(), sdpa_kernel(backend), expansion:
         for case in custom_data["cases"]:
             input_ids = torch.tensor([case["input_ids"]], device="cuda")

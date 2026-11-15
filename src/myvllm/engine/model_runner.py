@@ -21,6 +21,7 @@ class ModelRunner:
         self.config = config
         self.event = event
         self.timings = None
+        self._exited = False
 
         # set distributed config
         self.block_size = config['block_size']
@@ -30,7 +31,18 @@ class ModelRunner:
         self.rank = rank
         seed_everything(config.get('seed', 0))
         torch.set_default_dtype(resolve_dtype(config.get('dtype', 'float32')))
-        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
+        resources = config.get("_instance_resources")
+        self._standalone_store = None
+        if resources is None:
+            if self.world_size != 1:
+                raise ValueError("Multi-rank ModelRunner requires engine instance resources")
+            self._standalone_store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+            store = self._standalone_store
+            shm_name = None
+        else:
+            port, shm_name = resources
+            store = dist.TCPStore("127.0.0.1", port, is_master=False)
+        dist.init_process_group('nccl', store=store, world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
 
         # set model
@@ -109,28 +121,16 @@ class ModelRunner:
         if config.get("timing_path") and self.rank == 0:
             self.timings = StepTimings()
 
-        # IMPORTANT: Set up shared memory and barrier AFTER all model initialization
+        # IMPORTANT: Attach shared memory and barrier AFTER all model initialization
         # This ensures both ranks complete warmup/allocation before rank 1 enters its event loop
         if self.world_size > 1:
-            # Synchronize before setting up shared memory
+            # Synchronize before attaching shared memory
             dist.barrier()
-            if self.rank == 0:
-                # Try to clean up existing shared memory first
-                try:
-                    old_shm = SharedMemory(name='myvllm')
-                    old_shm.close()
-                    old_shm.unlink()
-                except FileNotFoundError:
-                    pass  # Doesn't exist, which is fine
-                self.shm = SharedMemory(name='myvllm', create=True, size=2**20)
-                # Barrier to ensure rank 1 waits until shared memory is created
-                dist.barrier()
-            else:
-                # Wait for rank 0 to create shared memory
-                dist.barrier()
-                self.shm = SharedMemory(name='myvllm')
-                # Don't call self.loop() here - let the spawning code handle it
-                # Otherwise we'll be stuck in an infinite loop during __init__
+            self.shm = SharedMemory(name=shm_name)
+            # Wait until all ranks have attached before issuing calls.
+            dist.barrier()
+            # Don't call self.loop() here - let the spawning code handle it
+            # Otherwise we'll be stuck in an infinite loop during __init__
 
     # only use read when rank != 0
     def read_shm(self):
@@ -155,10 +155,10 @@ class ModelRunner:
 
     # close shared memory, destroy process group, delete graphs
     def exit(self):
+        if self._exited:
+            return
         if self.world_size > 1:
             self.shm.close()
-            if self.rank == 0:
-                self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs
             del self.graph_vars
@@ -168,6 +168,8 @@ class ModelRunner:
         # Check if process group exists before destroying
         if dist.is_initialized():
             dist.destroy_process_group()
+        self._standalone_store = None
+        self._exited = True
     
     # wait to read method and args from shared memory
     # execute the method with args
@@ -178,7 +180,6 @@ class ModelRunner:
             method_name, args = self.read_shm()
             self.call(method_name, *args) # Unpack args when calling
             if method_name == 'exit':
-                self.exit()
                 break
 
     # will be called by both rank == 0 and rank != 0

@@ -58,4 +58,24 @@ stats 给出当前 staging/pinned bytes、slot/busy 数量及配置上限；关�
 
 计时开启时另记 `pd_layer_ready`、`pd_d2h_done`、`pd_region_send_start/socket_done/sent`、`pd_h2d_done`。GPU copy 记录来自真实 CUDA timing event，值相对本端 transfer origin。`monotonic_ns` 仅用于同进程内观察发送与首 token 的先后，不跨 P/D 相减。`handoff_pipeline` 的 `pd_pipeline_done.residual_wait_ms` 是首 token 后开始等待最终 copy ACK 的暴露等待，区别于 B2 完整 `transfer_ms`；commit/ACK/activate 时间另由 gateway handoff 计时覆盖。layer-ready 到下一 layer-ready 包含 CPU 空隙，不能直接解释为 kernel 与 memcpy 重叠；重叠结论必须另外读取实际 profiler 时间线。
 
-CPU 测试覆盖早期预算、真实 TCP、错误帧、双槽背压、断连/取消/超时及真实 runner/model 数值。真实 CUDA、跨卡和目标服务器性能分别需要 GPU 证据，CPU 测试不能证明 DMA 生命周期或收益。
+CPU 测试覆盖早期预算、真实 TCP、错误帧、双槽背压、断连/取消/超时及真实 runner/model 数值。CPU 测试不能证明 DMA 生命周期或收益；本机真实 CUDA 验证范围如下，跨卡和目标服务器性能仍待验证。
+
+## 本机 GPU 验证
+
+2026-11-16，在 RTX 5080 Laptop GPU 上用本地随机初始化的两层 tiny Qwen3 checkpoint，先运行独立共置参考进程，再运行同卡的独立 P/D 进程。P whole/eager → D eager/graph 的 FP32、BF16 四组合均通过：greedy token 与 B2、共置参考一致；同前缀 logits 按预先固定的 FP32 `rtol=1e-4, atol=1e-5`、BF16 `rtol=.02, atol=.02` 比较通过；有效 KV 与 B2 逐值相同。D 捕获记录只有 decode step，没有重算 prompt。各路径沿用相同的 M5 tiny fixture 配置，这些比较验证 PD 等价，未作 HF 对照。
+
+测试覆盖 block 边界和部分尾块、并发请求、首 token EOS、单输出和总长度限制。F=256 字节，每事务每端两个 pinned slot 共 512 字节；在 postprocess 之前直接查询实际 copy stream，确认 D2H 已完成，并使后续请求复用源物理块。长度为 5 的非终态请求实际传输 FP32 1280 字节、BF16 640 字节，仅含有效 token。计时文件保留实际 D2H/H2D CUDA event 和首层发送先于首 token 的同进程时间戳。
+
+真实 TCP relay 在 D 已恢复首帧、返回 `copies_done=False` 后暂停 ACK，验证 GPU 双槽背压期间正常 close、cancel、数据 EOF、D close 和 timeout 的回收；另强制终止本次测试创建的 P 进程，再启动替代 P。每种情况存活 worker 均能释放本侧资源并完成后续流水请求。强制退出不等于存活进程可跳过 DMA drain。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/src" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  uv run --no-sync python -m pytest -q -s tests/test_pd_pipeline_gpu.py
+```
+
+测试自行生成小 checkpoint，不下载模型；输出目录包含两端 `p.jsonl/d.jsonl`、捕获 tensor、源 copy 检查及数值/故障摘要。日志中的已确认 payload 字节与 sendall 部分提交未知的语义仍遵守上文。
+
+同机原始 Torch Profiler Chrome JSON 同时保留 CPU/CUDA 活动、decoder layer forward 和 `LayerSender.on_layer` 区间。24-token、两层、FP32 诊断中有 54 个实际 kernel 和 13 次 memcpy，其中独立 stream 上 4 次 pinned D2H 各 1536 字节，共 6144 字节；D2H 时长总和 1.614 微秒，与任何实际 kernel 的时间交集为 0。原日志保留 profiler 的 external-init callback 警告；GPU event 数量及预期字节数从原始 trace 核对。这个 tiny 请求没有观测到 GPU kernel 与 D2H 重叠；layer 区间中的 CPU launch 空隙不算重叠，也不以 profile 时间推算带宽或收益。
+
+另一个有界诊断形状使用 2048-token prompt、两层、hidden_size=32、16 个 Q/KV head、head_dim=128、FP32 和 `scale=1.0`，让 `Attention.forward` 自行除以 `sqrt(head_dim)`。F=32 MiB，每端两个 pinned slot 共 64 MiB；每层有效 KV 为 32 MiB。预热后的源物理块分成两个连续 run，实际发送四帧、总计 64 MiB；trace 含 48 个 kernel、17 次 memcpy，其中 8 次 KV D2H。第 0 层 D2H 与第 1 层实际 kernel 的交集并集为 1358.682 微秒，与全部实际 kernel 的交集并集为 1364.343 微秒。该单请求证明这个形状下存在真实重叠；两槽背压和网络 ACK 等待仍会暴露，不能据此推算 14B、跨卡/NUMA、4090 或 goodput 收益。

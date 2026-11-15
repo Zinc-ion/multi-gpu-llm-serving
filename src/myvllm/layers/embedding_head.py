@@ -26,8 +26,15 @@ class VocabParallelEmbedding(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
         self.weight.weight_loader = self.weight_loader
 
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse)
+        self.weight.weight_loader = self.weight_loader
+        return self
+
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         param_data = param.data
+        if tuple(loaded_weights.shape) != (self.num_embeddings, self.embedding_dim):
+            raise ValueError(f"Shape mismatch: expected {(self.num_embeddings, self.embedding_dim)}, got {tuple(loaded_weights.shape)}")
 
         offset = self.tp_rank * self.num_embeddings_per_partition
         shard_size = self.num_embeddings_per_partition
@@ -56,7 +63,7 @@ class VocabParallelEmbedding(nn.Module):
 
         if dist.get_world_size() > 1:
             # need to mask again, otherwise the embedding for the out-of-range ids will be the embedding of id 0
-            output = mask.unsqueeze(1) * output
+            output = mask.unsqueeze(-1) * output
             dist.all_reduce(output, op=dist.ReduceOp.SUM)
         return output
 
@@ -83,7 +90,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = torch.nn.functional.linear(x, self.weight)
         if self.tp_size > 1:
             # prepare for all_gather only for GPU 0 which is the main GPU
-            all_logits = [torch.empty(logits.size(), device=logits.device) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
+            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             # dist.gather collects the logits from all GPUs to GPU 0
             dist.gather(logits, gather_list=all_logits, dst=0)
             # concatenate

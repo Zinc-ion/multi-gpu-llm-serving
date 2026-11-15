@@ -56,6 +56,30 @@ class PDConnection:
         value, _ = await self._call("describe")
         return value
 
+    async def describe_early(self):
+        value, _ = await self._call("describe_early")
+        return value
+
+    async def reserve_early(self, metadata):
+        value, _ = await self._call("reserve_early", metadata=metadata)
+        return value
+
+    async def start(self):
+        value, _ = await self._call("start")
+        return value
+
+    async def wait_pipeline(self):
+        value, _ = await self._call("wait_pipeline")
+        return value
+
+    async def commit_early(self, metadata):
+        value, _ = await self._call("commit_early", metadata=metadata)
+        return value
+
+    async def acknowledge_early(self):
+        value, _ = await self._call("acknowledge_early")
+        return value
+
     async def reserve(self, metadata):
         value, _ = await self._call("reserve", metadata=metadata)
         return value
@@ -136,6 +160,17 @@ class PDClient:
                                     sampling=asdict(params))
 
     @staticmethod
+    async def prepare_p(endpoint, session_id, request_id, token_ids, params, *, lifetime):
+        return await PDClient._open(endpoint, "prepare_p", lifetime, session_id=session_id,
+                                    request_id=request_id, token_ids=token_ids,
+                                    sampling=asdict(params))
+
+    @staticmethod
+    async def start_pipeline(prefill, decode):
+        await decode.reserve_early(await prefill.describe_early())
+        await prefill.start()
+
+    @staticmethod
     async def _status(endpoint, op, timeout):
         deadline = asyncio.get_running_loop().time() + timeout
         async with asyncio.timeout_at(deadline):
@@ -177,4 +212,23 @@ class PDClient:
             except OSError as exc:
                 raise PDTimingError(*exc.args) from exc
         await prefill.acknowledge()
+        await decode.activate()
+
+    @staticmethod
+    async def handoff_pipeline(prefill, decode, metadata, *, timing_path=None):
+        started = time.perf_counter()
+        copied = await prefill.wait_pipeline()
+        elapsed = (time.perf_counter() - started) * 1000
+        await decode.commit_early(metadata)
+        if timing_path:
+            try:
+                write_record(timing_path, {
+                    "event": "pd_pipeline_done", "request_id": metadata["request_id"],
+                    "session_id": metadata["session_id"],
+                    "transaction_id": metadata["transaction_id"],
+                    **copied, "residual_wait_ms": elapsed,
+                })
+            except OSError as exc:
+                raise PDTimingError(*exc.args) from exc
+        await prefill.acknowledge_early()
         await decode.activate()

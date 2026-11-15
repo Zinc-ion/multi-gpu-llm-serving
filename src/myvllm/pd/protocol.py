@@ -106,6 +106,15 @@ def make_metadata(handle, spec, sampling_seed):
     }
 
 
+def make_early_metadata(handle, spec, sampling_seed):
+    metadata = make_metadata(handle, spec, sampling_seed)
+    prompt_length = metadata["prompt_length"]
+    metadata["version"] = 3
+    metadata["kv"]["shape"] = payload_shape(spec, prompt_length)
+    metadata["kv"]["nbytes"] = payload_nbytes(spec, prompt_length)
+    return metadata
+
+
 def _matches_model(value, expected):
     if type(value) is not type(expected):
         return False
@@ -120,7 +129,7 @@ def _matches_model(value, expected):
     return value == expected
 
 
-def validate_metadata(metadata, session_id, spec, max_model_length):
+def _validate_metadata(metadata, session_id, spec, max_model_length, early):
     fields = {
         "version", "session_id", "transaction_id", "request_id", "prefill_seq_id",
         "token_ids", "prompt_length", "cached_tokens", "next_position",
@@ -128,7 +137,7 @@ def validate_metadata(metadata, session_id, spec, max_model_length):
     }
     if not isinstance(metadata, dict) or set(metadata) != fields:
         raise ValueError("Invalid PD metadata fields")
-    if type(metadata["version"]) is not int or metadata["version"] != 2:
+    if type(metadata["version"]) is not int or metadata["version"] != (3 if early else 2):
         raise ValueError("Unsupported PD protocol version")
     if metadata["session_id"] != session_id:
         raise ValueError("PD session does not match this handle")
@@ -161,18 +170,19 @@ def validate_metadata(metadata, session_id, spec, max_model_length):
     prompt_length = metadata["prompt_length"]
     if type(prompt_length) is not int or not 0 < prompt_length < limit - 1:
         raise ValueError("Invalid prompt length or terminal first token")
-    if any(type(metadata[field]) is not int or metadata[field] != prompt_length
+    progress = 0 if early else prompt_length
+    if any(type(metadata[field]) is not int or metadata[field] != progress
            for field in ("cached_tokens", "next_position")):
         raise ValueError("Invalid cached progress or next position")
-    if type(metadata["completion_count"]) is not int or metadata["completion_count"] != 1:
+    if type(metadata["completion_count"]) is not int or metadata["completion_count"] != (0 if early else 1):
         raise ValueError("Invalid completion count")
     tokens = metadata["token_ids"]
-    if not isinstance(tokens, list) or len(tokens) != prompt_length + 1:
+    if not isinstance(tokens, list) or len(tokens) != prompt_length + (0 if early else 1):
         raise ValueError("Invalid token history length")
     vocab_size = spec["architecture"]["vocab_size"]
     if any(type(token) is not int or not 0 <= token < vocab_size for token in tokens):
         raise ValueError("Invalid token history")
-    if not sampling["ignore_eos"] and tokens[-1] in spec["eos"]:
+    if not early and not sampling["ignore_eos"] and tokens[-1] in spec["eos"]:
         raise ValueError("Terminal EOS cannot be handed off")
     expected = {
         "shape": payload_shape(spec, prompt_length),
@@ -186,3 +196,11 @@ def validate_metadata(metadata, session_id, spec, max_model_length):
             or any(type(dim) is not int for dim in kv["shape"])
             or type(kv["nbytes"]) is not int or kv != expected):
         raise ValueError("Invalid KV shape, dtype or byte count")
+
+
+def validate_metadata(metadata, session_id, spec, max_model_length):
+    _validate_metadata(metadata, session_id, spec, max_model_length, early=False)
+
+
+def validate_early_metadata(metadata, session_id, spec, max_model_length):
+    _validate_metadata(metadata, session_id, spec, max_model_length, early=True)

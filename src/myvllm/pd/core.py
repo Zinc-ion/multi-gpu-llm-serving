@@ -9,7 +9,8 @@ import torch
 
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.pd.kv import export_kv, restore_kv
-from myvllm.pd.protocol import finite_number, make_metadata, model_spec, payload_nbytes, validate_metadata
+from myvllm.pd.pipeline import LayerReceiver
+from myvllm.pd.protocol import finite_number, make_early_metadata, make_metadata, model_spec, payload_nbytes, tensor_dtype, validate_early_metadata, validate_metadata
 from myvllm.sampling_parameters import SamplingParams
 
 
@@ -40,7 +41,12 @@ class _Handle:
         self.transaction_id = None
         self.request_id = None
         self._metadata = None
+        self._early_metadata = None
+        self._commit_metadata = None
+        self._next_layer = 0
+        self._next_offset = 0
         self._payload = None
+        self._receiver = None
         self._reserved_bytes = 0
         self._reserved_blocks = 0
 
@@ -107,9 +113,14 @@ class _Core:
             return False
         self._check(handle)
         self._cancel(handle, "cancelled")
+        if handle._receiver is not None:
+            handle._receiver.close()
+            handle._receiver = None
         del self._handles[handle.session_id]
         handle.sequence = None
         handle._metadata = None
+        handle._early_metadata = None
+        handle._commit_metadata = None
         handle.state = "closed"
         return True
 
@@ -138,6 +149,14 @@ class PrefillCore(_Core):
     """Own P requests from admission through a synchronous transfer ACK."""
 
     def open(self, session_id, request_id, prompt_token_ids, params, deadline=None):
+        return self._open_request(session_id, request_id, prompt_token_ids, params, deadline, early=False)
+
+    def prepare(self, session_id, request_id, prompt_token_ids, params, deadline=None):
+        if self.scheduler.enable_chunked_prefill or not self.engine.config.get("enforce_eager", False):
+            raise ValueError("Early transfer requires whole eager prefill")
+        return self._open_request(session_id, request_id, prompt_token_ids, params, deadline, early=True)
+
+    def _open_request(self, session_id, request_id, prompt_token_ids, params, deadline, early):
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("session_id must be a nonempty string")
         if not isinstance(request_id, str) or not request_id:
@@ -166,7 +185,8 @@ class PrefillCore(_Core):
         existing = self._handles.get(session_id)
         if existing is not None:
             seq = existing.sequence
-            if (existing.request_id == request_id and seq.prompt_token_ids == prompt_token_ids
+            if ((existing._early_metadata is not None) == early
+                    and existing.request_id == request_id and seq.prompt_token_ids == prompt_token_ids
                     and (seq.temperature, seq.max_tokens, seq.ignore_eos, seq.max_model_length)
                     == (params.temperature, params.max_tokens, params.ignore_eos, limit)
                     and existing.deadline == deadline):
@@ -176,24 +196,72 @@ class PrefillCore(_Core):
         nbytes = 0
         if params.max_tokens > 1 and len(prompt_token_ids) + 1 < limit:
             nbytes = payload_nbytes(self.spec, len(prompt_token_ids))
+        if early and not nbytes:
+            raise ValueError("Early transfer requires a possible second token")
+        pending = [h for h in self._handles.values()
+                   if h.state in ("prepared", "ready", "queued", "prefill", "held", "exported")]
+        if early or any(h._early_metadata is not None for h in pending):
+            block_size = self.manager.block_size
+            blocks = (len(prompt_token_ids) + block_size - 1) // block_size
+            blocks += sum((h.sequence.num_prompt_tokens + block_size - 1) // block_size for h in pending)
+            if blocks > len(self.manager.blocks):
+                raise CapacityError("P prompt block capacity exhausted")
         if self._reserved_bytes + nbytes > self.max_transfer_bytes:
             raise CapacityError("P transfer capacity exhausted")
         handle = self._open(session_id, deadline)
         seq = Sequence(prompt_token_ids, self.manager.block_size, params)
-        try:
-            self.scheduler.add_sequence(seq)
-        except ValueError:
-            del self._handles[session_id]
-            raise
-        handle.state = "queued"
+        if early:
+            seq.max_model_length = limit
+        else:
+            try:
+                self.scheduler.add_sequence(seq)
+            except ValueError:
+                del self._handles[session_id]
+                raise
+        handle.state = "prepared" if early else "queued"
         handle.sequence = seq
         handle.transaction_id = uuid.uuid4().hex
         handle.request_id = request_id
         handle._reserved_bytes = nbytes
         self._reserved_bytes += nbytes
-        self._sequences[seq.seq_id] = handle
-        self.engine.request_ids[seq.seq_id] = request_id
+        if early:
+            handle._early_metadata = make_early_metadata(handle, self.spec, self.sampling_seed)
+        else:
+            self._sequences[seq.seq_id] = handle
+            self.engine.request_ids[seq.seq_id] = request_id
         return handle
+
+    def describe_early(self, handle):
+        self._check(handle)
+        if handle._early_metadata is None or handle.state not in ("prepared", "ready", "queued", "prefill", "held"):
+            raise StateError("P request has no early transfer")
+        return deepcopy(handle._early_metadata)
+
+    def ready(self, handle):
+        self._check(handle)
+        if handle._early_metadata is None:
+            raise StateError("P request was not prepared for early transfer")
+        if handle.state in ("ready", "queued", "prefill", "held"):
+            return False
+        if handle.state != "prepared":
+            raise StateError("P request cannot become ready")
+        handle.state = "ready"
+        return True
+
+    def start(self, handle):
+        self._check(handle)
+        if handle._early_metadata is None:
+            raise StateError("P request was not prepared for early transfer")
+        if handle.state in ("queued", "prefill", "held"):
+            return False
+        if handle.state != "ready":
+            raise StateError("P request has no ready data channel")
+        seq = handle.sequence
+        self.scheduler.add_sequence(seq)
+        self._sequences[seq.seq_id] = handle
+        self.engine.request_ids[seq.seq_id] = handle.request_id
+        handle.state = "queued"
+        return True
 
     def step(self):
         if self.scheduler.is_finished():
@@ -259,12 +327,27 @@ class PrefillCore(_Core):
         handle.state = "handed_off"
         return True
 
+    def acknowledge_early(self, handle):
+        self._check(handle)
+        if handle._early_metadata is None:
+            raise StateError("P request has no early transfer")
+        if handle.state == "handed_off":
+            return False
+        if handle.state != "held":
+            raise StateError("P request is not waiting for early transfer ACK")
+        self.manager.deallocate(handle.sequence)
+        self._release_bytes(handle)
+        handle.state = "handed_off"
+        return True
+
     def _cancel(self, handle, state):
         if handle.state in ("finished", "handed_off", "cancelled", "expired", "failed"):
             return False
         seq = handle.sequence
         if handle.state in ("held", "exported"):
             self.manager.deallocate(seq)
+            seq.status = SequenceStatus.CANCELLED
+        elif handle.state in ("prepared", "ready"):
             seq.status = SequenceStatus.CANCELLED
         elif seq is not None:
             self.scheduler.cancel(seq.seq_id)
@@ -278,6 +361,13 @@ class PrefillCore(_Core):
         result = super().stats()
         result["held_requests"] = sum(
             handle.state in ("held", "exported") for handle in self._handles.values()
+        )
+        pending = [h for h in self._handles.values()
+                   if h.state in ("prepared", "ready", "queued", "prefill", "held", "exported")]
+        result["reserved_prompt_blocks"] = (
+            sum((h.sequence.num_prompt_tokens + self.manager.block_size - 1) // self.manager.block_size
+                for h in pending)
+            if any(h._early_metadata is not None for h in pending) else 0
         )
         result["buffered_bytes"] = sum(
             len(handle._payload) for handle in self._handles.values() if handle._payload is not None
@@ -313,21 +403,26 @@ class DecodeCore(_Core):
         try:
             validate_metadata(metadata, handle.session_id, self.spec,
                               self.scheduler.max_model_length)
-            if metadata["sampling_seed"] == self.sampling_seed:
-                raise ValueError("P and D sampling_seed must differ")
-            nbytes = metadata["kv"]["nbytes"]
-            tokens = min(metadata["prompt_length"] + metadata["sampling"]["max_tokens"],
-                         metadata["sampling"]["max_model_length"])
-            blocks = (tokens + self.manager.block_size - 1) // self.manager.block_size
-            if self._resident >= self._resident_limit:
-                raise CapacityError("D resident sequence capacity exhausted")
-            if self._reserved_blocks + blocks > len(self.manager.blocks):
-                raise CapacityError("D KV block capacity exhausted")
-            if self._reserved_bytes + nbytes > self.max_transfer_bytes:
-                raise CapacityError("D transfer capacity exhausted")
+            self._reserve_budget(handle, metadata)
         except ValueError:
             handle.state = "failed"
             raise
+        handle.state = "reserved"
+        return True
+
+    def _reserve_budget(self, handle, metadata):
+        if metadata["sampling_seed"] == self.sampling_seed:
+            raise ValueError("P and D sampling_seed must differ")
+        nbytes = metadata["kv"]["nbytes"]
+        tokens = min(metadata["prompt_length"] + metadata["sampling"]["max_tokens"],
+                     metadata["sampling"]["max_model_length"])
+        blocks = (tokens + self.manager.block_size - 1) // self.manager.block_size
+        if self._resident >= self._resident_limit:
+            raise CapacityError("D resident sequence capacity exhausted")
+        if self._reserved_blocks + blocks > len(self.manager.blocks):
+            raise CapacityError("D KV block capacity exhausted")
+        if self._reserved_bytes + nbytes > self.max_transfer_bytes:
+            raise CapacityError("D transfer capacity exhausted")
         handle._metadata = deepcopy(metadata)
         handle.transaction_id = metadata["transaction_id"]
         handle.request_id = metadata["request_id"]
@@ -336,8 +431,123 @@ class DecodeCore(_Core):
         self._reserved_bytes += nbytes
         self._reserved_blocks += blocks
         self._resident += 1
-        handle.state = "reserved"
+
+    def reserve_early(self, handle, metadata):
+        self._check(handle)
+        if handle._early_metadata is not None and handle.state in ("early_reserved", "restored", "active", "finished"):
+            validate_early_metadata(metadata, handle.session_id, self.spec,
+                                    self.scheduler.max_model_length)
+            if metadata == handle._early_metadata:
+                return False
+            raise StateError("Early transaction metadata changed")
+        if handle.state != "open":
+            raise StateError("D handle cannot reserve an early transaction")
+        try:
+            validate_early_metadata(metadata, handle.session_id, self.spec,
+                                    self.scheduler.max_model_length)
+            self._reserve_budget(handle, metadata)
+        except ValueError:
+            handle.state = "failed"
+            raise
+        seq = Sequence(metadata["token_ids"], self.manager.block_size,
+                       SamplingParams(**metadata["sampling"]))
+        self.manager.allocate(seq)
+        handle.sequence = seq
+        handle._early_metadata = deepcopy(metadata)
+        handle.state = "early_reserved"
         return True
+
+    def attach_receiver(self, handle, frame_bytes, timing_path=None):
+        self._check(handle)
+        if handle.state != "early_reserved" or handle._receiver is not None:
+            raise StateError("D handle cannot attach another data channel")
+        identity = {"session_id": handle.session_id, "transaction_id": handle.transaction_id,
+                    "request_id": handle.request_id, "role": "decode"}
+        handle._receiver = LayerReceiver(self.engine.model_runner.kv_cache, frame_bytes,
+                                         identity, timing_path)
+        return handle._receiver
+
+    def restore_region(self, handle, layer, start, end, payload):
+        self._check(handle)
+        if handle.state != "early_reserved":
+            if handle._early_metadata is not None and handle.state in ("restored", "active"):
+                self._cancel(handle, "failed")
+            raise StateError("D handle has no early transfer in progress")
+        prompt_length = handle._early_metadata["prompt_length"]
+        arch = self.spec["architecture"]
+        try:
+            if (type(layer) is not int or layer != handle._next_layer
+                    or not 0 <= layer < arch["num_layers"]
+                    or type(start) is not int or type(end) is not int
+                    or start != handle._next_offset or not start < end <= prompt_length):
+                raise ValueError("Invalid or duplicate KV region")
+            nbytes = 2 * (end - start) * arch["num_kv_heads"] * arch["head_dim"] * tensor_dtype(self.spec).itemsize
+            if type(payload) is not bytes or len(payload) != nbytes:
+                raise ValueError("Invalid KV region byte count")
+            if handle._receiver is not None:
+                if nbytes > handle._receiver.frame_bytes:
+                    raise ValueError("KV region exceeds pipeline frame limit")
+                handle._receiver.restore(handle.sequence.block_table, layer, start, end, payload)
+                if layer + 1 == arch["num_layers"] and end == prompt_length:
+                    handle._receiver.finish()
+            else:
+                host = torch.frombuffer(bytearray(payload), dtype=tensor_dtype(self.spec)).reshape(
+                    2, end - start, arch["num_kv_heads"], arch["head_dim"])
+                cache = self.engine.model_runner.kv_cache
+                block_size = self.manager.block_size
+                pos = start
+                while pos < end:
+                    block = handle.sequence.block_table[pos // block_size]
+                    offset = pos % block_size
+                    count = min(end - pos, block_size - offset)
+                    cache[:, layer, block, offset:offset + count].copy_(host[:, pos - start:pos - start + count])
+                    pos += count
+        except Exception:
+            self._cancel(handle, "failed")
+            raise
+        if end == prompt_length:
+            handle._next_layer += 1
+            handle._next_offset = 0
+        else:
+            handle._next_offset = end
+        self._finish_early_restore(handle)
+        return True
+
+    def commit_early(self, handle, metadata):
+        self._check(handle)
+        if handle._commit_metadata is not None and handle.state in ("early_reserved", "restored", "active", "finished"):
+            validate_metadata(metadata, handle.session_id, self.spec,
+                              self.scheduler.max_model_length)
+            if metadata == handle._commit_metadata:
+                return False
+            raise StateError("Early transaction commit changed")
+        if handle.state != "early_reserved":
+            raise StateError("D handle has no early transfer to commit")
+        try:
+            validate_metadata(metadata, handle.session_id, self.spec,
+                              self.scheduler.max_model_length)
+            expected = deepcopy(handle._early_metadata)
+            expected["version"] = 2
+            expected["token_ids"].append(metadata["token_ids"][-1])
+            expected["cached_tokens"] = expected["next_position"] = expected["prompt_length"]
+            expected["completion_count"] = 1
+            if metadata != expected:
+                raise ValueError("Early transaction commit does not match its reservation")
+        except ValueError:
+            self._cancel(handle, "failed")
+            raise
+        handle._commit_metadata = deepcopy(metadata)
+        handle.sequence.append_token(metadata["token_ids"][-1])
+        self._finish_early_restore(handle)
+        return True
+
+    def _finish_early_restore(self, handle):
+        prompt_length = handle._early_metadata["prompt_length"]
+        if handle._commit_metadata is not None and handle._next_layer == self.spec["architecture"]["num_layers"]:
+            handle.sequence.num_cached_tokens = prompt_length
+            handle.sequence.num_scheduled_tokens = 1
+            self._release_bytes(handle)
+            handle.state = "restored"
 
     def restore(self, handle, payload):
         self._check(handle)
@@ -410,12 +620,15 @@ class DecodeCore(_Core):
     def _cancel(self, handle, state):
         if handle.state in ("finished", "cancelled", "expired", "failed"):
             return False
+        if handle._receiver is not None:
+            handle._receiver.close()
+            handle._receiver = None
         seq = handle.sequence
         if handle.state == "active":
             self.scheduler.cancel(seq.seq_id)
             self._sequences.pop(seq.seq_id, None)
             self.engine.request_ids.pop(seq.seq_id, None)
-        elif handle.state == "restored":
+        elif handle.state in ("restored", "early_reserved"):
             self.manager.deallocate(seq)
             seq.status = SequenceStatus.CANCELLED
         self._release(handle)

@@ -65,6 +65,23 @@ def analyze(paths):
             group["handoff_ms"] / completed if group["handoff_ms"] is not None and completed else None
         )
         group["transfer_ms"] = transfer.get("transfer_ms")
+        pipeline = [r for r in events if r["event"] == "pd_pipeline_done"]
+        sender = [r for r in events if r["event"] == "pd_pipeline_sender_closed"]
+        frames = [r for r in events if r["event"] == "pd_region_sent"]
+        submitted = [r for r in events if r["event"] == "pd_region_socket_done"]
+        if pipeline or sender or frames or any(r["event"] == "pd_pipeline_connected" for r in events):
+            observed = sender[-1] if sender else pipeline[-1] if pipeline else None
+            acked_bytes = observed["payload_bytes"] if observed else sum(r["payload_bytes"] for r in frames)
+            acked_frames = observed["frames"] if observed else len(frames)
+            group["payload_bytes"] = acked_bytes
+            group["pipeline"] = {
+                "acked_frames": acked_frames, "acked_payload_bytes": acked_bytes,
+                "socket_submitted_bytes_lower_bound": (
+                    sender[-1]["socket_submitted_bytes"] if sender
+                    else sum(r["payload_bytes"] for r in submitted)),
+                "partial_send_unknown": sender[-1]["partial_send_unknown"] if sender else None,
+                "residual_wait_ms": pipeline[-1]["residual_wait_ms"] if pipeline else None,
+            }
     counts = Counter(group["outcome"] for group in groups.values())
     return {"transactions": list(groups.values()), "outcomes": dict(counts),
             "orphan_pd_events": orphans}

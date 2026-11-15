@@ -30,6 +30,7 @@ class Sequence:
         self.num_prompt_tokens = len(self.token_ids)
         # num_cached_tokens = 0
         self.num_cached_tokens = 0
+        self.num_scheduled_tokens = len(self.token_ids)
         # block_table
         self.block_table = []
         # sampling_params' related things
@@ -92,8 +93,9 @@ class Sequence:
             self.num_tokens, 
             self.num_prompt_tokens, 
             self.num_cached_tokens, 
+            self.num_scheduled_tokens,
             self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
+            self.token_ids if self.num_tokens - self.num_cached_tokens > 1 else self.last_token
         )
 
     def __setstate__(self, state):
@@ -101,12 +103,12 @@ class Sequence:
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
+            self.num_scheduled_tokens,
             self.block_table,
             last_token_or_ids
         ) = state
-        # Check if this is prefill (num_completion_tokens == 0) or decode phase
-        num_completion_tokens = self.num_tokens - self.num_prompt_tokens
-        if num_completion_tokens == 0:
+        # Recompute after preemption also needs the full prefix, including completions.
+        if isinstance(last_token_or_ids, list):
             # Prefill: last_token_or_ids is the full token_ids list
             self.token_ids = last_token_or_ids
         else:

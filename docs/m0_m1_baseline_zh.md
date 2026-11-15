@@ -83,6 +83,8 @@ M0/M1 只建立可复现基线和调度/KV 生命周期正确性。当前 prefil
 
 当前配置默认 `enforce_eager=true`。CUDA Graph 路径仍有上游遗留问题：capture 阶段 `outputs` 的形状为 `(max_bs, vocab_size)`，但 `self.model()` 返回宽度为 `hidden_size` 的 hidden states，赋值形状不匹配。因此本基线的 `enforce_eager=false` 路径不可用，留到 M3 修复；当前没有执行 GPU 验证。
 
+上述限制描述 M0/M1 固定基线。M3 的代码修复及尚未完成的 GPU 验收边界见 [M3 运行说明](./m3_runtime_zh.md)。
+
 ## 人工学习/审核清单
 
 - 阅读 `src/myvllm/config.py`、两个 JSON 配置和两个入口，确认配置字段确实覆盖运行所需参数。

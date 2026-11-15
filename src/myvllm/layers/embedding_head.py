@@ -73,6 +73,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             # cu_seqlens_q = [0, 5, 8, 12]
             # last_indices = [5, 8, 12] - 1 = [4, 7, 11]
             last_token = context.cu_seqlens_q[1:] - 1  # exclude the first element which is 0
+            if context.logit_indices is not None:
+                # Incomplete chunks do not predict completion tokens.
+                last_token = context.logit_indices
             x = x[last_token].contiguous()
 
         # logits: [batch_size, seq_len, vocab_size_per_partition]

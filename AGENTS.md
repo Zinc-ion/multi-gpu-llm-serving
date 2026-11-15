@@ -61,7 +61,7 @@
 
 1. 不修改 `main`，不 push，不 force-push，不删除分支，除非用户明确要求。重写历史前先建备份分支。
 2. 每个开发阶段单独从dev分支分出来开发，看发完毕经过人工审核后才合入dev分支，比如m2阶段就分出dev-m2分支，然后在该分支上进行m2阶段开发。
-2. 按逻辑拆分 commit：功能改动、测试、文档分开；纯格式化（若用户要求）必须单独成 commit，不和功能改动混在一起。
+2. 按逻辑拆分 commit：如果是功能改动，相应的测试和文档合并提交，其他单独的文档修改和测试需要单独提交；纯格式化（若用户要求）必须单独成 commit，不和功能改动混在一起。
 3. commit message 正文逐条说明每个行为变化及其原因，不写与本次改动无关的内容。
 4. 提交前检查暂存区中只有本次任务相关的文件。
 5. `dev` 是统一的开发集成分支，`main` 保留上游基线。每个阶段从最新 `dev` 创建阶段分支，在阶段分支上开发并按逻辑分批提交。
@@ -93,8 +93,8 @@
 ## 7. 当前已知状态（随阶段更新）
 
 - M2 已增加 RoPE/RMSNorm 的 FP32 中间计算修复、greedy、多 EOS、14B 分派、单实例 HTTP 服务和测量工具；GPU0 的 14B 加载、HF 对比、容量及同 NUMA PCIe 实测见 `docs/m2_measurements_2026-11-14_zh.md`。完整 B0、跨 NUMA、logits/token 阈值及 SLO 尚未完成验收，不得仅凭 CPU 测试或小规模测量宣称通过。
-- 当前配置默认 `enforce_eager=true`，CUDA Graph 路径存在上游遗留的形状问题，见 `docs/m0_m1_baseline_zh.md`，计划在 M3 修复。
-- 当前 prefill kernel 不读取 block table，跨请求 prefix 复用保持禁用。在实现 paged prefill 和 RoPE 位置偏移之前，不要重新启用。
+- 当前配置默认 `enforce_eager=true`。M3 已修正 CUDA Graph hidden-state buffer、capture batch 范围和 padding，CPU 回归及 Triton 解释模式已验证；真实 GPU capture/replay、14B 显存和性能尚未验证，见 `docs/m3_runtime_zh.md`。
+- M3 新增 paged prefill、RoPE offset 和可选 chunked prefill；CPU 生命周期/协议与 tiny 模型已验证，GPU kernel 和 14B 尚未验证。跨请求 prefix 复用保持禁用，不能仅因支持同请求 chunk 就开启共享。
 
 
 

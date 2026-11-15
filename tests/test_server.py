@@ -46,8 +46,8 @@ def test_incremental_decoding_matches_whole_sequence(tokenizer, text):
     assert result == tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
 
-@pytest.fixture
-def service(tokenizer, monkeypatch, tmp_path):
+@pytest.fixture(params=[False, True], ids=["whole-prefill", "chunked-prefill"])
+def service(tokenizer, monkeypatch, tmp_path, request):
     generated = tokenizer.encode("你好 😀 café\n完成", add_special_tokens=False)
     eos = tokenizer.eos_token_id
 
@@ -67,13 +67,15 @@ def service(tokenizer, monkeypatch, tmp_path):
             return torch.tensor([
                 generated[seq.num_completion_tokens] if seq.num_completion_tokens < len(generated) else eos
                 for seq in sequences
+                if seq.num_cached_tokens + seq.num_scheduled_tokens == len(seq)
             ])
 
     monkeypatch.setattr("myvllm.engine.llm_engine.ModelRunner", CPUModelRunner)
     config = {
         "model_name_or_path": str(tmp_path), "world_size": 1, "block_size": 4,
-        "max_num_sequences": 2, "max_num_batched_tokens": 256,
+        "max_num_sequences": 2, "max_num_batched_tokens": 16 if request.param else 256,
         "max_model_length": 128, "max_cached_blocks": 64, "eos": [eos],
+        "enable_chunked_prefill": request.param,
     }
     app = create_app(config, "tiny", engine_factory=LLMEngine)
     sock = socket.socket()

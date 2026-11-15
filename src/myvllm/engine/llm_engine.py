@@ -52,7 +52,8 @@ class LLMEngine:
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
             eos=config["eos"],
-            max_model_length=config["max_model_length"]
+            max_model_length=config["max_model_length"],
+            enable_chunked_prefill=config.get("enable_chunked_prefill", False),
         )
 
         atexit.register(self.exit)
@@ -79,8 +80,11 @@ class LLMEngine:
         num_processed_tokens = 0
         if not scheduled_sequences:
             return [], num_processed_tokens, is_prefill
-        if timings:
-            token_count = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
+        token_count = sum(seq.num_scheduled_tokens for seq in scheduled_sequences)
+        sampled_sequences = [
+            seq for seq in scheduled_sequences
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == len(seq)
+        ]
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
         # Move outputs to CPU and convert them to a list
@@ -101,11 +105,11 @@ class LLMEngine:
             timings.cpu["postprocess_ms"] = (time.perf_counter() - postprocess_start) * 1000
             timings.write(self.config["timing_path"], is_prefill, scheduled_sequences, token_count, self.request_ids)
         if on_tokens is not None:
-            for seq, token in zip(scheduled_sequences, outputs):
+            for seq, token in zip(sampled_sequences, outputs):
                 on_tokens(seq, token)
 
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
-        num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
+        num_processed_tokens = token_count
 
         return outputs, num_processed_tokens, is_prefill
 

@@ -4,12 +4,12 @@ from myvllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
-    def __init__(self, max_num_sequences: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: list[int], max_model_length: int):
+    def __init__(self, max_num_sequences: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: list[int], max_model_length: int, enable_chunked_prefill: bool = False):
         if max_num_sequences <= 0:
             raise ValueError("max_num_sequences must be positive")
         if max_num_batched_tokens <= 0:
             raise ValueError("max_num_batched_tokens must be positive")
-        if max_model_length <= 0 or max_model_length > max_num_batched_tokens:
+        if max_model_length <= 0 or (not enable_chunked_prefill and max_model_length > max_num_batched_tokens):
             raise ValueError("max_model_length must be positive and must not exceed max_num_batched_tokens")
         if max_model_length > max_cached_blocks * block_size:
             raise ValueError("max_model_length must fit within the configured KV cache")
@@ -18,6 +18,7 @@ class Scheduler:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_sequences = max_num_sequences
         self.max_model_length = max_model_length
+        self.enable_chunked_prefill = enable_chunked_prefill
         # sequence queue
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -42,6 +43,8 @@ class Scheduler:
 
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        if self.enable_chunked_prefill:
+            return self._schedule_chunked()
         scheduled_sequences = []
         current_scheduled_tokens = 0
         # An empty schedule is only legitimate when this call freed blocks by
@@ -55,6 +58,7 @@ class Scheduler:
                 self.block_manager.allocate(seq)
                 seq.status = SequenceStatus.RUNNING
                 self.running.append(seq)
+                seq.num_scheduled_tokens = len(seq)
                 scheduled_sequences.append(seq)
                 current_scheduled_tokens += len(seq)
             else:
@@ -80,6 +84,7 @@ class Scheduler:
                     break
                 # append one token
                 self.block_manager.append(seq)
+                seq.num_scheduled_tokens = 1
                 scheduled_sequences.append(seq)
                 current_scheduled_tokens += 1 # only one token for completion
 
@@ -102,6 +107,59 @@ class Scheduler:
         return scheduled_sequences, False
 
 
+    def _schedule_chunked(self) -> tuple[list[Sequence], bool]:
+        scheduled_sequences = []
+        prefills = deque()
+        budget = self.max_num_batched_tokens
+        # Every resident gets at least one token of budget; decode is admitted
+        # first, then unfinished prefills consume the remaining budget.
+        resident_limit = min(self.max_num_sequences, self.max_num_batched_tokens)
+        while self.running:
+            seq = self.running.popleft()
+            if len(seq) - seq.num_cached_tokens > 1:
+                prefills.append(seq)
+                continue
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    self.preempt(self.running.pop())
+                elif prefills:
+                    self.preempt(prefills.pop())
+                else:
+                    self.preempt(seq)
+                    break
+            else:
+                self.block_manager.append(seq)
+                seq.num_scheduled_tokens = 1
+                scheduled_sequences.append(seq)
+                budget -= 1
+        while prefills:
+            seq = prefills.popleft()
+            if budget:
+                seq.num_scheduled_tokens = min(len(seq) - seq.num_cached_tokens, budget)
+                scheduled_sequences.append(seq)
+                budget -= seq.num_scheduled_tokens
+            else:
+                self.running.append(seq)
+        while self.waiting and budget and len(scheduled_sequences) + len(self.running) < resident_limit:
+            seq = self.waiting[0]
+            if not self.block_manager.can_allocate(seq):
+                break
+            self.waiting.popleft()
+            # Reserve the known prefix up front, reusing the existing allocator.
+            # Prefix sharing stays disabled; later chunks only write these slots.
+            self.block_manager.allocate(seq)
+            seq.status = SequenceStatus.RUNNING
+            seq.num_scheduled_tokens = min(len(seq), budget)
+            scheduled_sequences.append(seq)
+            budget -= seq.num_scheduled_tokens
+        self.running.extendleft(reversed(scheduled_sequences))
+        is_prefill = any(
+            seq.num_scheduled_tokens > 1 or seq.num_cached_tokens + 1 < len(seq)
+            for seq in scheduled_sequences
+        )
+        return scheduled_sequences, is_prefill
+
+
     def preempt(self, seq: Sequence) -> None:
         self.block_manager.deallocate(seq)
         seq.status = SequenceStatus.WAITING
@@ -122,7 +180,12 @@ class Scheduler:
     # postprocess after generation to check whether sequences are finished
     # if finished, deallocate blocks
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> None:
-        for seq, token_id in zip(seqs, token_ids):
+        tokens = iter(token_ids)
+        for seq in seqs:
+            seq.num_cached_tokens += seq.num_scheduled_tokens
+            if seq.num_cached_tokens < len(seq):
+                continue
+            token_id = next(tokens)
             seq.append_token(token_id)
             # Check stopping conditions:
             # EOS token

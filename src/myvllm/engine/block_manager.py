@@ -61,12 +61,9 @@ class BlockManager:
         block = self.blocks[block_id]
         # Clearing token_ids drops metadata for the freed block; allocate() also
         # gives each sequence independent blocks. Reuse across sequences is not
-        # enabled yet because the prefill path cannot consume it -- the Triton kernel
-        # in layers/attention.py attends only over the K/V computed in that pass and
-        # ignores context.block_tables, and qwen3 derives RoPE positions from
-        # cu_seqlens_q, so both would be wrong by num_cached_tokens. Enabling reuse
-        # means a paged prefill kernel (cu_seqlens_q != cu_seqlens_k) plus a position
-        # offset; until then allocate() uses independent blocks to keep the engine correct.
+        # enabled: paged prefill now consumes this request's prior chunks, but
+        # sharing live blocks across requests has not been implemented or validated.
+        # allocate() continues to use independent blocks.
         if self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
         block.reset()
@@ -84,7 +81,7 @@ class BlockManager:
             token_ids = seq.block(i)
             # only compute hash for full blocks, always -1 for partial blocks
             h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1
-            # Prefill cannot consume cached prefixes yet; never share live blocks.
+            # Cross-request prefix reuse remains disabled; never share live blocks.
             block = self._allocate_block(self.free_block_ids[0])
             if h != -1:
                 block.update(h=h, token_ids=token_ids)

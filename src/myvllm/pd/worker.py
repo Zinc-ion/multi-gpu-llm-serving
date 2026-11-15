@@ -379,12 +379,14 @@ class PDWorker:
         self.request_timeout = request_timeout
         self.engine_factory = engine_factory
         self.server = None
+        self._starting = None
         self.connections = {}
         self.sessions = 0
 
     async def start(self, host, port):
         self.loop = asyncio.get_running_loop()
         self.failed = asyncio.Event()
+        self._starting = asyncio.Event()
         self.owner = _Owner(self, self.engine_factory)
         self.owner.thread.start()
         try:
@@ -397,6 +399,8 @@ class PDWorker:
                 self.owner.submit(None, "shutdown")
             await asyncio.to_thread(self.owner.thread.join)
             raise
+        finally:
+            self._starting.set()
         return self.server.sockets[0].getsockname()[:2]
 
     async def _await_owner(self, reader, future):
@@ -552,6 +556,8 @@ class PDWorker:
                     self.connections.pop(task, None)
 
     async def close(self):
+        if self._starting is not None:
+            await self._starting.wait()
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()

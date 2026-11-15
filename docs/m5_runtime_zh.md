@@ -75,6 +75,8 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m myvllm.pd.worker \
 
 P、D 使用一致的模型、tokenizer revision、结构、dtype、EOS 和总长度配置。每个实例在 core 初始化时只设一次采样 RNG：P 的有效 seed 是配置的 32 位 base seed，D 为 `base XOR 0x80000000`。D 拒绝与自身有效 seed 相同的 P seed。固定多对实例应给各对使用不同 base seed，同一对 P/D 使用相同 base seed；非 greedy 的输出不承诺与共置实例逐 token 相同。
 
+公开的 `PDWorker.start()` 与 `close()` 并发时，`close()` 等待当前启动过程结束，再关闭监听与 owner；返回后不会留下无 owner 的监听端口。关闭后仍可再次调用 `start()`。
+
 ## 客户端契约
 
 `from myvllm.pd.client import PDClient, PDRemoteError`；端点是 `(host, port)`。`await PDClient.info(endpoint)` 通过独立连接返回：

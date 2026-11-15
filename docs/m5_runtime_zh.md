@@ -18,3 +18,28 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m pytest -q -s \
 ```
 
 该测试不代表多卡 TP 正确性、服务器验收或 PD/KV 传输已经完成。
+
+## PD 核心与交接协议
+
+`myvllm.pd.PrefillCore` 和 `DecodeCore` 分别独占一个已创建的 TP=1 `LLMEngine` 的 Scheduler 和 KV pool；创建时要求 Scheduler 为空。核心不创建、关闭引擎，也不提供网络服务。所有操作须在各自引擎的唯一所有者线程中串行执行。`ModelRunner.kv_cache` 指向模型各层使用的同一 KV pool。
+
+构造时显式提供 `max_open_requests` 和 `max_transfer_bytes`。每条连接对应一个 D handle，`DecodeCore.open(deadline=None)` 发放随机 `session_id`；P 用该 ID 调用 `PrefillCore.open(session_id, request_id, prompt_token_ids, params, deadline=None)`，再发放独立的随机 `transaction_id`。`request_id` 仅用于外部关联，允许不同连接重复。`deadline` 是各自进程中的 monotonic 绝对时间，不能跨进程直接比较；循环调用 `expire()` 或 `expire(now)` 返回新过期的 handle，网络层负责把取消传播到对端。
+
+典型调用顺序如下，其中 P 与 D 各在自己的所有者线程中运行；具体消息传输由后续服务层实现：
+
+1. D `open()`，将 `session_id` 交给 P；P `open()` 后按需调用 `step()`。返回的 `TokenEvent` 包含 handle、token、是否结束、结束原因及 prompt/completion 计数。P 首 token 先向客户端发送一次。EOS、输出数或总长度在首 token 即满足上限时，事件已标记结束且 P KV 已释放，无须交接。
+2. 对未结束请求，P 的 `describe(handle)` 返回可 JSON 序列化的轻量元数据，此时不分配和读取 payload；D `reserve(handle, metadata)` 校验并预留容量。`CapacityError` 明确拒绝该请求，不自动重试。
+3. P `export(handle)` 返回真实主存 `bytes`；D `restore(handle, payload)` 完成复制后才返回，随后 P `acknowledge(handle)` 释放 P block 和缓冲，D `activate(handle)` 开始解码。D `step()` 的事件只包含第二个及之后的 token。P/D 不共享 Sequence、seq_id 或物理 block。
+4. 两侧 `cancel(handle)`、`close(handle)` 和 `shutdown()` 在 step/copy 边界执行，释放本侧资源；`shutdown()` 不关闭引擎。网络层在同步复制返回后、激活或下一次 decode 前处理已排队的取消并调用 `expire()`。正常完成、拒绝、异常、连接断开或超时后，网络层都要关闭两侧相应 handle 并传播必要的对端取消。关闭后旧 handle 的交接/激活操作被拒绝；每条连接只能创建并使用其自己的 handle，不能把迟到消息当成新连接的 `open`。
+
+同一连接内，相同的 P `open`、D `reserve`/`restore`/`activate`、P `export`/`acknowledge` 不会再次执行生成或释放；改变已有事务的 metadata 会被拒绝。重复 `restore` 仅检查 bytes 类型和长度，保留首次成功恢复的结果，不重新复制或校验内容。ACK 后不再保留 payload，迟到的 `export` 不会重新生成它。已取消或过期的 handle 不可重新激活；终态只保留到连接调用 `close`，关闭会清除 Sequence 和 metadata 引用。`stats()` 可观察打开的 handle、预留传输字节、free/used block；P 另报 held 请求和实际缓冲字节，D 另报预留 block、resident 数及上限。
+
+元数据包括协议版本、session/transaction/request ID、P 本地 seq_id、完整 prompt 和首 token、原始 prompt 长度、cached token 数、下一个 position、completion 计数、采样及停止参数。模型名、固定 revision、tokenizer revision、模型结构、EOS 和规范 dtype 均须与 D 配置一致；当前模型 revision 必须显式提供。KV 标明 dtype、主机字节序、精确 shape 和字节数；D 在分配物理 block 前检查这些信息、请求长度及 payload 长度。
+
+P 在首 token 采样后仅有 prompt 的 KV：`cached_tokens = next_position = N`，`completion_count = 1`。传输形状为 `[2, layers, ceil(N / block_size), block_size, kv_heads, head_dim]`，依据 cached 数取块，不依据首 token 加入后的 `seq.num_blocks`。仅复制有效位置，末块无效尾部为零。bytes 为本机原生字节序，不兼容的字节序在接收端拒绝。
+
+P 的 D2H 和 D 的 H2D 使用同步复制；返回 bytes 或 restore 成功表示相应复制已完成。D 在验证 payload 后分配自己的 block，以原始 prompt 创建 Sequence、追加首 token，设 cached 为 N，并从位置 N 开始处理该 token；正常路径不重算 prompt。导出期间临时 host tensor 与输出 bytes 可同时存在，导入期间输入 bytes 与临时 host 存储可同时存在，数据大小可能达到预留字节的两倍；PyTorch 内部、调用者及网络层还可能持有额外副本，须另行计入并限制，不能把该上限直接当作进程峰值主存上限。
+
+D 按 `ceil(min(prompt_length + max_tokens, max_model_length) / block_size)` 为每个已接纳请求预留完整逻辑 block 配额，同时限制 reserved/restored/active 请求数不超过 `min(max_num_sequences, max_num_batched_tokens)`。配额覆盖后续 decode 的物理分配，确保核心独占 Scheduler 时不会因普通资源压力抢占并重算 prompt。P 的 held 请求移出 Scheduler 但继续持有 block；若全部运行请求都已移出且 waiting 队首因这些 block 暂不能分配，P `step()` 返回空事件等待 ACK/取消，不触发原有无进展异常。
+
+CPU 专项使用真实 `LLMEngine.step`、`Sequence`、Scheduler 和 BlockManager，覆盖块边界、跨块 decode、多请求、容量、取消、超时与重复消息。另用真实 tiny Qwen3 计算、CPU attention 替代 GPU kernel，对照 FP32/BF16 的 greedy token 和 logits。真实 GPU 上的 D2H/H2D、跨进程传输、CUDA Graph、故障回收及服务器性能仍待后续集成验证；本核心尚无 HTTP 或网络入口。

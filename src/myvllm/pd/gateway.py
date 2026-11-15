@@ -14,7 +14,7 @@ import uvicorn
 
 from myvllm.config import load_config, resolve_dtype
 from myvllm.engine.sequence import Sequence, SequenceStatus
-from myvllm.pd.client import PDClient, PDRemoteError
+from myvllm.pd.client import PDClient, PDRemoteError, PDTimingError
 from myvllm.pd.http import GatewayError
 from myvllm.pd.protocol import _ARCHITECTURE_FIELDS
 from myvllm.pd.wire import ProtocolError
@@ -47,6 +47,8 @@ def _model_spec(config):
 def _request_error(exc, phase):
     if isinstance(exc, GatewayError):
         return exc
+    if isinstance(exc, PDTimingError):
+        return GatewayError(500, f"PD timing write failed: {exc}")
     if isinstance(exc, TimeoutError) or isinstance(exc, PDRemoteError) and exc.code == "TimeoutError":
         return GatewayError(504, f"PD request timed out during {phase}")
     if isinstance(exc, PDRemoteError):
@@ -155,11 +157,17 @@ class PDGateway:
 
     def _task_done(self, entry, task):
         # A task cancelled before its coroutine starts cannot run its finally.
+        error = None if task.cancelled() else task.exception()
+        if error is not None:
+            logger.error("PD gateway request cleanup failed", exc_info=error)
         if not entry.remote_done:
             if task.cancelled():
-                self._record(entry, "pd_gateway_cancelled", phase="before_start")
-            else:
-                logger.error("PD gateway request cleanup failed", exc_info=task.exception())
+                try:
+                    self._record(entry, "pd_gateway_cancelled", phase="before_start")
+                except GatewayError:
+                    logger.exception("PD gateway cancellation timing failed")
+            elif error is not None and not entry.frontend_done:
+                entry.pending.tokens.put_nowait(_request_error(error, "cleanup"))
             entry.remote_done = True
             self._release_if_done(entry)
 
@@ -173,13 +181,16 @@ class PDGateway:
     def _record(self, entry, event, **fields):
         path = self.config.get("timing_path")
         if path:
-            write_record(path, {
-                "event": event, "request_id": entry.pending.request_id,
-                "gateway_id": entry.gateway_id, "session_id": entry.session_id,
-                "transaction_id": entry.transaction_id,
-                "elapsed_ms": (time.perf_counter() - entry.pending.arrival) * 1000,
-                **fields,
-            })
+            try:
+                write_record(path, {
+                    "event": event, "request_id": entry.pending.request_id,
+                    "gateway_id": entry.gateway_id, "session_id": entry.session_id,
+                    "transaction_id": entry.transaction_id,
+                    "elapsed_ms": (time.perf_counter() - entry.pending.arrival) * 1000,
+                    **fields,
+                })
+            except OSError as exc:
+                raise GatewayError(500, f"PD timing write failed: {exc}") from exc
 
     def _release_if_done(self, entry):
         if entry.frontend_done and entry.remote_done:
@@ -191,11 +202,15 @@ class PDGateway:
         if entry is None or entry.frontend_done:
             return
         entry.frontend_done = True
-        self._record(entry, "pd_gateway_frontend_completed" if completed else "pd_gateway_frontend_closed")
-        if not completed and not entry.finishing and not entry.cancelled:
-            entry.cancelled = True
-            entry.task.cancel()
-        self._release_if_done(entry)
+        try:
+            self._record(entry, "pd_gateway_frontend_completed" if completed else "pd_gateway_frontend_closed")
+        except GatewayError:
+            logger.exception("PD gateway frontend timing failed")
+        finally:
+            if not completed and not entry.finishing and not entry.cancelled:
+                entry.cancelled = True
+                entry.task.cancel()
+            self._release_if_done(entry)
 
     def _publish(self, entry, event):
         seq = entry.seq
@@ -214,12 +229,15 @@ class PDGateway:
             seq.status = SequenceStatus.FINISHED
         if seq.num_completion_tokens in (1, 2):
             self._record(entry, "pd_gateway_first" if seq.num_completion_tokens == 1 else "pd_gateway_second")
-        entry.pending.tokens.put_nowait((token, event["finished"], reason))
+        if not event["finished"]:
+            entry.pending.tokens.put_nowait((token, False, reason))
         return event["finished"]
 
     async def _run(self, entry):
         prefill = decode = None
         staging = False
+        cancelled = False
+        error = None
         phase = "open_d"
         deadline = asyncio.get_running_loop().time() + self.request_timeout
         try:
@@ -233,7 +251,8 @@ class PDGateway:
             entry.transaction_id = prefill.transaction_id
             self._record(entry, "pd_gateway_open", prefill=list(entry.pair[0]), decode=list(entry.pair[1]))
             phase = "first"
-            terminal = self._publish(entry, await prefill.next_token())
+            event = await prefill.next_token()
+            terminal = self._publish(entry, event)
             if not terminal:
                 phase = "describe"
                 metadata = await prefill.describe()
@@ -252,24 +271,41 @@ class PDGateway:
                 staging = False
                 phase = "decode"
                 while not terminal:
-                    terminal = self._publish(entry, await decode.next_token())
+                    event = await decode.next_token()
+                    terminal = self._publish(entry, event)
             self._record(entry, "pd_gateway_completed", completion_tokens=entry.seq.num_completion_tokens)
         except asyncio.CancelledError:
-            self._record(entry, "pd_gateway_cancelled", phase=phase)
+            cancelled = True
+            try:
+                self._record(entry, "pd_gateway_cancelled", phase=phase)
+            except GatewayError:
+                logger.exception("PD gateway cancellation timing failed")
         except Exception as exc:
             error = _request_error(exc, phase)
-            self._record(entry, "pd_gateway_failed", phase=phase, status=error.status, reason=str(error))
-            entry.pending.tokens.put_nowait(error)
+            try:
+                self._record(entry, "pd_gateway_failed", phase=phase, status=error.status, reason=str(error))
+            except GatewayError:
+                logger.exception("PD gateway failure timing failed")
         finally:
             entry.finishing = True
             results = await asyncio.gather(*(conn.close() for conn in (prefill, decode) if conn is not None),
                                            return_exceptions=True)
             if staging:
                 self.staging_bytes -= self.max_payload_bytes
-            self._record(entry, "pd_gateway_released", close_errors=[str(r) for r in results if isinstance(r, BaseException)],
-                         staging_bytes=self.staging_bytes)
-            entry.remote_done = True
-            self._release_if_done(entry)
+            try:
+                self._record(entry, "pd_gateway_released", close_errors=[str(r) for r in results if isinstance(r, BaseException)],
+                             staging_bytes=self.staging_bytes)
+            except GatewayError as exc:
+                logger.exception("PD gateway release timing failed")
+                if error is None and not cancelled:
+                    error = exc
+            finally:
+                if error is not None:
+                    entry.pending.tokens.put_nowait(error)
+                elif not cancelled:
+                    entry.pending.tokens.put_nowait((event["token"], True, event["finish_reason"]))
+                entry.remote_done = True
+                self._release_if_done(entry)
 
     async def close(self):
         self.closing = True

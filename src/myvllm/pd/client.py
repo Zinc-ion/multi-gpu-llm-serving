@@ -14,6 +14,10 @@ class PDRemoteError(RuntimeError):
         self.code = code
 
 
+class PDTimingError(OSError):
+    """A PD timing record could not be written."""
+
+
 class PDConnection:
     def __init__(self, reader, writer, deadline):
         self._reader = reader
@@ -163,11 +167,14 @@ class PDClient:
             del payload
         elapsed = (time.perf_counter() - started) * 1000
         if timing_path:
-            write_record(timing_path, {
-                "event": "pd_transfer_done", "request_id": metadata["request_id"],
-                "session_id": metadata["session_id"],
-                "transaction_id": metadata["transaction_id"],
-                "payload_bytes": nbytes, "transfer_ms": elapsed,
-            })
+            try:
+                write_record(timing_path, {
+                    "event": "pd_transfer_done", "request_id": metadata["request_id"],
+                    "session_id": metadata["session_id"],
+                    "transaction_id": metadata["transaction_id"],
+                    "payload_bytes": nbytes, "transfer_ms": elapsed,
+                })
+            except OSError as exc:
+                raise PDTimingError(*exc.args) from exc
         await prefill.acknowledge()
         await decode.activate()

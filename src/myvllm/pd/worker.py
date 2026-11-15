@@ -103,15 +103,21 @@ class _Owner:
             ctx.pending = None
         if ctx.handle is not None:
             handle = ctx.handle
-            if handle.state not in ("finished", "handed_off", "cancelled", "expired", "failed"):
-                self._record("pd_cancelled", ctx, reason="connection_closed")
-            self.core.close(handle)
-            self.contexts.pop(handle, None)
-            if self.worker.role == "decode":
-                self.decode_sessions.pop(handle.session_id, None)
-            self._record("pd_released", ctx, stats=self.core.stats())
-            ctx.handle = None
-        ctx.events.clear()
+            try:
+                try:
+                    if handle.state not in ("finished", "handed_off", "cancelled", "expired", "failed"):
+                        self._record("pd_cancelled", ctx, reason="connection_closed")
+                finally:
+                    self.core.close(handle)
+                    self.contexts.pop(handle, None)
+                    if self.worker.role == "decode":
+                        self.decode_sessions.pop(handle.session_id, None)
+                self._record("pd_released", ctx, stats=self.core.stats())
+            finally:
+                ctx.handle = None
+                ctx.events.clear()
+        else:
+            ctx.events.clear()
 
     def _open(self, ctx, op, fields):
         if ctx.handle is not None:
@@ -416,7 +422,10 @@ class PDWorker:
             return result.result()
         finally:
             disconnect.cancel()
-            if not result.done():
+            if result.done():
+                if not result.cancelled():
+                    result.exception()
+            else:
                 result.add_done_callback(lambda item: item.exception() if not item.cancelled() else None)
             await asyncio.gather(disconnect, return_exceptions=True)
 

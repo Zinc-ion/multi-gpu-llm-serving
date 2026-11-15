@@ -352,7 +352,14 @@ def create_app(config, model_name=None, engine_factory=LLMEngine, pd_worker=None
                             record.update(worker.timing_ids(seq.seq_id))
                         logger.info(json.dumps(record))
                         if config.get("timing_path"):
-                            write_record(config["timing_path"], record)
+                            try:
+                                write_record(config["timing_path"], record)
+                            except OSError as exc:
+                                if pd_worker is None:
+                                    raise
+                                first = False
+                                completed = False
+                                raise GatewayError(500, f"PD timing write failed: {exc}") from exc
                     first = False
                 if (body.get("stream_options") or {}).get("include_usage", False):
                     yield "data: " + json.dumps({

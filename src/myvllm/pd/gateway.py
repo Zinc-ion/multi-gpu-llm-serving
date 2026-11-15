@@ -131,6 +131,8 @@ class PDGateway:
         self.claimed -= 1
 
     def submit(self, pending):
+        if self.closing:
+            raise GatewayError(503, "PD gateway is shutting down")
         if not pending.token_ids:
             raise ValueError("Prompt requires at least one token")
         if len(pending.token_ids) >= self.config["max_model_length"]:

@@ -296,6 +296,10 @@ def create_app(config, model_name=None, engine_factory=LLMEngine, pd_worker=None
             else:
                 worker.commands.put(("add", pending))
                 seq = await pending.admitted
+        except GatewayError as exc:
+            if pd_worker is not None:
+                worker.unclaim()
+            raise HTTPException(exc.status, str(exc)) from exc
         except ValueError as exc:
             if pd_worker is not None:
                 worker.unclaim()

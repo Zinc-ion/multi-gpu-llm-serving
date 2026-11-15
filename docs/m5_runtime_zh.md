@@ -191,6 +191,8 @@ CUDA_VISIBLE_DEVICES='' uv run python -m myvllm.pd.gateway \
 
 请求头还未发出时，输入错误为 400、容量或对端不可用为 503、超时为 504、交接协议或恢复不匹配为 502；普通 JSON 即使在取得首 token 后失败，也在发送响应体前返回非 200。流式响应在首个 choices 之前发生错误时同样返回非 200 JSON；已发送 choices 后的失败以 `data: {"error": ...}` 结束，不发送成功的 finish、usage 或 `[DONE]`。成功流仍为每个 token 一条 choices，按请求可选发送空 choices 的 usage，再发送 `[DONE]`。客户端提前断连会取消对应网络任务；网关配额在前端结束、两侧连接关闭或 EOF 触发清理后才归还。`close()` 也会终止正在等待的请求。清理在 worker owner 中按已有操作顺序进行，不强行中断正在运行的 kernel 或复制。
 
+`close()` 返回后，仍处于读取请求体或分词阶段的请求由 HTTP 栈收尾；如继续提交，则返回 503、归还配额，不创建 P/D 连接。
+
 计时开启时，网关记录带 `gateway_id`、`session_id`、`transaction_id` 的 `pd_gateway_*` 事件，并保留 `chunk_sent`；外部 request ID 可以重复。`pd_gateway_first/second` 的 `elapsed_ms` 从 HTTP 收到请求起至网关收到该 token，包含分词与排队；`pd_gateway_completed` 到网关收到末 token 为止，并非客户端收到响应的 E2E。`pd_gateway_handoff_done.handoff_ms` 从调用 handoff 前至 D activate 后，包括 D reserve、P export、主存与 TCP 中转、D restore、P ACK 和 D activate。已有 `pd_transfer_done.transfer_ms` 从 reserve 响应后至 restore 响应，排除 reserve、P ACK 和 D activate。阶段相互重叠时不能简单相加。`pd_gateway_released` 记录两侧关闭尝试结束，worker 的 `pd_released` 及 stats 记录各自 owner 的释放结果；连接意外断开时不能把客户端 close 当成远端已确认释放。
 
 ```bash

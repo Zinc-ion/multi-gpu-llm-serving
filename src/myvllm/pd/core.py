@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import time
 import uuid
 
+import torch
+
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.pd.kv import export_kv, restore_kv
 from myvllm.pd.protocol import finite_number, make_metadata, model_spec, payload_nbytes, validate_metadata
@@ -44,11 +46,16 @@ class _Handle:
 
 
 class _Core:
+    _seed_mask = 0
+
     def __init__(self, engine, max_open_requests, max_transfer_bytes):
         if type(max_open_requests) is not int or max_open_requests <= 0:
             raise ValueError("max_open_requests must be a positive integer")
         if type(max_transfer_bytes) is not int or max_transfer_bytes <= 0:
             raise ValueError("max_transfer_bytes must be a positive integer")
+        seed = engine.config.get("seed", 0)
+        if type(seed) is not int or not 0 <= seed < 2**32:
+            raise ValueError("seed must be a 32-bit unsigned integer")
         self.engine = engine
         self.scheduler = engine.scheduler
         self.manager = self.scheduler.block_manager
@@ -60,6 +67,8 @@ class _Core:
         self._handles = {}
         self._sequences = {}
         self._reserved_bytes = 0
+        self.sampling_seed = seed ^ self._seed_mask
+        torch.manual_seed(self.sampling_seed)
 
     def _open(self, session_id, deadline):
         if len(self._handles) >= self.max_open_requests:
@@ -110,6 +119,7 @@ class _Core:
 
     def stats(self):
         return {
+            "sampling_seed": self.sampling_seed,
             "open_handles": len(self._handles),
             "reserved_transfer_bytes": self._reserved_bytes,
             "free_blocks": len(self.manager.free_block_ids),
@@ -216,7 +226,7 @@ class PrefillCore(_Core):
         if handle.state not in ("held", "exported", "handed_off"):
             raise StateError("P request has no transferable KV")
         if handle._metadata is None:
-            handle._metadata = make_metadata(handle, self.spec)
+            handle._metadata = make_metadata(handle, self.spec, self.sampling_seed)
         return deepcopy(handle._metadata)
 
     def export(self, handle):
@@ -226,7 +236,7 @@ class PrefillCore(_Core):
         if handle.state != "held":
             raise StateError("P request is not waiting for export")
         if handle._metadata is None:
-            handle._metadata = make_metadata(handle, self.spec)
+            handle._metadata = make_metadata(handle, self.spec, self.sampling_seed)
         try:
             payload = export_kv(self.engine.model_runner.kv_cache,
                                 handle.sequence.block_table,
@@ -278,6 +288,8 @@ class PrefillCore(_Core):
 class DecodeCore(_Core):
     """Reserve complete D budgets and activate only after the KV copy completes."""
 
+    _seed_mask = 0x80000000
+
     def __init__(self, engine, max_open_requests, max_transfer_bytes):
         super().__init__(engine, max_open_requests, max_transfer_bytes)
         self._reserved_blocks = 0
@@ -299,6 +311,8 @@ class DecodeCore(_Core):
         try:
             validate_metadata(metadata, handle.session_id, self.spec,
                               self.scheduler.max_model_length)
+            if metadata["sampling_seed"] == self.sampling_seed:
+                raise ValueError("P and D sampling_seed must differ")
             nbytes = metadata["kv"]["nbytes"]
             tokens = min(metadata["prompt_length"] + metadata["sampling"]["max_tokens"],
                          metadata["sampling"]["max_model_length"])

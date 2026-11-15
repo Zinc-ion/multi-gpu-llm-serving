@@ -75,11 +75,11 @@ def tensor_dtype(spec):
     return _DTYPES[spec["dtype"]]
 
 
-def make_metadata(handle, spec):
+def make_metadata(handle, spec, sampling_seed):
     seq = handle.sequence
     cached = seq.num_cached_tokens
     return {
-        "version": 1,
+        "version": 2,
         "session_id": handle.session_id,
         "transaction_id": handle.transaction_id,
         "request_id": handle.request_id,
@@ -89,6 +89,7 @@ def make_metadata(handle, spec):
         "cached_tokens": cached,
         "next_position": cached,
         "completion_count": seq.num_completion_tokens,
+        "sampling_seed": sampling_seed,
         "sampling": {
             "temperature": seq.temperature,
             "max_tokens": seq.max_tokens,
@@ -109,11 +110,11 @@ def validate_metadata(metadata, session_id, spec, max_model_length):
     fields = {
         "version", "session_id", "transaction_id", "request_id", "prefill_seq_id",
         "token_ids", "prompt_length", "cached_tokens", "next_position",
-        "completion_count", "sampling", "model", "kv",
+        "completion_count", "sampling_seed", "sampling", "model", "kv",
     }
     if not isinstance(metadata, dict) or set(metadata) != fields:
         raise ValueError("Invalid PD metadata fields")
-    if type(metadata["version"]) is not int or metadata["version"] != 1:
+    if type(metadata["version"]) is not int or metadata["version"] != 2:
         raise ValueError("Unsupported PD protocol version")
     if metadata["session_id"] != session_id:
         raise ValueError("PD session does not match this handle")
@@ -124,6 +125,8 @@ def validate_metadata(metadata, session_id, spec, max_model_length):
         raise ValueError("Invalid prefill_seq_id")
     if metadata["model"] != spec:
         raise ValueError("Incompatible model, revision, dtype, architecture or EOS")
+    if type(metadata["sampling_seed"]) is not int or not 0 <= metadata["sampling_seed"] < 2**32:
+        raise ValueError("Invalid sampling_seed")
 
     sampling = metadata["sampling"]
     if not isinstance(sampling, dict) or set(sampling) != {

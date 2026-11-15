@@ -43,3 +43,11 @@ P 的 D2H 和 D 的 H2D 使用同步复制；返回 bytes 或 restore 成功表�
 D 按 `ceil(min(prompt_length + max_tokens, max_model_length) / block_size)` 为每个已接纳请求预留完整逻辑 block 配额，同时限制 reserved/restored/active 请求数不超过 `min(max_num_sequences, max_num_batched_tokens)`。配额覆盖后续 decode 的物理分配，确保核心独占 Scheduler 时不会因普通资源压力抢占并重算 prompt。P 的 held 请求移出 Scheduler 但继续持有 block；若全部运行请求都已移出且 waiting 队首因这些 block 暂不能分配，P `step()` 返回空事件等待 ACK/取消，不触发原有无进展异常。
 
 CPU 专项使用真实 `LLMEngine.step`、`Sequence`、Scheduler 和 BlockManager，覆盖块边界、跨块 decode、多请求、容量、取消、超时与重复消息。另用真实 tiny Qwen3 计算、CPU attention 替代 GPU kernel，对照 FP32/BF16 的 greedy token 和 logits。真实 GPU 上的 D2H/H2D、跨进程传输、CUDA Graph、故障回收及服务器性能仍待后续集成验证；本核心尚无 HTTP 或网络入口。
+
+## PD 采样随机流
+
+P、D 必须分别在各自进程中独占一个引擎。模型权重、warmup 和 KV 初始化完成后，构造空引擎的 PD core 时仅设置一次采样种子：P 使用配置 `seed`（缺省为 0），D 使用 `seed ^ 0x80000000`；配置种子须为 0 到 `2**32 - 1` 的整数。`torch.manual_seed` 会重设进程内 PyTorch 的 CPU 和所有可见 CUDA 设备的全局随机状态，因此同进程其他随机操作也会影响该流。请求的 open、交接和后续 decode 不重设种子；不同请求按实际批处理和采样顺序共同推进实例流。
+
+协议版本 2 的顶层 `sampling_seed` 记录 P 的实际采样种子，D 在预留资源前拒绝与自身实际采样种子相同的交接；协议版本 1 不兼容。P、D 的 `stats()` 分别提供本实例的 `sampling_seed`，便于核对独立配置。该策略使 P 和 D 使用不同的随机种子，不保证正温度采样与共置引擎逐 token 相同；随机流也受请求顺序、批次、设备和实现影响。
+
+CPU 回归使用独立进程、真实 tiny Qwen3 和采样器，attention 使用 CPU 替身且采样强制 eager，验证初始化、并发及后续请求的随机流推进和种子碰撞回收。真实 GPU 上的正温度采样仍待验证。

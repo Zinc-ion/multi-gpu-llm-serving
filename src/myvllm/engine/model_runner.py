@@ -18,6 +18,19 @@ from myvllm.utils.timing import StepTimings
 
 class ModelRunner:
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
+        self._standalone_store = None
+        had_process_group = dist.is_initialized()
+        try:
+            self._initialize(config, rank, event)
+        except BaseException:
+            try:
+                if not had_process_group and dist.is_initialized():
+                    dist.destroy_process_group()
+            finally:
+                self._standalone_store = None
+            raise
+
+    def _initialize(self, config: dict, rank: int, event: Event | list[Event]):
         self.config = config
         self.event = event
         self.timings = None
@@ -32,12 +45,12 @@ class ModelRunner:
         seed_everything(config.get('seed', 0))
         torch.set_default_dtype(resolve_dtype(config.get('dtype', 'float32')))
         resources = config.get("_instance_resources")
-        self._standalone_store = None
         if resources is None:
             if self.world_size != 1:
                 raise ValueError("Multi-rank ModelRunner requires engine instance resources")
             self._standalone_store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
-            store = self._standalone_store
+            # A failed process-group initialization may retain its store in the traceback.
+            store = dist.TCPStore("127.0.0.1", self._standalone_store.port, is_master=False)
             shm_name = None
         else:
             port, shm_name = resources
@@ -157,19 +170,23 @@ class ModelRunner:
     def exit(self):
         if self._exited:
             return
-        if self.world_size > 1:
-            self.shm.close()
-        if not self.enforce_eager:
-            del self.graphs
-            del self.graph_vars
-        torch.cuda.synchronize()
-        if self.timings:
-            self.timings.flush()
-        # Check if process group exists before destroying
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        self._standalone_store = None
         self._exited = True
+        try:
+            if self.world_size > 1:
+                self.shm.close()
+            if not self.enforce_eager:
+                del self.graphs
+                del self.graph_vars
+            torch.cuda.synchronize()
+            if self.timings:
+                self.timings.flush()
+        finally:
+            try:
+                # Check if process group exists before destroying
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            finally:
+                self._standalone_store = None
     
     # wait to read method and args from shared memory
     # execute the method with args

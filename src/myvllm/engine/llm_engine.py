@@ -28,17 +28,19 @@ class LLMEngine:
         self.config = config
         self.request_ids = {}
         world_size = config.get("world_size", 1)
-        self._store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
-        self._shm = SharedMemory(create=True, size=2**20) if world_size > 1 else None
-        runner_config = config.copy()
-        runner_config["_instance_resources"] = (
-            self._store.port, self._shm.name if self._shm else None,
-        )
-        ctx = mp.get_context("spawn")
+        self._store = None
+        self._shm = None
         self.processes = []
         self.events = []
         had_process_group = dist.is_initialized()
         try:
+            self._store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+            self._shm = SharedMemory(create=True, size=2**20) if world_size > 1 else None
+            runner_config = config.copy()
+            runner_config["_instance_resources"] = (
+                self._store.port, self._shm.name if self._shm else None,
+            )
+            ctx = mp.get_context("spawn")
             for i in range(1, world_size):
                 event = ctx.Event()
                 process = ctx.Process(target=worker_process, args=(runner_config, i, event))
@@ -90,14 +92,16 @@ class LLMEngine:
         if self.model_runner is None:
             return
         atexit.unregister(self.exit)
-        self.model_runner.call("exit")
-        self.model_runner = None
-        for process in self.processes:
-            process.join()
-        if self._shm:
-            self._shm.close()
-            self._shm.unlink()
-        self._store = None
+        try:
+            self.model_runner.call("exit")
+        finally:
+            self.model_runner = None
+            for process in self.processes:
+                process.join()
+            if self._shm:
+                self._shm.close()
+                self._shm.unlink()
+            self._store = None
 
     # call scheduler to schedule the next batch
     # return scheduled sequences and whether it is for prefilling

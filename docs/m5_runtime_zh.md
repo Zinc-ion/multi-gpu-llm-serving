@@ -142,7 +142,7 @@ D 为每个连接创建 session；P 入队前向固定 D 原子 claim 此活跃 
 - `export_ms` 围绕 P 同步导出，`restore_ms` 围绕 D 分配及同步恢复；完成时间在对应阻塞 copy 返回之后，`payload_bytes` 包含整块传输的末尾填充。
 - `PDClient.handoff(..., timing_path=...)` 的 `pd_transfer_done.transfer_ms` 从 D reserve 响应之后开始，到 D restore 响应为止，包含 P export、socket、客户端转发和 D owner 排队/恢复；不含 D reserve、P acknowledge 或 D activate。P 首 token 和 D 第二 token 的 `elapsed_ms` 分别相对各自的连接接受时间，不可跨主机时钟直接相减。
 
-`PDClient.handoff` 计时写失败抛出 `PDTimingError`（`OSError` 子类），调用方仍须关闭连接；worker 计时写失败使 owner 退出，`close()` 传播原始错误。
+`PDClient.handoff` 计时写失败抛出 `PDTimingError`（`OSError` 子类），调用方仍须关闭连接；worker 计时写失败使 owner 退出，错误在 worker 日志中可见并由 `PDWorker.close()` 原样传播，网关仅观察到连接中断时不会推断其原因。
 
 正常 decode 没有为捕获 logits 增加同步。测试专用 engine hook 捕获 logits、有效 KV 和 block table，不能作为生产性能测量。
 
@@ -191,13 +191,13 @@ CUDA_VISIBLE_DEVICES='' uv run python -m myvllm.pd.gateway \
 
 每次交接在导出前预留一个 `max_payload_bytes` 的中转配额，总预留不超过 `max_staging_bytes`；不足时该请求失败，不等待或换路。P 返回的实际 body 同时受其 worker 通告的 body 上限和网关配置上限约束。上述中转配额限制的是逻辑 payload 的总额，不等于网关 RSS 上限：`StreamReader` 中的字节与返回的 `bytes` 在复制时可能共存，向 D 写入时 payload 和 socket 用户态写缓冲也可能共存；还要计入请求体、token 队列、Python 分配器和操作系统 socket 缓冲。P、D 自己的导入导出临时副本和各自的总传输限额另计。配置中的 3 GiB/6 GiB 只是上限示例，不是实测内存需求或容量保证。
 
-请求头还未发出时，输入错误为 400、计时写入失败为 500、容量或对端不可用为 503、超时为 504、交接协议或恢复不匹配为 502；普通 JSON 即使在取得首 token 后失败，也在发送响应体前返回非 200。流式响应在首个 choices 之前发生错误时同样返回非 200 JSON；已发送 choices 后的失败以 `data: {"error": ...}` 结束，不再发送成功的 finish、usage 或 `[DONE]`。成功流仍为每个 token 一条 choices，按请求可选发送空 choices 的 usage，再发送 `[DONE]`。客户端提前断连会取消对应网络任务；网关配额在前端结束、两侧连接关闭或 EOF 触发清理后才归还。`close()` 也会终止正在等待的请求。清理在 worker owner 中按已有操作顺序进行，不强行中断正在运行的 kernel 或复制。
+请求头还未发出时，输入错误为 400、网关自身或 `PDClient.handoff` 可识别的计时写入失败为 500、容量或对端不可用为 503、超时为 504、交接协议或恢复不匹配为 502；普通 JSON 即使在取得首 token 后失败，也在发送响应体前返回非 200。流式响应在首个 choices 之前发生错误时同样返回非 200 JSON；已发送 choices 后的失败以 `data: {"error": ...}` 结束，不再发送成功的 finish、usage 或 `[DONE]`。成功流仍为每个 token 一条 choices，按请求可选发送空 choices 的 usage，再发送 `[DONE]`。客户端提前断连会取消对应网络任务；网关配额在前端结束、两侧连接关闭或 EOF 触发清理后才归还。`close()` 也会终止正在等待的请求。清理在 worker owner 中按已有操作顺序进行，不强行中断正在运行的 kernel 或复制。
 
 `chunk_sent` 在发送后写入，失败时发送 SSE error、不再发送 usage 和 `[DONE]`，已发出的 choices 无法撤回。
 
 `close()` 返回后，仍处于读取请求体或分词阶段的请求由 HTTP 栈收尾；如继续提交，则返回 503、归还配额，不创建 P/D 连接。
 
-计时开启时，网关记录带 `gateway_id`、`session_id`、`transaction_id` 的 `pd_gateway_*` 事件，并保留 `chunk_sent`；外部 request ID 可以重复。`pd_gateway_first/second` 的 `elapsed_ms` 从 HTTP 收到请求起至网关收到该 token，包含分词与排队；`pd_gateway_completed` 到网关收到末 token 为止，并非客户端收到响应的 E2E。`pd_gateway_handoff_done.handoff_ms` 从调用 handoff 前至 D activate 后，包括 D reserve、P export、主存与 TCP 中转、D restore、P ACK 和 D activate。已有 `pd_transfer_done.transfer_ms` 从 reserve 响应后至 restore 响应，排除 reserve、P ACK 和 D activate。阶段相互重叠时不能简单相加。`pd_gateway_released` 记录两侧关闭尝试结束，worker 的 `pd_released` 及 stats 记录各自 owner 的释放结果；连接意外断开时不能把客户端 close 当成远端已确认释放。
+计时开启时，网关记录带 `gateway_id`、`session_id`、`transaction_id` 的 `pd_gateway_*` 事件，并保留 `chunk_sent`；外部 request ID 可以重复。`pd_gateway_first/second` 的 `elapsed_ms` 从 HTTP 收到请求起至网关收到该 token，包含分词与排队；`pd_gateway_completed` 到网关收到末 token 为止，并非客户端收到响应的 E2E。`pd_gateway_handoff_done.handoff_ms` 从调用 handoff 前至 D activate 后，包括 D reserve、P export、主存与 TCP 中转、D restore、P ACK 和 D activate。已有 `pd_transfer_done.transfer_ms` 从 reserve 响应后至 restore 响应，排除 reserve、P ACK 和 D activate。阶段相互重叠时不能简单相加。`pd_gateway_released` 记录两侧关闭尝试结束，worker 的 `pd_released` 及 stats 记录各自 owner 的释放结果；完整生成后关闭阶段的 EOF 按 `PDConnection.close()` 既有语义收尾，不撤销已完成结果，本地 close 不代表远端确认释放。
 
 网关在两侧连接关闭尝试及启用时的 `pd_gateway_released` 记录完成后才将末 token 交给 HTTP，首 token 即结束时也如此。
 

@@ -22,7 +22,15 @@ PYTHONPATH="$PWD/src" CUDA_VISIBLE_DEVICES='' \
 
 `tests/test_tp_checkpoint.py` 使用 Transformers 4.57.3 生成多文件 safetensors：Qwen3 和 Llama、tied 和 untied、attention bias、Llama MLP bias 均有覆盖。真实模型按 TP=1、TP=2 加载，同输入对照 HF 和两种 TP 的 logits，连续生成三个 greedy token，并核对每个 rank 的模型参数和 checkpoint 张量覆盖。CPU 仅将无法在 CPU 运行的 FlashAttention kernel 换为 PyTorch SDPA；模型、各并行层、loader 和 Gloo 通信均为真实实现。另有直接的 Column、Row、embedding/head、分片约束和错误 checkpoint 测试，以及 `cpu → meta` 参数转换测试。
 
+上述 checkpoint 算术测试每步重算完整前缀，不代表 worker decode 已验证。`tests/test_tp_decode.py` 另由真实 Scheduler 分配、prefill 后 postprocess 首 token，再通过 `ModelRunner.write_shm/read_shm` 的实际 pickle 协议驱动 worker 的 `prepare_prefill/prepare_decode`，覆盖跨 block、取消和释放。Sequence 的 worker payload 现在携带 `block_size`，供 decode 计算最后一块的槽位；不增加 worker 不使用的调度字段。此 CPU 测试只替换 CUDA 数据搬运，不运行 GPU attention。
+
+集成基线 `5a25360e173389de5d982e8440420441ba8c85fb` 已导入 M5 的实例 TCPStore、共享内存和启动失败清理，M4 不重复实现这些资源逻辑。`tests/test_tp_loader_cleanup.py` 从真实 tiny checkpoint 删除必需的 norm 权重，确认严格 loader 报错后进程组和 TCPStore 释放，并在同一进程成功重启；分别覆盖 engine 和 standalone runner。该测试使用真实模型、loader 和单进程 Gloo，替换 CUDA 搬运及 warmup/cache allocation，不等同于多 GPU 启动失败验证。
+
 测试前固定的 tiny 模型 logits 阈值为 FP32 `rtol=2e-4, atol=2e-5`、BF16 `rtol=5e-2, atol=2e-2`；这些是单元测试门槛，不是 14B GPU 验收阈值。Gloo 通信的进程墙钟时间只用于 CPU 诊断，不能作为 CUDA 通信时间或性能结论。
+
+GPU 入口使用 `tests/tp_engine_helpers.py` 创建真实 tokenizer/checkpoint，在独立子进程中构造 `LLMEngine`，由 Scheduler、`ModelRunner.run` 和 TP worker loop 执行首次 paged prefill、两步 decode 及跨 block。LM head hook 只在初始化完成后采集同前缀 logits；初始化仍执行原 warmup，其 cache-free FlashAttention 不进入数值对照。HF 参照使用 native `from_pretrained(dtype=...)`，保留 FP32 RoPE `inv_freq`，不对已初始化模型整体调用 `.to(bfloat16)` 量化该 buffer。seed、prompt 和上述阈值保持不变；每个 rank 的加载覆盖、实际 attention 路径、通信 event 和峰值 allocated 都保存在测试产物中。
+
+`tests/test_tp_engine_gpu.py` 的 TP=1 入口于 2026-11-15 在本机 RTX 5080 Laptop GPU 实测通过：FP32/HF 最大绝对误差 `1.4901161e-7`，BF16/HF 为 `0.0029296875`，各自三个 greedy token 完全一致。`tests/test_tp_gpu.py` 复用相同 helper 对照 TP=1/TP=2/HF，但本机只有一张 GPU，两种 dtype 均明确 skip。单卡没有 TP collective，不能将其零次通信记录当作双卡 NCCL 测量；真实 TP=2、目标服务器和 14B 仍未验收。
 
 ## 目标服务器复现模板
 
@@ -61,7 +69,7 @@ CUDA_VISIBLE_DEVICES=4,3 "$M4_PYTHON" -c \
   'import torch; [print(f"cuda:{i} uuid={p.uuid} pci={p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}") for i in range(torch.cuda.device_count()) for p in [torch.cuda.get_device_properties(i)]]' \
   > "$M4_DATA/visible-devices.txt"
 CUDA_VISIBLE_DEVICES=4,3 "$M4_PYTHON" -m pytest -q -s -ra \
-  --basetemp "$M4_DATA/pytest-gpu" tests/test_tp_gpu.py \
+  --basetemp "$M4_DATA/pytest-gpu" tests/test_tp_engine_gpu.py tests/test_tp_gpu.py \
   > "$M4_DATA/tiny-gpu.log" 2>&1
 ```
 

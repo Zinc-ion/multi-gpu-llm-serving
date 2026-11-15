@@ -56,14 +56,15 @@ def analyze(paths):
         second = by_name.get("pd_gateway_second", {}).get("elapsed_ms")
         completed = by_name.get("pd_gateway_completed", {}).get("elapsed_ms")
         handoff = by_name.get("pd_gateway_handoff_done", {})
+        transfer = next((r for r in events if r["event"] == "pd_transfer_done"), {})
         group.update(first_ms=first, second_ms=second, server_generation_ms=completed,
                      second_minus_first_ms=second - first if first is not None and second is not None else None,
-                     payload_bytes=handoff.get("payload_bytes"), handoff_ms=handoff.get("handoff_ms"))
+                     payload_bytes=transfer.get("payload_bytes", handoff.get("payload_bytes")),
+                     handoff_ms=handoff.get("handoff_ms"))
         group["handoff_to_generation_ratio"] = (
             group["handoff_ms"] / completed if group["handoff_ms"] is not None and completed else None
         )
-        group["transfer_ms"] = next((r["transfer_ms"] for r in events
-                                     if r["event"] == "pd_transfer_done"), None)
+        group["transfer_ms"] = transfer.get("transfer_ms")
     counts = Counter(group["outcome"] for group in groups.values())
     return {"transactions": list(groups.values()), "outcomes": dict(counts),
             "orphan_pd_events": orphans}

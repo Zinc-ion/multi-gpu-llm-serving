@@ -42,7 +42,7 @@ P 的 D2H 和 D 的 H2D 使用同步复制；返回 bytes 或 restore 成功表�
 
 D 按 `ceil(min(prompt_length + max_tokens, max_model_length) / block_size)` 为每个已接纳请求预留完整逻辑 block 配额，同时限制 reserved/restored/active 请求数不超过 `min(max_num_sequences, max_num_batched_tokens)`。配额覆盖后续 decode 的物理分配，确保核心独占 Scheduler 时不会因普通资源压力抢占并重算 prompt。P 的 held 请求移出 Scheduler 但继续持有 block；若全部运行请求都已移出且 waiting 队首因这些 block 暂不能分配，P `step()` 返回空事件等待 ACK/取消，不触发原有无进展异常。
 
-CPU 专项使用真实 `LLMEngine.step`、`Sequence`、Scheduler 和 BlockManager，覆盖块边界、跨块 decode、多请求、容量、取消、超时与重复消息。另用真实 tiny Qwen3 计算、CPU attention 替代 GPU kernel，对照 FP32/BF16 的 greedy token 和 logits。真实 GPU 上的 D2H/H2D、跨进程 TCP 传输、CUDA Graph 和代表性故障回收已在本地 tiny 模型上验证；服务器性能与 HTTP 入口仍待后续验证或实现。
+CPU 专项使用真实 `LLMEngine.step`、`Sequence`、Scheduler 和 BlockManager，覆盖块边界、跨块 decode、多请求、容量、取消、超时与重复消息。另用真实 tiny Qwen3 计算、CPU attention 替代 GPU kernel，对照 FP32/BF16 的 greedy token 和 logits。真实 GPU 上的 D2H/H2D、跨进程 TCP 传输、CUDA Graph 和代表性故障回收已在本地 tiny 模型上验证；服务器性能仍待验收。
 
 ## PD 采样随机流
 
@@ -54,7 +54,7 @@ CPU 回归使用独立进程、真实 tiny Qwen3 和采样器，attention 使用
 
 ## TCP worker 与异步客户端
 
-本单元新增 TP=1 的 P、D worker 和异步客户端。P、D 各自由一个线程拥有独立 `LLMEngine`，经普通主存和 TCP 传递 KV；本单元不提供 HTTP 网关或动态路由。worker 协议面向**可信的内部网关和 worker**，应部署在受控网络中；它没有认证、加密或完整性签名。session claim 用于约束请求生命周期，不是鉴权。
+本单元新增 TP=1 的 P、D worker 和异步客户端。P、D 各自由一个线程拥有独立 `LLMEngine`，经普通主存和 TCP 传递 KV；固定配对的 HTTP 网关见下文，没有动态路由。worker 协议面向**可信的内部网关和 worker**，应部署在受控网络中；它没有认证、加密或完整性签名。session claim 用于约束请求生命周期，不是鉴权。
 
 ## 启动与配置
 
@@ -156,3 +156,49 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m pytest -q -s tests/test_pd_gpu.py \
 GPU 测试使用生成的 tiny Qwen3 checkpoint，顺序运行共置参照，再启动同一物理 GPU 的独立 P/D 进程，经真实 TCP 与主存交接。固定 FP32 `rtol=1e-4, atol=1e-5`、BF16 `rtol=0.02, atol=0.02`，检查 greedy token 和有效 KV 精确相等；仅在相同前缀上比较 logits。测试目录保存原始捕获和逐 case 数值报告。测试覆盖 eager/graph、whole/chunked prefill、块边界、并发、EOS/ignore、总长度、断连和受控子进程退出。
 
 本地同卡小模型结果仅证明该环境下的功能和生命周期，不能代表跨 GPU 或跨 NUMA 的传输带宽、14B 数值/容量、正式 B2 或 goodput。目标服务器的独立 GPU、14B 和性能验收仍待后续执行。
+
+## 固定配对 HTTP 网关
+
+`myvllm.pd.gateway` 只加载同一固定 revision 的 tokenizer 和配置，不创建模型或使用 GPU；通过 TCP 使用已独立启动的 worker。每个请求依次打开 D session、由其固定 P claim 并生成首 token；首 token 非终态时经网关主存中转 KV，然后由 D 继续生成。网关中的 Sequence 只为每个远端 token 追加一次，HTTP 校验、分词、增量反分词及 JSON/SSE 组装复用原有 `myvllm.server`。`create_app(config, model_name, engine_factory)` 的已有用法保持不变，新增的 `pd_worker` 用于该入口的注入。
+
+另存如下网关配置，`max_payload_bytes` 不小于每个 worker 通告的 `max_transfer_bytes`；两个端点均为可信内部地址：
+
+```json
+{
+  "pairs": [
+    {"prefill": ["127.0.0.1", 9100], "decode": ["127.0.0.1", 9200]},
+    {"prefill": ["127.0.0.1", 9101], "decode": ["127.0.0.1", 9201]}
+  ],
+  "max_active_requests": 8,
+  "max_payload_bytes": 3221225472,
+  "max_staging_bytes": 6442450944,
+  "max_request_bytes": 2097152,
+  "request_timeout": 600
+}
+```
+
+```bash
+CUDA_VISIBLE_DEVICES='' uv run python -m myvllm.pd.gateway \
+  --config /path/to/model.json --gateway-config /path/to/gateway.json \
+  --served-model-name Qwen3-14B --host 127.0.0.1 --port 8000
+```
+
+模型配置必须与 worker 的模型名或本地 snapshot 路径、两个 revision、结构字段、dtype、EOS 和 `max_model_length` 一致；所有 worker 的 timeout 必须覆盖网关请求 timeout。启动时逐对读取 `info`，检查角色、上述规格、P 通告的固定 D 端点和 P/D seed；不同 pair 的 P seed 不可相同，同一对 D seed 为 P seed 异或 `0x80000000`。首 token 即结束时也经过启动核对，不依赖 D reserve 才发现错误。
+
+多对 worker 按请求接纳顺序轮询，不按排队长度或容量选择，也不重试或切换 pair。每对 P/D 使用相同 base seed，多对分别使用 `base + i (mod 2**32)`；正温度采样不承诺与共置结果逐 token 一致。网关在读取和分词前占用一个请求配额，请求体上限为 `max_request_bytes`；每个 token 队列至多容纳 `min(max_tokens, max_model_length - prompt_length)` 个事件，另留一个失败事件。满配额立即返回 503，不建立无界内部等待队列。
+
+每次交接在导出前预留一个 `max_payload_bytes` 的中转配额，总预留不超过 `max_staging_bytes`；不足时该请求失败，不等待或换路。P 返回的实际 body 同时受其 worker 通告的 body 上限和网关配置上限约束。上述中转配额限制的是逻辑 payload 的总额，不等于网关 RSS 上限：`StreamReader` 中的字节与返回的 `bytes` 在复制时可能共存，向 D 写入时 payload 和 socket 用户态写缓冲也可能共存；还要计入请求体、token 队列、Python 分配器和操作系统 socket 缓冲。P、D 自己的导入导出临时副本和各自的总传输限额另计。配置中的 3 GiB/6 GiB 只是上限示例，不是实测内存需求或容量保证。
+
+请求头还未发出时，输入错误为 400、容量或对端不可用为 503、超时为 504、交接协议或恢复不匹配为 502；普通 JSON 即使在取得首 token 后失败，也在发送响应体前返回非 200。流式响应在首个 choices 之前发生错误时同样返回非 200 JSON；已发送 choices 后的失败以 `data: {"error": ...}` 结束，不发送成功的 finish、usage 或 `[DONE]`。成功流仍为每个 token 一条 choices，按请求可选发送空 choices 的 usage，再发送 `[DONE]`。客户端提前断连会取消对应网络任务；网关配额在前端结束、两侧连接关闭或 EOF 触发清理后才归还。`close()` 也会终止正在等待的请求。清理在 worker owner 中按已有操作顺序进行，不强行中断正在运行的 kernel 或复制。
+
+计时开启时，网关记录带 `gateway_id`、`session_id`、`transaction_id` 的 `pd_gateway_*` 事件，并保留 `chunk_sent`；外部 request ID 可以重复。`pd_gateway_first/second` 的 `elapsed_ms` 从 HTTP 收到请求起至网关收到该 token，包含分词与排队；`pd_gateway_completed` 到网关收到末 token 为止，并非客户端收到响应的 E2E。`pd_gateway_handoff_done.handoff_ms` 从调用 handoff 前至 D activate 后，包括 D reserve、P export、主存与 TCP 中转、D restore、P ACK 和 D activate。已有 `pd_transfer_done.transfer_ms` 从 reserve 响应后至 restore 响应，排除 reserve、P ACK 和 D activate。阶段相互重叠时不能简单相加。`pd_gateway_released` 记录两侧关闭尝试结束，worker 的 `pd_released` 及 stats 记录各自 owner 的释放结果；连接意外断开时不能把客户端 close 当成远端已确认释放。
+
+```bash
+uv run python tools/analyze_pd.py \
+  --timings /path/to/gateway.jsonl /path/to/prefill.jsonl /path/to/decode.jsonl \
+  --output /path/to/pd-analysis.json
+```
+
+分析以 gateway ID 以及 session/transaction ID 合并，保留失败、取消、未匹配事件和原始记录，给出 payload 字节、同一网关时钟上的第二 token 减首 token、handoff 与服务端生成时间的比值。worker 各进程的 export/restore 值分别使用本进程时钟；不跨主机相减。客户端 TTFT、ITL、TPOT、E2E 与 SLO 继续使用 `tools/analyze_bench.py` 分析。
+
+远端生成配置、NUMA 绑定、完整 bench 口径和待验收事项见 [M5 实验准备](m5_experiments_zh.md)。本机同卡测试和服务接入不代表服务器 14B、跨 GPU 或 B2 性能已验收。

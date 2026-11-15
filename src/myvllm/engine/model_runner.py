@@ -418,7 +418,24 @@ class ModelRunner:
         if self.timings:
             self.timings.end_gpu("h2d")
             self.timings.start_gpu("forward")
-        logits = self.run_model(input_ids, is_prefill)
+        transfers = getattr(self, "layer_transfers", None)
+        active_transfers = [transfers[seq.seq_id] for seq in seqs if seq.seq_id in transfers] if transfers else []
+        hooks = []
+        if active_transfers:
+            for layer_id, layer in enumerate(self.model.model.layers):
+                def layer_ready(module, args, output, layer_id=layer_id):
+                    for transfer in active_transfers:
+                        transfer.on_layer(layer_id)
+                hooks.append(layer.register_forward_hook(layer_ready))
+        try:
+            logits = self.run_model(input_ids, is_prefill)
+        finally:
+            for hook in hooks:
+                hook.remove()
+            # postprocess may release the source blocks for a terminal first token.
+            # Socket sends only retain host slots after these D2H reads complete.
+            for transfer in active_transfers:
+                transfer.drain_copies()
         if self.timings:
             self.timings.end_gpu("forward")
         # only sample when rank == 0

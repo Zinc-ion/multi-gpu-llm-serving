@@ -86,6 +86,9 @@ class PDGateway:
             setattr(self, name, value)
         if self.max_staging_bytes < self.max_payload_bytes:
             raise ValueError("max_staging_bytes must fit one max_payload_bytes")
+        self.pipeline_min_tokens = settings.get("pipeline_min_tokens", 0)
+        if type(self.pipeline_min_tokens) is not int or self.pipeline_min_tokens < 0:
+            raise ValueError("pipeline_min_tokens must be a nonnegative integer")
         self.request_timeout = settings["request_timeout"]
         if (type(self.request_timeout) not in (int, float) or not math.isfinite(self.request_timeout)
                 or self.request_timeout <= 0):
@@ -116,6 +119,10 @@ class PDGateway:
                 raise ValueError("Prefill worker's fixed decode endpoint does not match pair")
             if di["sampling_seed"] != pi["sampling_seed"] ^ 0x80000000 or pi["sampling_seed"] in seeds:
                 raise ValueError("P/D seed mismatch or repeated pair seed")
+            if self.pipeline_min_tokens and (
+                    not pi.get("pipeline_frame_bytes") or
+                    pi["pipeline_frame_bytes"] > di.get("pipeline_frame_bytes", 0)):
+                raise ValueError("Pipeline requires enabled workers with a compatible frame limit")
             seeds.add(pi["sampling_seed"])
         tokenizer = await asyncio.to_thread(
             AutoTokenizer.from_pretrained, self.config["model_name_or_path"],
@@ -239,36 +246,52 @@ class PDGateway:
         cancelled = False
         error = None
         phase = "open_d"
+        params = entry.pending.params
+        limit = params.max_model_length or self.config["max_model_length"]
+        pipeline = (self.pipeline_min_tokens > 0
+                    and len(entry.pending.token_ids) >= self.pipeline_min_tokens
+                    and params.max_tokens > 1 and len(entry.pending.token_ids) + 1 < limit)
         deadline = asyncio.get_running_loop().time() + self.request_timeout
         try:
             decode = await PDClient.open_d(entry.pair[1], lifetime=deadline - asyncio.get_running_loop().time())
             entry.session_id = decode.session_id
             phase = "open_p"
-            prefill = await PDClient.open_p(
+            open_prefill = PDClient.prepare_p if pipeline else PDClient.open_p
+            prefill = await open_prefill(
                 entry.pair[0], decode.session_id, entry.pending.request_id, entry.pending.token_ids,
                 entry.pending.params, lifetime=deadline - asyncio.get_running_loop().time(),
             )
             entry.transaction_id = prefill.transaction_id
-            self._record(entry, "pd_gateway_open", prefill=list(entry.pair[0]), decode=list(entry.pair[1]))
+            self._record(entry, "pd_gateway_open", prefill=list(entry.pair[0]), decode=list(entry.pair[1]),
+                         transfer_mode="pipeline" if pipeline else "bulk")
+            if pipeline:
+                phase = "prepare"
+                await PDClient.start_pipeline(prefill, decode)
             phase = "first"
             event = await prefill.next_token()
             terminal = self._publish(entry, event)
             if not terminal:
                 phase = "describe"
                 metadata = await prefill.describe()
-                nbytes = metadata["kv"]["nbytes"]
-                if nbytes > self.max_payload_bytes or self.staging_bytes + self.max_payload_bytes > self.max_staging_bytes:
-                    raise GatewayError(503, "PD gateway transfer capacity exhausted")
-                self.staging_bytes += self.max_payload_bytes
-                staging = True
+                arch = metadata["model"]["architecture"]
+                nbytes = (2 * arch["num_layers"] * metadata["prompt_length"]
+                          * arch["num_kv_heads"] * arch["head_dim"]
+                          * resolve_dtype(metadata["model"]["dtype"]).itemsize) if pipeline else metadata["kv"]["nbytes"]
+                if not pipeline:
+                    if nbytes > self.max_payload_bytes or self.staging_bytes + self.max_payload_bytes > self.max_staging_bytes:
+                        raise GatewayError(503, "PD gateway transfer capacity exhausted")
+                    self.staging_bytes += self.max_payload_bytes
+                    staging = True
                 phase = "handoff"
                 handoff_start = time.perf_counter()
                 self._record(entry, "pd_gateway_handoff_start", payload_bytes=nbytes)
-                await PDClient.handoff(prefill, decode, metadata, timing_path=self.config.get("timing_path"))
+                handoff = PDClient.handoff_pipeline if pipeline else PDClient.handoff
+                await handoff(prefill, decode, metadata, timing_path=self.config.get("timing_path"))
                 self._record(entry, "pd_gateway_handoff_done", payload_bytes=nbytes,
                              handoff_ms=(time.perf_counter() - handoff_start) * 1000)
-                self.staging_bytes -= self.max_payload_bytes
-                staging = False
+                if staging:
+                    self.staging_bytes -= self.max_payload_bytes
+                    staging = False
                 phase = "decode"
                 while not terminal:
                     event = await decode.next_token()

@@ -1,4 +1,4 @@
-"""Generate foreground PD deployment and B2 commands for a fixed server candidate."""
+"""Generate foreground PD deployment and benchmark commands for a fixed candidate."""
 
 import argparse
 import json
@@ -38,6 +38,16 @@ def generate(args):
             or config["model_revision"] != "40c069824f4251a91eefaf281ebe4c544efd3e18"
             or config["tokenizer_revision"] != config["model_revision"]):
         raise ValueError("base config must be the pinned TP=1 Qwen3-14B BF16 configuration")
+    if args.pipeline_min_tokens < 0 or args.pipeline_frame_bytes < 0:
+        raise ValueError("pipeline options must be nonnegative")
+    if bool(args.pipeline_min_tokens) != bool(args.pipeline_frame_bytes):
+        raise ValueError("pipeline requires both min-tokens and frame-bytes")
+    if args.pipeline_frame_bytes:
+        token_bytes = 2 * config["num_kv_heads"] * config["head_dim"] * 2
+        if not token_bytes <= args.pipeline_frame_bytes <= PAYLOAD_LIMIT:
+            raise ValueError("pipeline frame must fit one KV token and the payload limit")
+        if not config.get("enforce_eager") or config.get("enable_chunked_prefill", False):
+            raise ValueError("pipeline requires whole eager prefill")
     repo = Path(args.repo_dir)
     if not repo.is_absolute() or not Path(args.python).is_absolute() or not Path(args.model_path).is_absolute():
         raise ValueError("repo-dir, python and pinned model-path must be absolute")
@@ -48,6 +58,8 @@ def generate(args):
     settings = {"pairs": [], "max_active_requests": 8, "max_payload_bytes": PAYLOAD_LIMIT,
                 "max_staging_bytes": 2 * PAYLOAD_LIMIT, "max_request_bytes": 2 * 1024**2,
                 "request_timeout": 600}
+    if args.pipeline_min_tokens:
+        settings["pipeline_min_tokens"] = args.pipeline_min_tokens
     files = {}
     prefix = "#!/usr/bin/env bash\nset -euo pipefail\n" + f"source {quote(output / 'env.sh')}\n"
     prefix += f"cd {quote(repo)}\n"
@@ -82,6 +94,8 @@ def generate(args):
                    "--max-connections", 4, "--max-transfer-bytes", PAYLOAD_LIMIT, "--request-timeout", 600]
             if role == "prefill":
                 cmd += ["--decode-host", de[0], "--decode-port", de[1]]
+            if args.pipeline_frame_bytes:
+                cmd += ["--pipeline-frame-bytes", args.pipeline_frame_bytes]
             files[f"{name}.sh"] = (prefix + f"export CUDA_VISIBLE_DEVICES={gpu}\nexec " +
                                    command(["numactl", f"--cpunodebind={node}", f"--membind={node}", *cmd]) + "\n")
     config["timing_path"] = str(output / "gateway.timing.jsonl")
@@ -117,6 +131,7 @@ def generate(args):
                                        for pair in TOPOLOGIES[args.topology] for gpu in pair},
                          "gateway_node": 0, "client_node": 0},
                 "payload_limit_bytes": PAYLOAD_LIMIT, "gateway_settings": settings,
+                "pipeline_frame_bytes": args.pipeline_frame_bytes,
                 "workloads": {name: str(dataset) for name, _, dataset in workloads},
                 "bench_seed": 7, "warmups": 8, "l1_repetitions": 1, "l2_repetitions": 5}
     files["manifest.json"] = json.dumps(manifest, indent=2) + "\n"
@@ -134,6 +149,9 @@ def main():
     parser.add_argument("--model-path", required=True, help="Existing pinned local model snapshot")
     parser.add_argument("--base-config", default="configs/qwen3_14b.json")
     parser.add_argument("--base-seed", type=int, default=0)
+    parser.add_argument("--pipeline-min-tokens", type=int, default=0,
+                        help="Opt-in prompt threshold; uncalibrated until measured on target hardware")
+    parser.add_argument("--pipeline-frame-bytes", type=int, default=0)
     for name in ("l1-1k", "l1-4k", "l1-16k", "l2-sharegpt", "l2-longbench"):
         parser.add_argument("--" + name, required=True, help="Existing materialized JSONL and its manifest")
     parser.add_argument("--dry-run", action="store_true")

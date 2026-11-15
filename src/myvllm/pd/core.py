@@ -9,6 +9,7 @@ import torch
 
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.pd.kv import export_kv, restore_kv
+from myvllm.pd.pipeline import LayerReceiver
 from myvllm.pd.protocol import finite_number, make_early_metadata, make_metadata, model_spec, payload_nbytes, tensor_dtype, validate_early_metadata, validate_metadata
 from myvllm.sampling_parameters import SamplingParams
 
@@ -45,6 +46,7 @@ class _Handle:
         self._next_layer = 0
         self._next_offset = 0
         self._payload = None
+        self._receiver = None
         self._reserved_bytes = 0
         self._reserved_blocks = 0
 
@@ -111,6 +113,9 @@ class _Core:
             return False
         self._check(handle)
         self._cancel(handle, "cancelled")
+        if handle._receiver is not None:
+            handle._receiver.close()
+            handle._receiver = None
         del self._handles[handle.session_id]
         handle.sequence = None
         handle._metadata = None
@@ -446,17 +451,21 @@ class DecodeCore(_Core):
             raise
         seq = Sequence(metadata["token_ids"], self.manager.block_size,
                        SamplingParams(**metadata["sampling"]))
-        try:
-            self.manager.allocate(seq)
-        except Exception:
-            self.manager.deallocate(seq)
-            self._release(handle)
-            handle.state = "failed"
-            raise
+        self.manager.allocate(seq)
         handle.sequence = seq
         handle._early_metadata = deepcopy(metadata)
         handle.state = "early_reserved"
         return True
+
+    def attach_receiver(self, handle, frame_bytes, timing_path=None):
+        self._check(handle)
+        if handle.state != "early_reserved" or handle._receiver is not None:
+            raise StateError("D handle cannot attach another data channel")
+        identity = {"session_id": handle.session_id, "transaction_id": handle.transaction_id,
+                    "request_id": handle.request_id, "role": "decode"}
+        handle._receiver = LayerReceiver(self.engine.model_runner.kv_cache, frame_bytes,
+                                         identity, timing_path)
+        return handle._receiver
 
     def restore_region(self, handle, layer, start, end, payload):
         self._check(handle)
@@ -475,17 +484,24 @@ class DecodeCore(_Core):
             nbytes = 2 * (end - start) * arch["num_kv_heads"] * arch["head_dim"] * tensor_dtype(self.spec).itemsize
             if type(payload) is not bytes or len(payload) != nbytes:
                 raise ValueError("Invalid KV region byte count")
-            host = torch.frombuffer(bytearray(payload), dtype=tensor_dtype(self.spec)).reshape(
-                2, end - start, arch["num_kv_heads"], arch["head_dim"])
-            cache = self.engine.model_runner.kv_cache
-            block_size = self.manager.block_size
-            pos = start
-            while pos < end:
-                block = handle.sequence.block_table[pos // block_size]
-                offset = pos % block_size
-                count = min(end - pos, block_size - offset)
-                cache[:, layer, block, offset:offset + count].copy_(host[:, pos - start:pos - start + count])
-                pos += count
+            if handle._receiver is not None:
+                if nbytes > handle._receiver.frame_bytes:
+                    raise ValueError("KV region exceeds pipeline frame limit")
+                handle._receiver.restore(handle.sequence.block_table, layer, start, end, payload)
+                if layer + 1 == arch["num_layers"] and end == prompt_length:
+                    handle._receiver.finish()
+            else:
+                host = torch.frombuffer(bytearray(payload), dtype=tensor_dtype(self.spec)).reshape(
+                    2, end - start, arch["num_kv_heads"], arch["head_dim"])
+                cache = self.engine.model_runner.kv_cache
+                block_size = self.manager.block_size
+                pos = start
+                while pos < end:
+                    block = handle.sequence.block_table[pos // block_size]
+                    offset = pos % block_size
+                    count = min(end - pos, block_size - offset)
+                    cache[:, layer, block, offset:offset + count].copy_(host[:, pos - start:pos - start + count])
+                    pos += count
         except Exception:
             self._cancel(handle, "failed")
             raise
@@ -604,6 +620,9 @@ class DecodeCore(_Core):
     def _cancel(self, handle, state):
         if handle.state in ("finished", "cancelled", "expired", "failed"):
             return False
+        if handle._receiver is not None:
+            handle._receiver.close()
+            handle._receiver = None
         seq = handle.sequence
         if handle.state == "active":
             self.scheduler.cancel(seq.seq_id)

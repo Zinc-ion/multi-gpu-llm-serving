@@ -106,6 +106,20 @@ def make_metadata(handle, spec, sampling_seed):
     }
 
 
+def _matches_model(value, expected):
+    if type(value) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return value.keys() == expected.keys() and all(
+            _matches_model(value[key], item) for key, item in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(value) == len(expected) and all(
+            _matches_model(a, b) for a, b in zip(value, expected)
+        )
+    return value == expected
+
+
 def validate_metadata(metadata, session_id, spec, max_model_length):
     fields = {
         "version", "session_id", "transaction_id", "request_id", "prefill_seq_id",
@@ -123,7 +137,7 @@ def validate_metadata(metadata, session_id, spec, max_model_length):
             raise ValueError(f"Invalid {field}")
     if type(metadata["prefill_seq_id"]) is not int or metadata["prefill_seq_id"] < 0:
         raise ValueError("Invalid prefill_seq_id")
-    if metadata["model"] != spec:
+    if not _matches_model(metadata["model"], spec):
         raise ValueError("Incompatible model, revision, dtype, architecture or EOS")
     if type(metadata["sampling_seed"]) is not int or not 0 <= metadata["sampling_seed"] < 2**32:
         raise ValueError("Invalid sampling_seed")

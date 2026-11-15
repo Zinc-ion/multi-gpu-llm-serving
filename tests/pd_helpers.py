@@ -22,6 +22,7 @@ def create_tiny_qwen_checkpoint(path):
     ).save_pretrained(path)
     return {
         "model_name_or_path": str(path), "model_type": "Qwen3-0.6B",
+        "model_revision": "a" * 40, "tokenizer_revision": "b" * 40,
         "world_size": 1, "block_size": 4, "enforce_eager": True,
         "vocab_size": 64, "hidden_size": 32, "num_heads": 2, "head_dim": 16,
         "scale": model_config.head_dim ** -0.5, "num_kv_heads": 1,

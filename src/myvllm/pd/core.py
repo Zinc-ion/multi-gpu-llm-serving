@@ -303,6 +303,8 @@ class DecodeCore(_Core):
     def reserve(self, handle, metadata):
         self._check(handle)
         if handle.state in ("reserved", "restored", "active", "finished"):
+            validate_metadata(metadata, handle.session_id, self.spec,
+                              self.scheduler.max_model_length)
             if metadata == handle._metadata:
                 return False
             raise StateError("Transaction metadata changed")

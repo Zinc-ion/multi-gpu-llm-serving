@@ -13,7 +13,7 @@ from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.input_batch import build_prefill_batch
 from myvllm.utils import *
-from myvllm.config import resolve_dtype, seed_everything
+from myvllm.config import resolve_dtype, resolve_kv_cache_dtype, seed_everything
 from myvllm.utils.timing import StepTimings
 
 class ModelRunner:
@@ -43,7 +43,9 @@ class ModelRunner:
 
         self.rank = rank
         seed_everything(config.get('seed', 0))
-        torch.set_default_dtype(resolve_dtype(config.get('dtype', 'float32')))
+        model_dtype = resolve_dtype(config.get('dtype', 'float32'))
+        self.kv_cache_dtype = resolve_kv_cache_dtype(config.get('kv_cache_dtype', 'auto'), model_dtype)
+        torch.set_default_dtype(model_dtype)
         resources = config.get("_instance_resources")
         if resources is None:
             if self.world_size != 1:
@@ -242,7 +244,10 @@ class ModelRunner:
 
         # check whether the current free memory can hold at least one block
         # compute the actual byte required of each block
-        block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
+        block_elements = self.block_size * 2 * num_layers * num_kv_heads
+        data_block_bytes = block_elements * head_dim * self.kv_cache_dtype.itemsize
+        scale_block_bytes = block_elements * torch.float32.itemsize if self.kv_cache_dtype == torch.float8_e4m3fn else 0
+        block_bytes = data_block_bytes + scale_block_bytes
         num_available_kv_blocks = min(int(available_mem // block_bytes), self.config['max_cached_blocks'])
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
         
@@ -284,6 +289,9 @@ class ModelRunner:
                 "warmup_peak_allocated_bytes": peak_mem_usage,
                 "current_allocated_bytes": current_mem_usage,
                 "warmup_extra_bytes": peak_mem_usage - current_mem_usage,
+                "model_dtype": str(self.default_dtype).removeprefix("torch."),
+                "kv_cache_dtype": str(self.kv_cache_dtype).removeprefix("torch."),
+                "data_block_bytes": data_block_bytes, "scale_block_bytes": scale_block_bytes,
                 "block_bytes": block_bytes, "block_count": self.config['max_cached_blocks'],
                 "kv_token_capacity": self.config['max_cached_blocks'] * self.block_size,
             }), flush=True)
@@ -291,13 +299,19 @@ class ModelRunner:
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, dtype=self.kv_cache_dtype, device=f'cuda:{self.rank}')
         self.kv_cache = allocated_kv_cache
+        self.kv_cache_scales = None
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
+            self.kv_cache_scales = torch.ones(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, dtype=torch.float32, device=f'cuda:{self.rank}')
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
                 module.k_cache = allocated_kv_cache[0, layer_id]
                 module.v_cache = allocated_kv_cache[1, layer_id]
+                if self.kv_cache_scales is not None:
+                    module.k_scale_cache = self.kv_cache_scales[0, layer_id]
+                    module.v_scale_cache = self.kv_cache_scales[1, layer_id]
                 layer_id += 1
 
     # given seqs
@@ -408,6 +422,7 @@ class ModelRunner:
     # run model
     # sample logits
     # reset context
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if self.timings:
             self.timings.prepare()

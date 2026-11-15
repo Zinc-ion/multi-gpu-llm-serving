@@ -194,8 +194,8 @@ Python、PyTorch、CUDA、Triton、NCCL、PyTorch Profiler、Nsight Systems。
 
 ### M7：FP8 KV cache
 
-- KV cache 以 FP8 存储，attention kernel 读取时反量化；PD 传输直接传 FP8，传输量减半。
-- 4090（Ada 架构）原生支持 FP8，不需要自己开发算子。
+- KV cache 以 FP8 存储，attention kernel 读取时反量化；PD 传输直接传 FP8 数据及其 scale，实际字节数需包括 scale 和填充。
+- 4090（Ada 架构）支持 FP8，但本项目的自定义 attention kernel 仍需实现相应读取与反量化。
 - 验收：与 BF16 对比 KV 显存、可容纳的 decode batch、传输时间、TTFT/TPOT、goodput，以及 NaN/Inf；按第 5 节“质量与正确性”用 evalscope 测推理类和长上下文类数据集的精度变化，可接受的精度下降阈值预先固定。参考 SpectrumKV、HACK 等 KV 传输压缩工作。
 
 ### M8：按阶段选择并行方式与弹性 P/D

@@ -177,6 +177,21 @@ class Scheduler:
         return False
 
 
+    def detach(self, seq_id: int) -> Sequence | None:
+        """Remove a running sequence without releasing its blocks."""
+        for i, seq in enumerate(self.running):
+            if seq.seq_id == seq_id:
+                del self.running[i]
+                return seq
+        return None
+
+
+    def activate_restored(self, seq: Sequence) -> None:
+        """Schedule a restored sequence whose blocks are already allocated."""
+        seq.status = SequenceStatus.RUNNING
+        self.running.append(seq)
+
+
     # postprocess after generation to check whether sequences are finished
     # if finished, deallocate blocks
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> None:

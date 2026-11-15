@@ -2,6 +2,7 @@ import atexit
 import torch.distributed as dist
 import time
 import torch.multiprocessing as mp
+from multiprocessing.shared_memory import SharedMemory
 
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.engine.scheduler import Scheduler
@@ -27,43 +28,80 @@ class LLMEngine:
         self.config = config
         self.request_ids = {}
         world_size = config.get("world_size", 1)
-        ctx = mp.get_context("spawn")
+        self._store = None
+        self._shm = None
         self.processes = []
         self.events = []
-        for i in range(1, world_size):
-            event = ctx.Event()
-            process = ctx.Process(target=worker_process, args=(config, i, event))
-            self.events.append(event)
-            self.processes.append(process)
-            process.start()
-        # start the engine only on the master thread with rank = 0
-        self.model_runner = ModelRunner(config, rank=0, event=self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"),
-                                                       revision=config.get("tokenizer_revision"), cache_dir=config.get("cache_dir"))
+        had_process_group = dist.is_initialized()
+        try:
+            self._store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+            self._shm = SharedMemory(create=True, size=2**20) if world_size > 1 else None
+            runner_config = config.copy()
+            runner_config["_instance_resources"] = (
+                self._store.port, self._shm.name if self._shm else None,
+            )
+            ctx = mp.get_context("spawn")
+            for i in range(1, world_size):
+                event = ctx.Event()
+                process = ctx.Process(target=worker_process, args=(runner_config, i, event))
+                self.events.append(event)
+                process.start()
+                self.processes.append(process)
+            # start the engine only on the master thread with rank = 0
+            self.model_runner = ModelRunner(runner_config, rank=0, event=self.events)
+        except BaseException:
+            for process in self.processes:
+                if process.is_alive():
+                    process.terminate()
+                process.join()
+            if not had_process_group and dist.is_initialized():
+                dist.destroy_process_group()
+            if self._shm:
+                self._shm.close()
+                self._shm.unlink()
+            self._store = None
+            raise
+        config["max_cached_blocks"] = runner_config["max_cached_blocks"]
+        self.model_runner.config = config
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"),
+                                                           revision=config.get("tokenizer_revision"), cache_dir=config.get("cache_dir"))
         
-        # scheduler needs to init after model_runner: when world_size > 1,
-        # ModelRunner.__init__ calls dist.init_process_group() which is a
-        # collective barrier — rank-0 blocks until all worker ranks have joined.
-        # The scheduler should only be created after that rendezvous completes.
-        # When world_size == 1 there is no barrier and no real dependency.
-        self.scheduler = Scheduler(
-            max_num_sequences=config.get("max_num_sequences", 16),
-            max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
-            max_cached_blocks=config.get("max_cached_blocks", 1024),
-            block_size=config.get("block_size", 256),
-            eos=config["eos"],
-            max_model_length=config["max_model_length"],
-            enable_chunked_prefill=config.get("enable_chunked_prefill", False),
-        )
+            # scheduler needs to init after model_runner: when world_size > 1,
+            # ModelRunner.__init__ calls dist.init_process_group() which is a
+            # collective barrier — rank-0 blocks until all worker ranks have joined.
+            # The scheduler should only be created after that rendezvous completes.
+            # When world_size == 1 there is no barrier and no real dependency.
+            self.scheduler = Scheduler(
+                max_num_sequences=config.get("max_num_sequences", 16),
+                max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
+                max_cached_blocks=config.get("max_cached_blocks", 1024),
+                block_size=config.get("block_size", 256),
+                eos=config["eos"],
+                max_model_length=config["max_model_length"],
+                enable_chunked_prefill=config.get("enable_chunked_prefill", False),
+            )
+        except BaseException:
+            self.exit()
+            raise
 
         atexit.register(self.exit)
 
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
-        for process in self.processes:
-            process.join()
+        if self.model_runner is None:
+            return
+        atexit.unregister(self.exit)
+        try:
+            self.model_runner.call("exit")
+        finally:
+            self.model_runner = None
+            for process in self.processes:
+                process.join()
+            if self._shm:
+                self._shm.close()
+                self._shm.unlink()
+            self._store = None
 
     # call scheduler to schedule the next batch
     # return scheduled sequences and whether it is for prefilling

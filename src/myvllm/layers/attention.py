@@ -5,6 +5,20 @@ import torch
 import torch.nn as nn
 
 @triton.jit
+def _maximum_propagate_nan(a, b):
+    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@triton.jit
+def _fp16_round_to_odd(x):
+    half = x.to(tl.float16, fp_downcast_rounding="rtz")
+    bits = half.to(tl.uint16, bitcast=True)
+    # Preserve discarded FP32 bits so the subsequent FP8 ties round correctly.
+    bits = bits | (half.to(tl.float32) != x).to(tl.uint16)
+    return bits.to(tl.float16, bitcast=True)
+
+
+@triton.jit
 def store_kvcache_kernel(
     key_ptr, # pointer to what we want to store
     value_ptr,
@@ -65,11 +79,11 @@ def store_kvcache_kernel(
     if FP8_CACHE:
         key = key.to(tl.float32)
         value = value.to(tl.float32)
-        key_amax = tl.max(tl.abs(key), 0)
-        value_amax = tl.max(tl.abs(value), 0)
+        key_amax = tl.reduce(tl.abs(key), 0, _maximum_propagate_nan)
+        value_amax = tl.reduce(tl.abs(value), 0, _maximum_propagate_nan)
         # Match PyTorch's FP32 scalar division, which multiplies by the rounded reciprocal.
-        key_scale = tl.where(key_amax == 0, 1.0, tl.maximum(key_amax * (1.0 / 448.0), 1.1754943508222875e-38))
-        value_scale = tl.where(value_amax == 0, 1.0, tl.maximum(value_amax * (1.0 / 448.0), 1.1754943508222875e-38))
+        key_scale = tl.where(key_amax == 0, 1.0, tl.maximum(key_amax * (1.0 / 448.0), 1.1754943508222875e-38, propagate_nan=tl.PropagateNan.ALL))
+        value_scale = tl.where(value_amax == 0, 1.0, tl.maximum(value_amax * (1.0 / 448.0), 1.1754943508222875e-38, propagate_nan=tl.PropagateNan.ALL))
         scale_offset = slot_idx * num_kv_heads + head_idx
         tl.store(k_scale_ptr + scale_offset, key_scale)
         tl.store(v_scale_ptr + scale_offset, value_scale)
@@ -78,8 +92,10 @@ def store_kvcache_kernel(
                                         dtype=tl.float32, is_pure=True, pack=1)
         value = tl.inline_asm_elementwise("div.rn.f32 $0, $1, $2;", "=f,f,f", [value, value_scale],
                                           dtype=tl.float32, is_pure=True, pack=1)
-        key = tl.minimum(tl.maximum(key, -448.0), 448.0)
-        value = tl.minimum(tl.maximum(value, -448.0), 448.0)
+        key = tl.minimum(tl.maximum(key, -448.0, propagate_nan=tl.PropagateNan.ALL), 448.0, propagate_nan=tl.PropagateNan.ALL)
+        value = tl.minimum(tl.maximum(value, -448.0, propagate_nan=tl.PropagateNan.ALL), 448.0, propagate_nan=tl.PropagateNan.ALL)
+        key = _fp16_round_to_odd(key)
+        value = _fp16_round_to_odd(value)
     
     # store into cache
     tl.store(k_cache_ptr + cache_offset, key)

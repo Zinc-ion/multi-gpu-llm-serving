@@ -19,6 +19,8 @@ FP8 模式下，`ModelRunner.kv_cache` 的 dtype 为 `torch.float8_e4m3fn`，布
 
 每个有效 token 的每个 K head、V head 分别计算 `amax = max(abs(values))` 和 `scale = max(amax / 448, float32_tiny)`；全零 head 的 scale 为 1。写入数据为 `clamp(values / scale, -448, 448)` 转换到 E4M3FN。scale 随对应 token 存储，之后写入其他 token 不改变已有 token 的 scale。池初次分配时 data 为零、scale 为 1；释放的 block 再分配时，新有效位置由写入覆盖，不承诺清零历史无效位置。
 
+FP32 转 E4M3FN 时，先将向零舍入的 FP16 中间值按被丢弃的 FP32 位设为奇数，再执行 FP8 最近偶数舍入，避免 SM89 上两次舍入导致的边界错误。`amax` 归约与 clamp 显式传播 NaN；含 NaN 的 head 得到 NaN scale，含 Inf 而无 NaN 的 head 得到 Inf scale，其数据遵循相同的除法和转换规则。
+
 Triton store 将对应 token/head 的数据及 scale 直接写入池；除法保留 FP32 subnormal。运行时 whole/chunked paged prefill 和 decode 均按 block table 读取 FP8 数据及相同物理位置的 scale，按需反量化。FP8 prefill 在 FP32 中做反量化及 attention 中间计算，decode 同样使用 FP32 中间值；输出仍使用 query 的 dtype。cache 分配前的模型 warmup 沿用原有的无 cache prefill 路径。不存在逐步整池反量化或整池复制。
 
 CUDA Graph 捕获和重放复用相同的 data/scale 池地址。slot 为 `-1` 的 padding 不写 cache，长度为零的 decode padding 不读取有效 KV；真实 batch 的 block 分配、释放和重用仍由原有 Scheduler 管理。

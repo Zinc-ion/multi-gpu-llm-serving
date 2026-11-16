@@ -46,7 +46,8 @@ def inputs(tmp_path):
     args = [PREPARE, '--workspace-root', root, '--output-dir', output, '--repo-dir', REPO,
             '--server-python', sys.executable, '--model-path', model, '--math-data', math_data,
             '--needle-data', needle, '--math-revision', 'math-revision-123',
-            '--needle-revision', 'needle-revision-456', '--candidate-commit', 'a' * 40]
+            '--needle-revision', 'needle-revision-456', '--candidate-commit',
+            subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip()]
     return root, output, args
 
 
@@ -99,8 +100,9 @@ def report_metric(name, subsets):
 
 def native_run(output, rows, variant):
     config = json.loads((output / f'server-{variant}.json').read_text())
+    alias = json.loads((output / f'eval-{variant}.json').read_text())['model']
     event = {'event': 'server_start', 'config': config, 'arguments': {
-        'config': str(output / f'server-{variant}.json'), 'served_model_name': 'Qwen3-14B',
+        'config': str(output / f'server-{variant}.json'), 'served_model_name': alias,
         'host': '127.0.0.1', 'port': 8000}}
     (output / f'server-{variant}.log').write_text('INFO:myvllm:' + json.dumps(event) + '\n')
     for task in ('math_500', 'needle_haystack'):
@@ -119,8 +121,8 @@ def native_run(output, rows, variant):
                     value = int(row['index'] != 0 and (variant == 'baseline' or row['index'] != 8))
                     metadata = {'context_length': row['context_length'], 'depth_percent': row['depth_percent']}
                 grouped.setdefault(metric, {}).setdefault(subset, []).append(value)
-                predictions.append({'index': row['index'], 'model': 'Qwen3-14B',
-                                    'model_output': {'error': None, 'choices': [{
+                predictions.append({'index': row['index'], 'model': alias,
+                                    'model_output': {'model': alias, 'error': None, 'choices': [{
                                         'stop_reason': 'stop', 'message': {'role': 'assistant', 'content': 'answer'}}]},
                                     'messages': [{'role': 'user', 'content': row['input']},
                                                  {'role': 'assistant', 'content': 'answer'}]})
@@ -158,7 +160,8 @@ def test_cli_prepares_native_isolated_configs_and_scripts(inputs):
     baseline = json.loads((output / 'eval-baseline.json').read_text())
     candidate = json.loads((output / 'eval-candidate.json').read_text())
     assert baseline['use_cache'] is None and candidate['use_cache'] is None
-    assert baseline.pop('work_dir') != candidate.pop('work_dir') and baseline == candidate
+    assert baseline.pop('work_dir') != candidate.pop('work_dir')
+    assert baseline.pop('model') != candidate.pop('model') and baseline == candidate
     assert baseline['judge_strategy'] == 'rule' and baseline['datasets'] == ['math_500', 'needle_haystack']
     generation = baseline['generation_config']
     assert generation['retries'] == 1 and generation['max_retries'] == baseline['model_args']['max_retries'] == 0

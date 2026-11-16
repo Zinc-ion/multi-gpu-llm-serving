@@ -48,6 +48,8 @@ finally:
 
 开启 D `timing_path` 后，本地请求的 `pd_admitted`、`pd_first`、`pd_second`、`pd_finished`、`pd_cancelled`、`pd_failed` 和 `pd_released` 等实际发生的记录包含 `route="local"` 与 `payload_bytes=0`；不产生伪造的交接或传输事件。这些 worker 记录使用本端时间，不能跨进程直接相减。
 
+直接使用 `DecodeCore.expire()` 时，正常路径返回本轮新过期的 handle。接收端计时写入失败时，它先关闭本轮新过期的 handle，再抛出原始 `PipelineTimingError`；该异常是 `OSError` 子类，其 `__cause__` 保留底层文件 I/O 错误。异常路径不返回 handle 列表，调用方仍须关闭自己持有的 socket；core 不管理调用方的网络连接。尚未完成的 CUDA 复制仍须先完成，才能回收其使用的 block。
+
 ## owner 统计
 
 `PDClient.stats()` 通过独立连接向 owner 查询，在原有字段上增加：

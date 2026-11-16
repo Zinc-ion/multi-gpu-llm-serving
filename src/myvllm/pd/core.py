@@ -9,7 +9,7 @@ import torch
 
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.pd.kv import export_kv, restore_kv
-from myvllm.pd.pipeline import LayerReceiver
+from myvllm.pd.pipeline import LayerReceiver, PipelineTimingError
 from myvllm.pd.protocol import bulk_version, finite_number, make_early_metadata, make_metadata, model_spec, payload_nbytes, tensor_dtype, token_byte_counts, validate_early_metadata, validate_metadata
 from myvllm.sampling_parameters import SamplingParams
 
@@ -124,10 +124,20 @@ class _Core:
         if now is None:
             now = time.monotonic()
         expired = []
+        error = None
         for handle in list(self._handles.values()):
             if handle.deadline is not None and now >= handle.deadline:
-                if self._cancel(handle, "expired"):
+                try:
+                    if self._cancel(handle, "expired"):
+                        expired.append(handle)
+                except PipelineTimingError as exc:
                     expired.append(handle)
+                    if error is None:
+                        error = exc
+        if error is not None:
+            for handle in expired:
+                self.close(handle)
+            raise error
         return expired
 
     def cancel(self, handle):
@@ -138,9 +148,16 @@ class _Core:
         if isinstance(handle, _Handle) and handle.state == "closed":
             return False
         self._check(handle)
-        self._cancel(handle, "cancelled")
+        error = None
+        try:
+            self._cancel(handle, "cancelled")
+        except PipelineTimingError as exc:
+            error = exc
         if handle._receiver is not None:
-            handle._receiver.close()
+            try:
+                handle._receiver.close()
+            except PipelineTimingError as exc:
+                error = exc
             handle._receiver = None
         del self._handles[handle.session_id]
         handle.sequence = None
@@ -148,11 +165,20 @@ class _Core:
         handle._early_metadata = None
         handle._commit_metadata = None
         handle.state = "closed"
+        if error is not None:
+            raise error
         return True
 
     def shutdown(self):
+        error = None
         for handle in list(self._handles.values()):
-            self.close(handle)
+            try:
+                self.close(handle)
+            except PipelineTimingError as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
 
     def stats(self):
         return {
@@ -691,8 +717,12 @@ class DecodeCore(_Core):
     def _cancel(self, handle, state):
         if handle.state in ("finished", "cancelled", "expired", "failed"):
             return False
+        error = None
         if handle._receiver is not None:
-            handle._receiver.close()
+            try:
+                handle._receiver.close()
+            except PipelineTimingError as exc:
+                error = exc
             handle._receiver = None
         seq = handle.sequence
         if handle.state in ("queued", "prefill", "active"):
@@ -704,6 +734,8 @@ class DecodeCore(_Core):
             seq.status = SequenceStatus.CANCELLED
         self._release(handle)
         handle.state = state
+        if error is not None:
+            raise error
         return True
 
     def stats(self):

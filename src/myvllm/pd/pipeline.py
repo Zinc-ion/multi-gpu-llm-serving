@@ -19,6 +19,10 @@ class PipelineError(ValueError):
     """One connection-scoped layer transfer failed."""
 
 
+class PipelineTimingError(OSError):
+    """A pipeline timing record could not be written."""
+
+
 def contiguous_regions(table, start, end, block_size, max_tokens):
     while start < end:
         stop = min(end, start + max_tokens, (start // block_size + 1) * block_size)
@@ -92,11 +96,14 @@ class _Staging:
 
     def _record(self, event, **fields):
         if self.timing_path:
-            write_record(self.timing_path, {
-                "event": event, **self.identity,
-                "elapsed_ms": (time.perf_counter() - self.started) * 1000,
-                "monotonic_ns": time.monotonic_ns(), **fields,
-            })
+            try:
+                write_record(self.timing_path, {
+                    "event": event, **self.identity,
+                    "elapsed_ms": (time.perf_counter() - self.started) * 1000,
+                    "monotonic_ns": time.monotonic_ns(), **fields,
+                })
+            except OSError as exc:
+                raise PipelineTimingError(*exc.args) from exc
 
     def drain_copies(self):
         if self.stream is not None:
@@ -142,7 +149,7 @@ class LayerSender(_Staging):
         # This path also runs on the network loop while the owner waits for a slot.
         with self.condition:
             if self.error is None:
-                self.error = PipelineError(str(error))
+                self.error = error if isinstance(error, PipelineTimingError) else PipelineError(str(error))
             for future in (self.ready, self.done):
                 if not future.done():
                     future.set_exception(self.error)
@@ -309,11 +316,15 @@ class LayerSender(_Staging):
     def close(self):
         if not self.done.done():
             self.abort(ConnectionError("Pipeline closed"))
-        self.drain_copies()
-        self.thread.join()
-        self._record("pd_pipeline_sender_closed", **self.stats())
-        self.pending.clear()
-        self.slots.clear()
+        try:
+            self.drain_copies()
+        finally:
+            self.thread.join()
+        try:
+            self._record("pd_pipeline_sender_closed", **self.stats())
+        finally:
+            self.pending.clear()
+            self.slots.clear()
 
     def stats(self):
         with self.condition:
@@ -383,13 +394,26 @@ class LayerReceiver(_Staging):
                             host_scales[offset:offset + (stop - pos) * width], non_blocking=self.cuda)
 
     def finish(self):
+        error = None
         for index in range(2):
-            self._wait_slot(index)
+            try:
+                self._wait_slot(index)
+            except PipelineTimingError as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
 
     def close(self):
-        self.finish()
-        self._record("pd_pipeline_receiver_closed", **self.stats())
-        self.slots.clear()
+        try:
+            self.finish()
+        except PipelineTimingError:
+            self.slots.clear()
+            raise
+        try:
+            self._record("pd_pipeline_receiver_closed", **self.stats())
+        finally:
+            self.slots.clear()
 
     def stats(self):
         return {**super().stats(), "busy_slots": sum(event is not None for event in self.events)}

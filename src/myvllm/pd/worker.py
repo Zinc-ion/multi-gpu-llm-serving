@@ -16,7 +16,7 @@ import time
 from myvllm.config import load_config
 from myvllm.engine.llm_engine import LLMEngine
 from myvllm.pd import DecodeCore, PrefillCore
-from myvllm.pd.pipeline import LayerSender
+from myvllm.pd.pipeline import LayerSender, PipelineTimingError
 from myvllm.pd.protocol import descriptor_components, finite_number, token_byte_counts
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError, close_writer, read_body, read_header, write_frame
 from myvllm.sampling_parameters import SamplingParams
@@ -24,6 +24,20 @@ from myvllm.utils.timing import write_record
 
 
 logger = logging.getLogger("myvllm.pd.worker")
+
+
+async def _wait_for_cleanup(future):
+    cancelled = None
+    while True:
+        try:
+            await asyncio.shield(future)
+            break
+        except asyncio.CancelledError as exc:
+            if future.cancelled():
+                raise
+            cancelled = exc
+    if cancelled is not None:
+        raise cancelled
 
 
 def _decode_endpoint(endpoint):
@@ -50,6 +64,8 @@ class _Connection:
     data_writer: object = None
     data_target: object = None
     decode_endpoint: object = None
+    response_done: object = None
+    failure_response: object = None
 
 
 class _Owner:
@@ -57,7 +73,10 @@ class _Owner:
         self.worker = worker
         self.engine_factory = engine_factory
         self.commands = queue.Queue(maxsize=2 * worker.max_socket_connections + 2)
+        self._submission_lock = threading.Lock()
+        self._stopping = False
         self.ready = threading.Event()
+        self.cleanup_done = Future()
         self.thread = threading.Thread(target=self.run, name="pd-model-owner")
         self.error = None
         self.contexts = {}
@@ -68,11 +87,31 @@ class _Owner:
 
     def submit(self, ctx, op, fields=None, payload=b""):
         future = Future()
-        if self.error is not None:
-            future.set_exception(self.error)
-        else:
-            self.commands.put_nowait((ctx, op, fields or {}, payload, future))
+        with self._submission_lock:
+            if self._stopping:
+                error = self.error or RuntimeError("PD worker stopped")
+            else:
+                self.commands.put_nowait((ctx, op, fields or {}, payload, future))
+                error = None
+        if error is not None:
+            future.set_exception(error)
         return future
+
+    def _stop(self, error=None):
+        with self._submission_lock:
+            if error is not None and self.error is None:
+                self.error = error
+            self._stopping = True
+            failure = self.error or RuntimeError("PD worker stopped")
+            pending = []
+            while True:
+                try:
+                    pending.append(self.commands.get_nowait()[-1])
+                except queue.Empty:
+                    break
+        for future in pending:
+            if not future.done() and future.set_running_or_notify_cancel():
+                future.set_exception(failure)
 
     @staticmethod
     def _resolve(future, result):
@@ -87,14 +126,20 @@ class _Owner:
         if handle and handle.local:
             fields.setdefault("route", "local")
             fields.setdefault("payload_bytes", 0)
-        write_record(path, {
-            "event": event, "role": self.worker.role, "time": time.time(),
-            "monotonic_ns": time.monotonic_ns(),
-            "request_id": handle.request_id if handle else None,
-            "session_id": handle.session_id if handle else None,
-            "transaction_id": handle.transaction_id if handle else None,
-            **fields,
-        })
+        sender_error = ctx.sender.error if ctx.sender is not None else None
+        try:
+            write_record(path, {
+                "event": event, "role": self.worker.role, "time": time.time(),
+                "monotonic_ns": time.monotonic_ns(),
+                "request_id": handle.request_id if handle else None,
+                "session_id": handle.session_id if handle else None,
+                "transaction_id": handle.transaction_id if handle else None,
+                **fields,
+            })
+        except OSError:
+            if isinstance(sender_error, PipelineTimingError):
+                raise sender_error
+            raise
 
     def _info(self):
         scheduler = self.core.scheduler
@@ -147,26 +192,42 @@ class _Owner:
             ctx.pending = None
         if ctx.handle is not None:
             handle = ctx.handle
-            try:
-                if ctx.sender is not None:
-                    ctx.sender.close()
-                    self.engine.model_runner.layer_transfers.pop(handle.sequence.seq_id, None)
-                    ctx.sender = None
-                if ctx.data_writer is not None:
-                    self.worker.loop.call_soon_threadsafe(ctx.data_writer.transport.abort)
-                    ctx.data_writer = None
+            errors = []
+            if ctx.sender is not None:
                 try:
-                    if handle.state not in ("finished", "handed_off", "cancelled", "expired", "failed"):
-                        self._record("pd_cancelled", ctx, reason="connection_closed")
-                finally:
-                    self.core.close(handle)
-                    self.contexts.pop(handle, None)
-                    if self.worker.role == "decode":
-                        self.decode_sessions.pop(handle.session_id, None)
+                    ctx.sender.close()
+                except PipelineTimingError as exc:
+                    errors.append(exc)
+                if isinstance(ctx.sender.error, PipelineTimingError):
+                    errors.insert(0, ctx.sender.error)
+                self.engine.model_runner.layer_transfers.pop(handle.sequence.seq_id, None)
+                ctx.sender = None
+            if ctx.data_writer is not None:
+                self.worker.loop.call_soon_threadsafe(ctx.data_writer.transport.abort)
+                ctx.data_writer = None
+            if handle._receiver is not None:
+                try:
+                    handle._receiver.close()
+                except PipelineTimingError as exc:
+                    errors.append(exc)
+                handle._receiver = None
+            try:
+                if handle.state not in ("finished", "handed_off", "cancelled", "expired", "failed"):
+                    self._record("pd_cancelled", ctx, reason="connection_closed")
+            except OSError as exc:
+                errors.append(exc)
+            self.core.close(handle)
+            self.contexts.pop(handle, None)
+            if self.worker.role == "decode":
+                self.decode_sessions.pop(handle.session_id, None)
+            try:
                 self._record("pd_released", ctx, stats=self.core.stats())
-            finally:
-                ctx.handle = None
-                ctx.events.clear()
+            except OSError as exc:
+                errors.append(exc)
+            ctx.handle = None
+            ctx.events.clear()
+            if errors:
+                raise errors[0]
         else:
             ctx.events.clear()
 
@@ -214,6 +275,7 @@ class _Owner:
 
     def _command(self, ctx, op, fields, payload, future):
         if op == "shutdown":
+            self._resolve(future, (True, b""))
             return False
         if op == "cleanup":
             if fields.get("reason") and ctx.handle is not None:
@@ -225,8 +287,10 @@ class _Owner:
             target = ctx.data_target
             if target is not None:
                 ctx.data_target = None
-                self._close(target)
-                self.worker.loop.call_soon_threadsafe(target.writer.transport.abort)
+                try:
+                    self._close(target)
+                finally:
+                    self.worker.loop.call_soon_threadsafe(target.writer.transport.abort)
             self._resolve(future, (True, b""))
             return True
         if op == "info":
@@ -290,7 +354,7 @@ class _Owner:
                 ctx.sender = LayerSender(self.engine.model_runner.kv_cache, handle.sequence,
                                          ctx.decode_endpoint, self.worker.pipeline_frame_bytes,
                                          identity, handle.deadline, self.worker.config.get("timing_path"), scales)
-                result = True
+                result = ctx.sender
             elif op == "start" and self.worker.role == "prefill":
                 if ctx.sender is None or not ctx.sender.ready.done() or ctx.sender.ready.exception() is not None:
                     raise ValueError("P pipeline data channel is not ready")
@@ -371,6 +435,11 @@ class _Owner:
     def _poll(self):
         if self.worker.pipeline_frame_bytes and self.worker.role == "prefill":
             for ctx in list(self.contexts.values()):
+                if ctx.sender is not None and isinstance(ctx.sender.error, PipelineTimingError):
+                    if ctx.pending is not None and not ctx.pending.done():
+                        ctx.pending.set_exception(ctx.sender.error)
+                        ctx.pending = None
+                    raise ctx.sender.error
                 if ctx.sender is not None and ctx.sender.error is not None and not ctx.cancelled:
                     ctx.cancelled = True
                     self.core.cancel(ctx.handle)
@@ -418,6 +487,7 @@ class _Owner:
 
     def run(self):
         current = None
+        timing_response = None
         try:
             self.engine = self.engine_factory(self.worker.config)
             core_type = PrefillCore if self.worker.role == "prefill" else DecodeCore
@@ -449,6 +519,7 @@ class _Owner:
                         if not future.done():
                             future.set_exception(exc)
                     except BaseException as exc:
+                        self._stop(exc)
                         if not future.done():
                             future.set_exception(exc)
                         raise
@@ -466,12 +537,20 @@ class _Owner:
                     if not self.core.scheduler.is_finished():
                         self._step()
         except BaseException as exc:
-            self.error = exc
+            self._stop(exc)
             logger.exception("PD model owner failed")
             if current is not None and not current[-1].done():
                 current[-1].set_exception(exc)
-            self.worker.loop.call_soon_threadsafe(self.worker.failed.set)
+            if isinstance(exc, PipelineTimingError):
+                timing_response = next(
+                    ((ctx, ctx.failure_response) for ctx in self.contexts.values()
+                     if ctx.sender is not None and ctx.sender.error is exc and ctx.response_done is not None),
+                    None,
+                )
+            if timing_response is None:
+                self.worker.loop.call_soon_threadsafe(self.worker.failed.set)
         finally:
+            self._stop()
             self.ready.set()
             if self.core is not None:
                 for ctx in list(self.contexts.values()):
@@ -479,22 +558,21 @@ class _Owner:
                         self._close(ctx)
                     except Exception:
                         logger.exception("PD cleanup failed")
-                    self.worker.loop.call_soon_threadsafe(ctx.writer.close)
+                    if timing_response is None or ctx is not timing_response[0]:
+                        self.worker.loop.call_soon_threadsafe(ctx.writer.close)
+            self.cleanup_done.set_result(None)
             if self.engine is not None:
                 try:
                     self.engine.exit()
                 except Exception:
                     logger.exception("PD engine shutdown failed")
                     if self.error is None:
-                        self.error = RuntimeError("PD engine shutdown failed")
+                        self._stop(RuntimeError("PD engine shutdown failed"))
                         self.worker.loop.call_soon_threadsafe(self.worker.failed.set)
-            while True:
-                try:
-                    _, _, _, _, future = self.commands.get_nowait()
-                except queue.Empty:
-                    break
-                if not future.done():
-                    future.set_exception(self.error or RuntimeError("PD worker stopped"))
+            self._stop()
+            if timing_response is not None:
+                self.worker.loop.call_soon_threadsafe(
+                    self.worker._defer_timing_failure, *timing_response, self.worker.failed)
 
 
 class PDWorker:
@@ -650,6 +728,18 @@ class PDWorker:
                     target.data_writer = None
                     return
 
+    def _defer_timing_failure(self, ctx, response_done, failed):
+        async def finish():
+            try:
+                async with asyncio.timeout(2):
+                    await response_done.wait()
+            except TimeoutError:
+                pass
+            finally:
+                ctx.writer.close()
+                failed.set()
+        asyncio.create_task(finish())
+
     async def _accept(self, reader, writer):
         if len(self.connections) >= self.max_socket_connections:
             writer.close()
@@ -657,7 +747,8 @@ class PDWorker:
             return
         task = asyncio.current_task()
         self.connections[task] = writer
-        ctx = _Connection(writer, time.monotonic())
+        owner = self.owner
+        ctx = _Connection(writer, time.monotonic(), failure_response=asyncio.Event())
         session = False
         data_channel = False
         expected_payload = None
@@ -719,18 +810,23 @@ class PDWorker:
                             await self._claim_connected(reader, header["session_id"], deadline, endpoint)
                             ctx.claim_ms = (time.perf_counter() - started) * 1000
                     body = await read_body(reader, size)
+                    if self.role == "prefill" and (op == "start" or ctx.sender is not None):
+                        ctx.response_done = asyncio.Event()
                     try:
                         if op in ("cancel", "close") and ctx.sender is not None:
                             ctx.sender.abort(ConnectionError("PD request cancelled"))
                         if op == "wait_pipeline":
-                            if ctx.sender is None:
+                            sender = ctx.sender
+                            if sender is None and isinstance(self.owner.error, PipelineTimingError):
+                                raise self.owner.error
+                            if sender is None:
                                 raise ProtocolError("P has no pipeline to wait for")
-                            value, output = await self._await_owner(reader, ctx.sender.done)
+                            value, output = await self._await_owner(reader, sender.done)
                         else:
                             if op == "start":
                                 future = self.owner.submit(ctx, "connect_pipeline")
-                                await self._await_owner(reader, future)
-                                await self._await_owner(reader, ctx.sender.ready)
+                                sender, _ = await self._await_owner(reader, future)
+                                await self._await_owner(reader, sender.ready)
                             future = self.owner.submit(ctx, op, {k: v for k, v in header.items() if k != "op"}, body)
                             value, output = await self._await_owner(reader, future)
                     finally:
@@ -745,10 +841,12 @@ class PDWorker:
                                           max_header_bytes=self.max_header_bytes)
                     finally:
                         output = None
+                    if ctx.response_done is not None:
+                        ctx.response_done.set()
                     if op in ("close", "info", "stats", "claim"):
                         graceful = True
                         break
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError, PipelineTimingError) as exc:
             cleanup_reason = str(exc)
             if not writer.is_closing():
                 try:
@@ -757,6 +855,8 @@ class PDWorker:
                     graceful = True
                 except (ConnectionError, OSError):
                     pass
+            if isinstance(exc, PipelineTimingError):
+                ctx.failure_response.set()
         except TimeoutError:
             cleanup_reason = "timeout"
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
@@ -764,27 +864,32 @@ class PDWorker:
         finally:
             # An admission or copy may still be executing when the socket goes away.
             # The permit remains held until this ordered cleanup reaches the owner.
+            if ctx.response_done is not None:
+                ctx.response_done.set()
+            ctx.failure_response.set()
             if ctx.sender is not None:
                 ctx.sender.abort(ConnectionError("PD control connection closed"))
             try:
-                if (session or data_channel) and self.owner.thread.is_alive():
-                    future = self.owner.submit(ctx, "cleanup_data" if data_channel else "cleanup",
-                                               {"reason": cleanup_reason})
+                if (session or data_channel) and owner.thread.is_alive() and owner.error is None:
+                    future = owner.submit(ctx, "cleanup_data" if data_channel else "cleanup",
+                                          {"reason": cleanup_reason})
                     completion = asyncio.wrap_future(future)
                     try:
-                        await asyncio.shield(completion)
-                    except asyncio.CancelledError:
-                        await asyncio.shield(completion)
-                        raise
+                        await _wait_for_cleanup(completion)
                     except Exception:
                         logger.exception("PD connection cleanup failed")
             finally:
                 try:
-                    await close_writer(writer, deadline, abort=not graceful)
+                    if (session or data_channel) and (owner.error is not None or owner._stopping):
+                        completion = asyncio.wrap_future(owner.cleanup_done)
+                        await _wait_for_cleanup(completion)
                 finally:
-                    if session:
-                        self.sessions -= 1
-                    self.connections.pop(task, None)
+                    try:
+                        await close_writer(writer, deadline, abort=not graceful)
+                    finally:
+                        if session:
+                            self.sessions -= 1
+                        self.connections.pop(task, None)
 
     async def close(self):
         if self._starting is not None:
@@ -795,11 +900,22 @@ class PDWorker:
         connections = list(self.connections.items())
         for _, writer in connections:
             writer.transport.abort()
+        cancelled = None
         if connections:
-            await asyncio.gather(*(task for task, _ in connections), return_exceptions=True)
+            completion = asyncio.gather(*(task for task, _ in connections), return_exceptions=True)
+            try:
+                await _wait_for_cleanup(completion)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
         if self.owner.thread.is_alive():
             self.owner.submit(None, "shutdown")
-            await asyncio.to_thread(self.owner.thread.join)
+            completion = asyncio.create_task(asyncio.to_thread(self.owner.thread.join))
+            try:
+                await _wait_for_cleanup(completion)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        if cancelled is not None:
+            raise cancelled
         if self.owner.error is not None:
             raise self.owner.error
 

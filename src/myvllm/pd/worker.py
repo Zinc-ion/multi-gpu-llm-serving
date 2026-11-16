@@ -15,7 +15,7 @@ import time
 
 from myvllm.config import load_config
 from myvllm.engine.llm_engine import LLMEngine
-from myvllm.pd import DecodeCore, PrefillCore
+from myvllm.pd import CapacityError, DecodeCore, PrefillCore
 from myvllm.pd.pipeline import LayerSender, PipelineTimingError
 from myvllm.pd.protocol import descriptor_components, finite_number, token_byte_counts
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError, close_writer, read_body, read_header, write_frame
@@ -24,6 +24,8 @@ from myvllm.utils.timing import write_record
 
 
 logger = logging.getLogger("myvllm.pd.worker")
+
+_OWNER_CLEANUP_COMMANDS = ("cleanup", "cleanup_data", "shutdown")
 
 
 async def _wait_for_cleanup(future):
@@ -73,8 +75,10 @@ class _Owner:
         self.worker = worker
         self.engine_factory = engine_factory
         self.commands = queue.Queue(maxsize=2 * worker.max_socket_connections + 2)
+        self._command_slots = threading.BoundedSemaphore(worker.max_socket_connections + 1)
         self._submission_lock = threading.Lock()
         self._stopping = False
+        self._shutdown_future = None
         self.ready = threading.Event()
         self.cleanup_done = Future()
         self.thread = threading.Thread(target=self.run, name="pd-model-owner")
@@ -90,8 +94,14 @@ class _Owner:
         with self._submission_lock:
             if self._stopping:
                 error = self.error or RuntimeError("PD worker stopped")
+            elif op == "shutdown" and self._shutdown_future is not None:
+                return self._shutdown_future
+            elif op not in _OWNER_CLEANUP_COMMANDS and not self._command_slots.acquire(blocking=False):
+                error = CapacityError("PD owner command capacity exhausted")
             else:
                 self.commands.put_nowait((ctx, op, fields or {}, payload, future))
+                if op == "shutdown":
+                    self._shutdown_future = future
                 error = None
         if error is not None:
             future.set_exception(error)
@@ -106,11 +116,14 @@ class _Owner:
             pending = []
             while True:
                 try:
-                    pending.append(self.commands.get_nowait()[-1])
+                    command = self.commands.get_nowait()
                 except queue.Empty:
                     break
+                if command[1] not in _OWNER_CLEANUP_COMMANDS:
+                    self._command_slots.release()
+                pending.append(command[-1])
         for future in pending:
-            if not future.done() and future.set_running_or_notify_cancel():
+            if (not future.done() or future.cancelled()) and future.set_running_or_notify_cancel():
                 future.set_exception(failure)
 
     @staticmethod
@@ -512,9 +525,11 @@ class _Owner:
                     current = None
                 while current is not None:
                     ctx, op, fields, payload, future = current
-                    future.set_running_or_notify_cancel()
+                    if op not in _OWNER_CLEANUP_COMMANDS:
+                        self._command_slots.release()
                     try:
-                        running = self._command(ctx, op, fields, payload, future)
+                        if future.set_running_or_notify_cancel():
+                            running = self._command(ctx, op, fields, payload, future)
                     except ValueError as exc:
                         if not future.done():
                             future.set_exception(exc)
@@ -812,6 +827,7 @@ class PDWorker:
                     body = await read_body(reader, size)
                     if self.role == "prefill" and (op == "start" or ctx.sender is not None):
                         ctx.response_done = asyncio.Event()
+                    future = None
                     try:
                         if op in ("cancel", "close") and ctx.sender is not None:
                             ctx.sender.abort(ConnectionError("PD request cancelled"))
@@ -830,12 +846,18 @@ class PDWorker:
                             future = self.owner.submit(ctx, op, {k: v for k, v in header.items() if k != "op"}, body)
                             value, output = await self._await_owner(reader, future)
                     finally:
+                        if op in ("info", "stats") and future is not None:
+                            future.cancel()
                         body = None
                         future = None
                     if op in ("open_p", "open_d", "prepare_p", "open_local"):
                         timeout.reschedule(ctx.deadline)
                     elif op == "reserve":
                         expected_payload = header["metadata"]["kv"]["nbytes"]
+                    elif op == "close":
+                        # The owner has released this session; the socket is counted separately.
+                        self.sessions -= 1
+                        session = False
                     try:
                         await write_frame(writer, {"ok": True, "value": value}, output,
                                           max_header_bytes=self.max_header_bytes)

@@ -127,9 +127,9 @@ D 为每个连接创建 session；P 入队前向固定 D 原子 claim 此活跃 
 
 令每个 worker 的 `max_connections=N`、`max_transfer_bytes=B`、header 限额为 `H`：
 
-- 事务连接最多 N 个；P 最多 `N+1` 个 socket，D 最多 `2N+1` 个 socket，容纳 N 个活跃 D session、最多 N 个并发 P claim 和一个状态连接。owner 命令队列上限为 `2 * max_socket_connections + 2`。这些是总量界限，不为恶意连接提供优先级或防护。
-- core 的 P 或 D 已预留传输字节总和不超过 B，单个 payload 也不超过 B；消息头和声明的 body 长度在读取 body 前检查。每个事务连接同一时间最多有一个在途命令和 body；P 的导出结果、D 的输入及复制临时对象、socket 写缓冲可能同时占用多份数据，因此 B 不是整个进程的 RSS 上限。按最多 N 个事务、每个待处理 body 不超过 B、每个 socket 的 header 不超过 H，用户态传输存储为有限的 `O(N × B + (2N+1) × H)`，另加 owner 中一次同步 copy 的临时数据、固定流缓冲和操作系统 socket 缓冲。不要按 B 单独估算主存。
-- 待发 token 队列按 `min(max_tokens, max_model_length - prompt_length)` 有界；D 不重复缓存 P 已发送的首 token。core 执行/copy 完成前，网络断开不会提前归还相关资源。关闭期间事务许可保持到 owner 清理及本端 socket 关闭或 abort 完成；错误、超时和 worker 关闭丢弃未发送的缓冲。
+- 事务连接最多 N 个；P 最多 `N+1` 个 socket，D 最多 `2N+1` 个 socket，启用 pipeline 时 D 最多 `3N+1` 个 socket。令 socket 上限为 S，owner 命令队列上限为 `2S+2`，其中普通排队命令最多 `S+1` 个，其余容量保留给每个 socket 至多一个清理命令和一个关闭命令。普通命令满时返回 `CapacityError`；命令按提交顺序执行，清理不会越过已接纳的状态变更。断连或超时的 `info`/`stats` 若仍在队列中则取消，owner 取出时跳过，取出之前仍占用普通命令容量。这些是总量界限，不为恶意连接提供优先级或防护。
+- core 的 P 或 D 已预留传输字节总和不超过 B，单个 payload 也不超过 B；消息头和声明的 body 长度在读取 body 前检查。每个事务连接同一时间最多有一个在途命令和 body；P 的导出结果、D 的输入及复制临时对象、socket 写缓冲可能同时占用多份数据，因此 B 不是整个进程的 RSS 上限。按最多 N 个事务、每个待处理 body 不超过 B、每个 socket 的 header 不超过 H，用户态传输存储为有限的 `O(N × B + S × H)`，另加 owner 中一次同步 copy 的临时数据、固定流缓冲和操作系统 socket 缓冲。不要按 B 单独估算主存。
+- 待发 token 队列按 `min(max_tokens, max_model_length - prompt_length)` 有界；D 不重复缓存 P 已发送的首 token。core 执行/copy 完成前，网络断开不会提前归还相关资源。正常 `close` 在 owner 完成清理后归还事务许可，再发送成功响应；socket 单独计数至关闭。断连或超时时事务许可保持到 owner 清理及本端 socket 关闭或 abort 完成；错误、超时和 worker 关闭丢弃未发送的缓冲。
 - `lifetime` 是从连接接受开始的单一请求生命周期，覆盖排队、prefill、claim、交接和 decode，不得超过 worker 的 `request_timeout`。客户端从连接前开始计算自己的 deadline，因此可能略早于服务端超时。超时在同步 GPU 操作之间处理，不强行中断已经开始的 kernel 或 copy。
 
 `await PDClient.stats(endpoint)` 不改变请求生命周期，可检查 `open_handles`、KV block、传输预留、排队事件与 D resident 等计数。无效协议消息关闭该连接并执行清理；core 的非法重复 metadata 在拒绝时保持原有有效事务，经过网络连接时则按违规连接关闭和回收。用户可重复使用外部 request ID，session/transaction 才区分交接。

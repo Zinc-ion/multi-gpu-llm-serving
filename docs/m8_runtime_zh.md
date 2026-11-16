@@ -171,3 +171,36 @@ uv run python tools/analyze_trace.py --plan "$PLAN_JSONL" --run-dir "$RUN_DIR" -
 正式 SLO 可用 `--freeze` 指定 `m8-slo-v1` JSON：`units="ms"`，`ttft_ms_by_prompt_tokens` 为递增的 `{"max_prompt_tokens": 整数或null, "ttft_ms": 数值}` 列表，最后一项上限为 `null`；另提供正数 `tpot_ms`、`single_token_policy="ttft_only"`、非空 `calibration_files` 引用和上述 `approval`。正式 freeze 的 `binding` 还须绑定模型与 tokenizer revision、`tokenizer_files_sha256`、`deployment_sha256`、`replay_tool_sha256`、`analyze_tool_sha256`、`concurrency`、`request_timeout_s`、`batch_timeout_s`、`max_raw_bytes`、`gpu_count`、`ignore_eos`。`plans` 每项提供 `plan_sha256`、`plan_manifest_sha256`、`warmup_plan_sha256`、`warmup_plan_manifest_sha256`；明确无 warmup 时后两项均为 `null`。回放和分析核对实际计划、部署、工具与设置，变更会拒绝正式判定。当前没有已批准的阈值或目标部署 probe，因此默认只能采集，不报告正式 SLO 或容量。
 
 分析以计划全量为分母，检查结果中的缺失/重复 ID、计划 hash 和未完成 batch；按 planned phase 和固定窗口计算 offered/passing rate，跨窗口完成尾巴单列。`mode="formal"` 表示依据所给人工批准文件进行正式门槛计算；`formal_contract_checks_passed` 只表示自动检查的结构、绑定和批次完整性通过。结果另有 `evidence_authenticity="requires_primary_agent_verification"`、`stage_acceptance=null`，由主 agent 核验实际来源、原始 SSE 和批准的真实性，阶段验收不由脚本决定。正式 TTFT 从 planned deadline 起算，dispatch TTFT 只用于诊断。usage 已证明包含特殊 token 时，合法单 token 请求的 TPOT 为 `null`，冻结政策只检查可识别的 TTFT；多 token 仅有一个可识别输出事件时 TPOT 仍为 `null`、SLO 不可判定。多事件 TPOT 要求首末两个不同事件均有独立映射证明且 usage 包含全部特殊 token，取首末客户端事件时间差除以 `completion_tokens-1`。允许控制 choice 时仍可用独立已证明的两端和完整 usage 估计 TPOT，但不报告相邻 choice 的 chunk ITL；仅证明首端则只保留 TTFT。usage 未证明包含特殊 token 时，即使首末可识别也不能用该计数估计 TPOT，报告的 1 也不能证明实际仅输出一个 token，因此不能套用单 token TTFT-only 通过政策。chunk ITL 只在首末均可识别且无控制 choice 时报告为输出事件间隔；合并、缓存与网络带来的偏差目前未知，不能当作精确逐 token 时间。每次报告 P50/P90/P99 和样本数，失败及不可判定请求不从计划分母删除；单次 L3 不能称为稳态最大 goodput，五次 P99 的平均值也不是稳定 P99。
+
+## 独立 PD 数值捕获
+
+`tools/compare_pd.py` 供正确性诊断，要求 reference、P、D 的 `world_size=1`，明确拒绝 TP2；实际 engine 从指定 Git checkout 导入并核对完整 SHA，每个模型进程分别记录导入路径、被跟踪源码哈希、源码状态、实际 KV/scale 格式和输入及运行时配置。harness 的路径和哈希另记。三个实例必须使用相同模型、架构、精度、EOS 和总长度。各模型 step 显式在 `torch.inference_mode()` 下执行，采样保持 greedy。reference 每例完成后保存，且进程已退出后才启动 D、P。
+
+每例保留原始 `prompt` 和 `input_ids`，模型输入始终以原 ID 为准（token IDs authoritative），不重新编码替换。三方实际 tokenizer 的身份、`encode(prompt)` 和 `decode(input_ids)` 观测必须一致。若 `encode(prompt)==input_ids`，正常接受；否则仅当 `decode(input_ids)==prompt` 时允许，适配 `compare_hf.py prepare` 先截断 ID、再解码文本的表示。截断多字节字符可生成 `�`，使文本无法重新编码回原 ID；各角色 `*.engine.json` 的 `tokenizer` 记录 `input_decodings`、两种关系的布尔值及 `lossy_nonroundtrip=true`。该标记表示文本相对原 ID 的非往返表示，不改变实际模型输入。编码和解码关系均不匹配时拒绝；这项边界不构成模型数值一致性结论。
+
+以下变量均由运行者按实际环境显式提供；输出目录必须不存在，时间和容量参数不是正式实验预算。模型及 tokenizer 须已在配置指定的本地路径或缓存中，子进程使用离线模式。旧 M5 仅支持 bulk；选择 pipeline 时另外提供 `--pipeline-frame-bytes "$P4_FRAME_BYTES"`，P 必须 whole/eager，单输出或总长度只允许首 token 的 case 会被拒绝。
+
+```bash
+python tools/compare_pd.py capture \
+  --engine-source "$P4_ENGINE_SOURCE" --expected-sha "$P4_ENGINE_SHA" \
+  --reference-config "$P4_REFERENCE_CONFIG" --reference-gpu "$P4_REFERENCE_GPU" \
+  --prefill-config "$P4_PREFILL_CONFIG" --prefill-gpu "$P4_PREFILL_GPU" \
+  --decode-config "$P4_DECODE_CONFIG" --decode-gpu "$P4_DECODE_GPU" \
+  --prompts "$P4_PROMPTS" --max-tokens "$P4_MAX_TOKENS" --transfer bulk \
+  --max-transfer-bytes "$P4_MAX_TRANSFER_BYTES" --output-dir "$P4_NEW_OUTPUT" \
+  --startup-timeout "$P4_STARTUP_TIMEOUT" --request-timeout "$P4_REQUEST_TIMEOUT" \
+  --normal-exit-timeout "$P4_EXIT_TIMEOUT" --term-timeout "$P4_TERM_TIMEOUT" \
+  --kill-timeout "$P4_KILL_TIMEOUT" --raw-kv
+```
+
+`--ignore-eos` 可按对照条件显式加入。`reference-00000.pt` 和 `candidate-00000.pt` 等分别含有一例、每 token 一行 logits，可直接传给 `tools/compare_runs.py`。`partial/` 每个 token 独立落盘；启用 raw KV 时，runner 返回后、postprocess 前保存有效位置，D 首次 decode 前保存恢复的 prompt。`kv-*.json` 对同格式 P→D 的 data/scale 原始字节逐字节比较，reference→P 的字节差异另作描述；首 token 终态没有 D 交接。不会比较尾块中无效位置。完成文件原子提交且禁止覆盖；未落盘数据和断电持久性不受保证。
+
+按实际 GPU/NUMA 拓扑可分别添加 `--reference-numa N`、`--prefill-numa N`、`--decode-numa N`；指定的角色使用 `numactl --cpunodebind=N --membind=N` 启动，找不到 `numactl` 或绑定失败直接报错。各角色的 `*.engine.json` 记录模型执行线程的 `/proc/thread-self/status` CPU/内存允许掩码和 CPU affinity；内存允许掩码不是对当前内存策略或实际页位置的独立证明，目标服务器需结合启动结果与拓扑核验。
+
+```bash
+python tools/compare_pd.py analyze --baseline "$P4_NEW_OUTPUT/reference-00000.pt" \
+  --candidate "$P4_NEW_OUTPUT/candidate-00000.pt" --output "$P4_NEW_REPORT"
+# 已人工批准并冻结具体门槛时，另加 --gate-freeze "$P4_GATE_FREEZE"
+```
+
+无 freeze 是 capture-only，不产生门槛结论。freeze JSON 必须包含非空 `version`、`approved: true`、非空 `approval_declaration` 和有限非负 `atol`、`rtol`；记录文件 SHA 和声明，不验证声明者身份。分析只对首次 token 分歧及之前的同前缀位置逐元素检查 `abs(candidate-reference) <= atol + rtol*abs(reference)`，并要求有限值和所有 greedy token 一致；失败返回非零并保留报告。控制进程对各自创建的进程组设置有界正常退出、TERM 和 KILL 等待，保留退出码、信号、残留进程和可见产物；controller 被 SIGKILL 或主机故障时无法保证它继续清理子进程。最终候选的 GPU、14B 和正式门槛均须单独验收。

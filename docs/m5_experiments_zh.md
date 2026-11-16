@@ -103,7 +103,7 @@ bash "$M5_OUT/ready.sh" > "$M5_OUT/ready-01.json"
 - `tools/compare_hf.py prepare` 输出包含模型/tokenizer revision 和 `cases` 的 JSON；每个 case 保存 `name`、`prompt`、`input_ids`。M2 已保存的输入可直接复用，不必重新下载或重新采样。
 - `tools/compare_hf.py custom --config <配置> --prompts <输入JSON> --max-tokens <数量> --output <输出PT>` 在**共置** `LLMEngine` 的 LM head 上注册 hook，输出 `{"metadata": ..., "cases": [...]}`；各 case 的 `input_ids`、`token_ids` 和逐输出位置的二维 `logits` 可作为共置参照。`tools/compare_runs.py --baseline <PT> --candidate <PT> --output <JSON>` 接受这种结构，只比较首次 token 分歧及之前的同前缀 logits，报告 `logits_gate=null`，不会替用户决定正式阈值。
 - `tests/pd_gpu_helpers.py::CaptureEngine` 及 `tests/test_pd_gpu.py::test_real_socket_pd_matches_colocated_gpu` 是现有 tiny P/D 测试 hook：通过测试进程注入真实引擎，分别保存共置、P、D 的 PT；其结构为 `requests[request_id].events` 中的 token/logits，以及 blocks、KV、step 信息，与 `compare_hf.py custom` 输出格式不同。该测试还把 P 首 token 和 D 后续事件拼接，在相同前缀比较 logits 和有效 KV。它的 tiny checkpoint、固定小 payload 上限和本机容差不能直接作为 14B 验收。
-- 当前没有直接可运行的 **14B P/D logits 捕获 CLI**，也没有把上述两种 PT 自动转换的入口。服务器验收前仍需在固定候选上适配测试捕获入口、确保独立 GPU 和足够的传输/内存预算，并人工固定 14B 数值阈值；本轮没有实现或执行该适配。捕获 hook 会把 logits/KV 搬到 CPU，适用于正确性诊断，不应开启后拿来衡量生产延迟。
+- `tools/compare_pd.py capture` 提供独立 reference、P、D 的 TP1 捕获，按 case 输出可直接交给 `compare_runs.py` 的 PT；使用方法及来源、进程和 KV 边界见 [M8 runtime](m8_runtime_zh.md#独立-pd-数值捕获)。原始 `input_ids` 是模型输入的权威来源；prepare 截断多字节字符时，`prompt` 可以是有损解码表示，捕获器记录 lossy/nonroundtrip 观测，不重新编码替换 ID。它也可显式选择 M5 的 bulk 接口；pipeline 要求引擎支持该接口。捕获 hook 会把 logits/KV 搬到 CPU，只适用于正确性诊断，不应开启后拿来衡量生产延迟。正式 14B logits 门槛和目标部署的验证仍须另行完成。
 
 ## L1/L2 与客户端分析
 

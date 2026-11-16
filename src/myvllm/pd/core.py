@@ -402,10 +402,12 @@ class PrefillCore(_Core):
             max(0, h.sequence.num_prompt_tokens - h.sequence.num_cached_tokens)
             for h in pending if h.state not in ("held", "exported")
         )
+        result["pending_prompt_blocks"] = sum(
+            (h.sequence.num_prompt_tokens + self.manager.block_size - 1) // self.manager.block_size
+            for h in pending
+        )
         result["reserved_prompt_blocks"] = (
-            sum((h.sequence.num_prompt_tokens + self.manager.block_size - 1) // self.manager.block_size
-                for h in pending)
-            if any(h._early_metadata is not None for h in pending) else 0
+            result["pending_prompt_blocks"] if any(h._early_metadata is not None for h in pending) else 0
         )
         result["buffered_bytes"] = sum(
             len(handle._payload) for handle in self._handles.values() if handle._payload is not None

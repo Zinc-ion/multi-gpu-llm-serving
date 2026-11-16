@@ -19,11 +19,16 @@ class PDTimingError(OSError):
     """A PD timing record could not be written."""
 
 
+class PDHeaderLimitError(ProtocolError):
+    """A request control header cannot fit the selected worker."""
+
+
 class PDConnection:
-    def __init__(self, reader, writer, deadline):
+    def __init__(self, reader, writer, deadline, max_header_bytes=DEFAULT_HEADER_LIMIT):
         self._reader = reader
         self._writer = writer
         self._deadline = deadline
+        self._max_header_bytes = min(max_header_bytes, DEFAULT_HEADER_LIMIT)
         self._max_body_bytes = 0
         self._lock = asyncio.Lock()
         self.session_id = None
@@ -34,7 +39,11 @@ class PDConnection:
         async with self._lock:
             try:
                 async with asyncio.timeout_at(self._deadline):
-                    await write_frame(self._writer, {"op": op, **fields}, body)
+                    try:
+                        await write_frame(self._writer, {"op": op, **fields}, body,
+                                          max_header_bytes=self._max_header_bytes)
+                    except ProtocolError as exc:
+                        raise PDHeaderLimitError(str(exc)) from exc
                     header, size = await read_header(self._reader, DEFAULT_HEADER_LIMIT,
                                                      self._max_body_bytes)
                     data = await read_body(self._reader, size)
@@ -132,13 +141,13 @@ class PDConnection:
 
 class PDClient:
     @staticmethod
-    async def _open(endpoint, op, lifetime, **fields):
+    async def _open(endpoint, op, lifetime, *, max_header_bytes=DEFAULT_HEADER_LIMIT, **fields):
         if type(lifetime) not in (int, float) or not 0 < lifetime < float("inf"):
             raise ValueError("lifetime must be a positive finite number")
         deadline = asyncio.get_running_loop().time() + lifetime
         async with asyncio.timeout_at(deadline):
             reader, writer = await asyncio.open_connection(*endpoint)
-        connection = PDConnection(reader, writer, deadline)
+        connection = PDConnection(reader, writer, deadline, max_header_bytes)
         try:
             value, _ = await connection._call(op, lifetime=lifetime, **fields)
             connection._max_body_bytes = value["max_transfer_bytes"]
@@ -151,31 +160,38 @@ class PDClient:
             raise
 
     @staticmethod
-    async def open_d(endpoint, *, lifetime):
-        return await PDClient._open(endpoint, "open_d", lifetime)
+    async def open_d(endpoint, *, lifetime, max_header_bytes=DEFAULT_HEADER_LIMIT):
+        return await PDClient._open(endpoint, "open_d", lifetime, max_header_bytes=max_header_bytes)
 
     @staticmethod
-    async def open_p(endpoint, session_id, request_id, token_ids, params, *, lifetime, decode_endpoint=None):
+    async def open_p(endpoint, session_id, request_id, token_ids, params, *, lifetime, decode_endpoint=None,
+                     max_header_bytes=DEFAULT_HEADER_LIMIT):
         selected = {} if decode_endpoint is None else {"decode_endpoint": decode_endpoint}
-        return await PDClient._open(endpoint, "open_p", lifetime, session_id=session_id,
+        return await PDClient._open(endpoint, "open_p", lifetime, max_header_bytes=max_header_bytes,
+                                    session_id=session_id,
                                     request_id=request_id, token_ids=token_ids,
                                     sampling=asdict(params), **selected)
 
     @staticmethod
-    async def prepare_p(endpoint, session_id, request_id, token_ids, params, *, lifetime, decode_endpoint=None):
+    async def prepare_p(endpoint, session_id, request_id, token_ids, params, *, lifetime, decode_endpoint=None,
+                        max_header_bytes=DEFAULT_HEADER_LIMIT):
         selected = {} if decode_endpoint is None else {"decode_endpoint": decode_endpoint}
-        return await PDClient._open(endpoint, "prepare_p", lifetime, session_id=session_id,
+        return await PDClient._open(endpoint, "prepare_p", lifetime, max_header_bytes=max_header_bytes,
+                                    session_id=session_id,
                                     request_id=request_id, token_ids=token_ids,
                                     sampling=asdict(params), **selected)
 
     @staticmethod
-    async def open_local(endpoint, request_id, token_ids, params, *, lifetime):
-        return await PDClient._open(endpoint, "open_local", lifetime, request_id=request_id,
+    async def open_local(endpoint, request_id, token_ids, params, *, lifetime, max_header_bytes=DEFAULT_HEADER_LIMIT):
+        return await PDClient._open(endpoint, "open_local", lifetime, max_header_bytes=max_header_bytes,
+                                    request_id=request_id,
                                     token_ids=token_ids, sampling=asdict(params))
 
     @staticmethod
-    async def start_pipeline(prefill, decode):
+    async def start_pipeline(prefill, decode, *, on_reserved=None):
         await decode.reserve_early(await prefill.describe_early())
+        if on_reserved is not None:
+            on_reserved()
         await prefill.start()
 
     @staticmethod
@@ -199,8 +215,10 @@ class PDClient:
         return await PDClient._status(endpoint, "stats", timeout)
 
     @staticmethod
-    async def handoff(prefill, decode, metadata, *, timing_path=None):
+    async def handoff(prefill, decode, metadata, *, timing_path=None, on_reserved=None):
         await decode.reserve(metadata)
+        if on_reserved is not None:
+            on_reserved()
         started = time.perf_counter()
         payload = await prefill.export()
         nbytes = len(payload)

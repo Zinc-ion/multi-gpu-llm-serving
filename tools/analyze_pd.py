@@ -42,6 +42,10 @@ def analyze(paths):
         events = group["events"]
         by_name = {record["event"]: record for record in events
                    if record["event"].startswith("pd_gateway_")}
+        group["route"] = by_name.get("pd_gateway_assigned", {}).get(
+            "route", by_name.get("pd_gateway_open", {}).get(
+                "route", by_name.get("pd_gateway_failed", {}).get(
+                    "route", by_name.get("pd_gateway_cancelled", {}).get("route", "remote"))))
         if "pd_gateway_failed" in by_name:
             group["outcome"] = "failed"
         elif "pd_gateway_cancelled" in by_name or ("pd_gateway_frontend_closed" in by_name
@@ -52,6 +56,21 @@ def analyze(paths):
         else:
             group["outcome"] = "incomplete"
         group["frontend_closed"] = "pd_gateway_frontend_closed" in by_name
+        group["frontend_outcome"] = (
+            "completed" if "pd_gateway_frontend_completed" in by_name else
+            "closed" if group["frontend_closed"] else "unknown"
+        )
+        group["client_outcome"] = None
+        group["worker_outcomes"] = {}
+        for role in ("prefill", "decode"):
+            names = {record["event"] for record in events if record.get("role") == role}
+            group["worker_outcomes"][role] = (
+                "failed" if "pd_failed" in names else
+                "cancelled" if "pd_cancelled" in names else
+                "completed" if "pd_finished" in names else
+                "handed_off" if "pd_p_released" in names else
+                "incomplete" if names else "unknown"
+            )
         first = by_name.get("pd_gateway_first", {}).get("elapsed_ms")
         second = by_name.get("pd_gateway_second", {}).get("elapsed_ms")
         completed = by_name.get("pd_gateway_completed", {}).get("elapsed_ms")
@@ -59,8 +78,13 @@ def analyze(paths):
         transfer = next((r for r in events if r["event"] == "pd_transfer_done"), {})
         group.update(first_ms=first, second_ms=second, server_generation_ms=completed,
                      second_minus_first_ms=second - first if first is not None and second is not None else None,
-                     payload_bytes=transfer.get("payload_bytes", handoff.get("payload_bytes")),
+                     payload_bytes=(0 if group["route"] == "local" else
+                                    transfer.get("payload_bytes", handoff.get("payload_bytes"))),
                      handoff_ms=handoff.get("handoff_ms"))
+        if (group["route"] == "remote" and "pd_gateway_completed" in by_name
+                and by_name.get("pd_gateway_open", {}).get("transfer_mode") == "bulk"
+                and "pd_gateway_handoff_start" not in by_name):
+            group["payload_bytes"] = 0
         if "scale_bytes" in transfer or "scale_bytes" in handoff:
             group["data_bytes"] = transfer.get("data_bytes", handoff.get("data_bytes"))
             group["scale_bytes"] = transfer.get("scale_bytes", handoff.get("scale_bytes"))
@@ -91,8 +115,27 @@ def analyze(paths):
                 "partial_send_unknown": sender[-1]["partial_send_unknown"] if sender else None,
                 "residual_wait_ms": pipeline[-1]["residual_wait_ms"] if pipeline else None,
             }
+        group["payload_unknown"] = group["payload_bytes"] is None
+        if "pipeline" in group and not pipeline:
+            detail = group["pipeline"]
+            group["payload_unknown"] = (
+                detail["partial_send_unknown"] is not False or
+                detail["socket_submitted_bytes_lower_bound"] > detail["acked_payload_bytes"]
+            )
     counts = Counter(group["outcome"] for group in groups.values())
+    routes = {}
+    for route in ("remote", "local", "unassigned"):
+        selected = [group for group in groups.values() if group["route"] == route]
+        known_bytes = [group["payload_bytes"] for group in selected if group["payload_bytes"] is not None]
+        routes[route] = {
+            "requests": len(selected),
+            "gateway_outcomes": dict(Counter(group["outcome"] for group in selected)),
+            "frontend_outcomes": dict(Counter(group["frontend_outcome"] for group in selected)),
+            "observed_payload_bytes": sum(known_bytes) if known_bytes else None,
+            "unknown_payload_requests": sum(group["payload_unknown"] for group in selected),
+        }
     return {"transactions": list(groups.values()), "outcomes": dict(counts),
+            "routes": routes, "measurement_scope": "gateway and supplied worker timing records",
             "orphan_pd_events": orphans}
 
 

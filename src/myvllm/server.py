@@ -16,6 +16,7 @@ import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
 import uvicorn
 
 from myvllm.config import load_config
@@ -260,7 +261,16 @@ def create_app(config, model_name=None, engine_factory=LLMEngine, pd_worker=None
 
     async def completion(request, chat):
         arrival = time.perf_counter()
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+
+        def record_admission_failure(status, reason):
+            try:
+                worker.record_admission_failure(request_id, arrival, status=status, reason=reason)
+            except GatewayError as exc:
+                raise HTTPException(exc.status, str(exc)) from exc
+
         if pd_worker is not None and not worker.claim():
+            record_admission_failure(503, "PD gateway request capacity exhausted")
             raise HTTPException(503, "PD gateway request capacity exhausted")
         try:
             body = await read_json_limited(request, worker.max_request_bytes) if pd_worker is not None else await request.json()
@@ -275,16 +285,24 @@ def create_app(config, model_name=None, engine_factory=LLMEngine, pd_worker=None
         except GatewayError as exc:
             if pd_worker is not None:
                 worker.unclaim()
+                record_admission_failure(exc.status, str(exc))
             raise HTTPException(exc.status, str(exc)) from exc
         except ValueError as exc:
             if pd_worker is not None:
                 worker.unclaim()
+                record_admission_failure(400, str(exc))
             raise HTTPException(400, str(exc)) from exc
-        except BaseException:
+        except BaseException as exc:
             if pd_worker is not None:
                 worker.unclaim()
+                cancelled = isinstance(exc, (asyncio.CancelledError, ClientDisconnect))
+                try:
+                    worker.record_admission_failure(
+                        request_id, arrival, status=None if cancelled else 500,
+                        reason=str(exc) or type(exc).__name__, cancelled=cancelled)
+                except GatewayError:
+                    logger.exception("PD gateway admission timing failed")
             raise
-        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         pending = PendingRequest(
             request_id, token_ids, params,

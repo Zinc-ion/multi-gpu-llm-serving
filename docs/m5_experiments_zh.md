@@ -50,6 +50,7 @@ mkdir -p "$PYTHONPYCACHEPREFIX" "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR" \
   "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH" \
   "$VLLM_CACHE_ROOT" "$NUMBA_CACHE_DIR" "$TMPDIR"
 cd "$M5_REPO"
+export PYTHONPATH="$M5_REPO/src"
 test "$(git rev-parse HEAD)" = "$M5_COMMIT"
 test "$(git rev-parse "${M5_TAG}^{commit}")" = "$M5_COMMIT"
 

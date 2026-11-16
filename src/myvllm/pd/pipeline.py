@@ -80,10 +80,13 @@ class _Staging:
                                   pin_memory=self.cuda) for _ in range(2)]
         self.stream = torch.cuda.Stream(device=self.device) if self.cuda else None
         self.origin = None
-        if self.cuda and timing_path:
-            self.origin = torch.cuda.Event(enable_timing=True)
-            self.origin.record(torch.cuda.current_stream(self.device))
-            self.stream.wait_event(self.origin)
+        if self.cuda:
+            # A recycled block can still have tail writes queued on the owner stream.
+            origin = torch.cuda.Event(enable_timing=bool(timing_path))
+            origin.record(torch.cuda.current_stream(self.device))
+            self.stream.wait_event(origin)
+            if timing_path:
+                self.origin = origin
         self.payload_bytes = 0
         self.frames = 0
 

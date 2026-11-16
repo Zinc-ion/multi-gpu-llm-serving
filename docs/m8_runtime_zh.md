@@ -114,3 +114,60 @@ load 模式按实际 JSON/UTF-8 编码检查选路时已知的请求字段和控
 同一输出目录另外生成四个 `whole-control-N` 与四个 `chunk-control-N` 单实例配置和启动脚本，逐卡独立配置、seed、端口和计时文件；各组以 manifest 中的四个 endpoint 组成一个目的地集合。manifest 同时记录物理 GPU 顺序、NUMA 映射、P/D 采样种子、策略与 chunk budget。各比较组复用相同物理端口和 GPU，按组依次启动；它们不是要同时启动的八个 GPU 实例。实际 GPU 空闲、NUMA 绑定、独立引擎资源及运行结果仍须在目标服务器核验。
 
 当前已完成真实 CPU worker/TCP/HTTP 的负载路由和资源回收测试；CPU 测试使用模型执行替身，不证明 CUDA Graph、DMA 或 14B 的正确性与性能。目标服务器 GPU、跨 NUMA、L3、TP2 和完整 M8 评测仍待验收。
+
+## L2/L3 请求计划与公共流式客户端
+
+`tools/prepare_trace.py`、`tools/replay_trace.py` 和 `tools/analyze_trace.py` 是新增的离线物化、公共 HTTP 回放和分析工具。它们读取 M2 已物化的 JSONL 和同名 `.manifest.json`，逐字节按 LF 分行，校验原文件 hash、行数和模型/tokenizer revision；已套模板的 prompt 与每行 `output_tokens` 原样保留，不再套 chat template。tokenizer 必须是本地文件，按 provenance 中 `tokenizer/` 下逐文件 SHA256 核对后，以 `local_files_only=True` 加载；输入 token 数通过该 tokenizer 的 `encode()` 实际计算。
+
+例如，已确定本地路径和预算后，可用以下命令生成一份有限阶段计划。示例中的阶段定义只说明格式，速率、时长、并发和请求预算须按实际实验事先确定；它们不是已批准的服务器测量配置：
+
+```json
+[
+  {"name": "chat-heavy", "duration_s": 120, "rate": 1, "chat_probability": 0.9},
+  {"name": "long-heavy", "duration_s": 120, "rate": 1, "chat_probability": 0.1},
+  {"name": "mixed", "duration_s": 120, "rate": 1, "chat_probability": 0.5}
+]
+```
+
+```bash
+uv run python tools/prepare_trace.py --mode l3 --kind formal \
+  --chat "$M2_SHAREGPT_JSONL" --long "$M2_LONGBENCH_JSONL" \
+  --tokenizer "$TOKENIZER_DIR" --tokenizer-provenance "$TOKENIZER_PROVENANCE_JSON" \
+  --model-revision "$MODEL_REVISION" --tokenizer-revision "$TOKENIZER_REVISION" \
+  --seed 7 --phases "$PHASES_JSON" --max-requests "$MAX_REQUESTS" --output "$PLAN_JSONL"
+```
+
+provenance JSON 的 `model_revision` 须匹配 tokenizer revision，`files` 按 `tokenizer/<相对路径>` 映射到带 `sha256` 的对象；该目录的文件集合及内容必须与记录一致。同一 `files` 中还须有每份使用的 `workloads/<JSONL文件名>` 和 `workloads/<JSONL文件名>.manifest.json`，两者的实际 hash 均须与记录一致。计划保存这些证据的绝对路径和 hash；回放与分析重新读取计划记录的来源 JSONL、manifest、provenance 和 tokenizer 文件，缺失或不匹配即拒绝。若使用证据副本，须在物化计划时显式传入副本路径，并在冻结后保持可读取。已有真实 provenance 没有 `scope` 字段时可继续使用；显式标为 `fixture` 的来源不能用于正式协议。
+
+L2 使用 `--mode l2 --rate <每秒速率>`，并指定 `--count` 或 `--duration-s` 之一；有限窗口还须提供 `--max-requests`。只有一个来源时可只提供 `--chat` 或 `--long`；混合 L2 须同时指定两个来源及 `--chat-probability`。随机数生成器跨阶段使用同一 seed，输出绝对计划 offset、planned phase、唯一请求 ID、源文件/manifest hash、LF 行号与行 hash、实际输入 token 数和原输出预算。默认 ID 包含 `formal` 或 `warmup`；回放额外拒绝两份计划之间的 ID 交集。来源行用尽默认报错；显式传入 `--allow-recycle` 后，每个请求记录循环次数和使用序号。不同角色或路径引用相同 JSONL hash 时共享使用序号，不能绕过循环记录。
+
+计划旁的 manifest 保存各阶段固定窗口、标称泊松速率、实际请求数和聊天比例，以及整份计划的输入 token 和最大输出 token 总数。有限窗口即使最后一次到达早于窗口结束，也保留原窗口时长。`--max-requests` 是物化上限，超过时不写计划，不会静默丢掉后续到达。warmup 用 `--kind warmup` 单独生成一份有界计划；正式计划用 `--kind formal`，两者及其 token 预算均可分别核对。
+
+回放示例中的 endpoint 为 HTTP(S) 基础 URL，可以重复提供多个；一个计划按 ordinal 轮转目的地，所有目的地共用一个并发上限。`--warmup-plan` 或 `--no-warmup` 必须明确选择；warmup 有失败时正式请求标为未执行：
+
+```bash
+uv run python tools/replay_trace.py --plan "$PLAN_JSONL" --warmup-plan "$WARMUP_JSONL" \
+  --endpoint "$ENDPOINT_1" --endpoint "$ENDPOINT_2" --model "$SERVED_MODEL" --ignore-eos true \
+  --concurrency "$CONCURRENCY" --request-timeout-s "$REQUEST_TIMEOUT_S" \
+  --batch-timeout-s "$BATCH_TIMEOUT_S" --max-raw-bytes "$MAX_RAW_BYTES" --gpu-count 4 \
+  --output-dir "$RUN_DIR"
+uv run python tools/analyze_trace.py --plan "$PLAN_JSONL" --run-dir "$RUN_DIR" --output "$ANALYSIS_JSON"
+```
+
+客户端使用绝对 monotonic deadline；等待并发槽导致的晚发不会平移后面的计划。单请求 timeout 从 dispatch 开始，整个 warmup 和正式回放共享有限 batch deadline，无隐式重试，也不跟随 HTTP 重定向；3xx 保留状态和响应体并记为失败。活动任务不超过全局并发上限。每条计划都有 success、failed 或 not_executed 结果；结果记录计划时间、dispatch、choice/finish/完成时间、HTTP 状态、usage 和错误。原始响应体以受控 ordinal 保存，已收到的 SSE 原字节、非 SSE 错误正文及失败时的 partial 会保留；HTTP chunk framing 由客户端库解码。同一次读取中先完成的合法事件会先记录，再处理后面的畸形字节或超限。`--max-raw-bytes` 是每个响应的硬存储上限：每次最多读 64 KiB、至多额外读取一个不保存的字节以区分恰好达到上限与超限；超限保存上限内前缀，先记录其中完成的事件，再将请求标为失败。结果中的 `raw_bytes` 是保存字节数，`received_body_bytes` 只计实际读取的 body 字节，`raw_truncated` 标明因超限截断，不代表未读取响应的完整长度。客户端禁用自动解压；若服务忽略 `Accept-Encoding: identity` 返回 gzip 等编码，则有界保留编码后的 body、记录 `content_encoding` 并失败，不把它解码成 SSE；此时 `.sse` 路径保存的是编码原字节。`run.json` 保存计划、工具、部署证据和 freeze hash、参数及 warmup/正式/合计预算；进程异常退出时可能只留下 `state=running` 和已落盘结果。batch deadline、warmup 失败或停止导致 `state=incomplete` 时回放 CLI 退出 1；分析 CLI 写出完整或 partial 报告后，对不完整批次或完整性校验问题退出 1。所有计划行均已执行但部分请求失败时 batch 可以完整结束，两个 CLI 可退出 0，失败仍留在分析分母。
+
+流式解码支持拆分 UTF-8、CR/LF、注释、ping、多个 `data:` 行及一次读取中的多个 SSE 事件；同一次客户端读取中完成的事件使用同一接收时间。协议成功要求一致的 completion identity/object/model、单个 index 0 choice、唯一 `stop`/`length` finish、合法整数 usage、与本地 tokenizer 相同的 prompt token 数、正的 completion token 数、总数一致和 `[DONE]`。错误、截断、畸形、重复/冲突终态或缺字段均为失败；空文本和带 finish 的字段本身不证明事件是否包含 token。
+
+默认没有事件/token 对应关系的证明，choice 接收时间仍保存，但首末输出时间和 TTFT/TPOT 为 `null`。可选 `--deployment`、`--protocol-contract` 仅在源码、部署配置和独立 probe 均已核验时启用规则。部署 JSON 的 `schema` 为 `m8-deployment-v1`，包含 `scope`、`endpoints`、`model`、`model_revision`、`tokenizer_revision`、`tokenizer_files_sha256`、`ignore_eos`、`generation_mode="standard_non_speculative"`、正整数 `stream_interval`，以及非空的 `source_files`、`config_files` 和 `runtime_provenance` 引用。文件引用格式为 `{"path": "...", "sha256": "...", "scope": "formal或fixture"}`，其中源码/配置引用还须有非空 `role`；相对路径相对引用它的 JSON 文件解析。tokenizer 文件集合 hash 是计划 manifest 中 `tokenizer.files` 对象按下述规范序列化后的 SHA256。
+
+`runtime_provenance` 指向 `m8-runtime-provenance-v1` JSON，记录相同 `scope`、`endpoints`、`model`、`source_files`、`config_files`，非空 `observer` 和 `shared_implementation` 说明，以及 `processes` 列表。每项 process 包含所属 `endpoint`、正整数 `pid` 和非空 `command`；所有 endpoint 须被覆盖。`shared_implementation` 说明多副本共享源码与配置的实际依据，不能仅因版本号相同就认定运行源码相同。引用列表中的相对源码/配置路径仍相对部署 JSON 解析。
+
+协议文件的 `schema` 为 `m8-protocol-v1`，以 `deployment_sha256` 绑定上述部署 JSON；`assertions` 精确包含布尔字段 `first_choice`、`last_choice`、`no_control_choices`、`usage_counts_special_tokens`。四项都允许为 false；它们是源码审阅与 probe 独立建立的陈述，false 表示不能据此启用相应计时规则，不使合法协议响应失败。`first_choice`/`last_choice` 分别证明首/末 choice 是对应输出事件，可只启用一端；两者均 false 时 formal 仍可计算全分母，成功请求的首末时间、TTFT/TPOT 为 `null`，SLO 为 indeterminate。仅当无控制 choice 且 usage 包含全部特殊 token 时才用 `choice 数 <= completion_tokens` 做必要一致性检查；该不等式从不证明事件含 token，违反时首末计时均为 `null`。`source_review` 引用 `m8-source-review-v1` JSON，记录相同 scope、deployment hash、assertions、`verified=true`、reviewer 及排序后的 `uncovered_cases`；`probe_manifest` 引用 `m8-protocol-probe-v1` JSON，也须记录相同 scope、deployment hash、assertions 和 `verified=true`。`cases` 必须包含 `ordinary`、`empty_first`、`empty_last`、`last_token_finish`、`single_token`、`eos`、`merged_choices`、`pure_terminal`、`error_and_missing`。每项包含相同 `scope`、布尔 `covered` 和 `samples`：覆盖时 samples 非空；确实无法构造的特殊 case 标 `covered=false`、`samples=[]` 并写非空 `reason`，独立 source review 须列出相应缺口。`ordinary` 须覆盖全部 endpoint，使用各自独立 raw 文件，且是通过 usage 和 DONE 校验的完整普通 SSE；其他 case 无须每个副本重复全部边界。
+
+每个 sample 包含 `endpoint` 及 `request`、`raw_sse`、`independent_observation` 文件引用；endpoint 须属于部署。观测 JSON 的 `schema` 为 `m8-probe-observation-v1`，包含相同 `scope`、`case`、`endpoint`、`deployment_sha256`、`request_sha256`、`raw_sse_sha256`，非空 `observer`、`method` 及非空对象列表 `observations`。probe 请求使用与回放相同的受限 completions 字段；EOS probe 须设置 `ignore_eos=false`，其余 probe 须与回放一致。除错误/缺失场景外，raw 须包含该 model 的 completion SSE。普通样本不会自动生成首末事件 assertions；probe 和独立源码审阅需要真实对应部署，少数字符串或 `choice 数 <= usage` 不能代替证明。
+
+`scope="fixture"` 仅用于有明确标记的测试夹具，分析结果标为 fixture；引用、runtime、源码审阅、probe case/观测及批准记录的 scope 必须与外层一致。`scope="formal"` 的协议文件另外要求 `approval` 引用。批准文件是 `m8-approval-v1` JSON，包含相同 `scope`、`status="approved"`、非空 `approver`、带时区的 `approved_at` 和 `subject_sha256`；后者是被批准 JSON **去掉 `approval` 字段后**的规范序列化 SHA256。规范序列化为 Python `json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"` 的 UTF-8 字节。批准时间不能晚于回放开始，工具校验文件与绑定 hash；批准者身份、实际运行进程源码和 probe 事实仍须由主 agent 独立核对，hash 本身不是电子签名。
+
+正式 SLO 可用 `--freeze` 指定 `m8-slo-v1` JSON：`units="ms"`，`ttft_ms_by_prompt_tokens` 为递增的 `{"max_prompt_tokens": 整数或null, "ttft_ms": 数值}` 列表，最后一项上限为 `null`；另提供正数 `tpot_ms`、`single_token_policy="ttft_only"`、非空 `calibration_files` 引用和上述 `approval`。正式 freeze 的 `binding` 还须绑定模型与 tokenizer revision、`tokenizer_files_sha256`、`deployment_sha256`、`replay_tool_sha256`、`analyze_tool_sha256`、`concurrency`、`request_timeout_s`、`batch_timeout_s`、`max_raw_bytes`、`gpu_count`、`ignore_eos`。`plans` 每项提供 `plan_sha256`、`plan_manifest_sha256`、`warmup_plan_sha256`、`warmup_plan_manifest_sha256`；明确无 warmup 时后两项均为 `null`。回放和分析核对实际计划、部署、工具与设置，变更会拒绝正式判定。当前没有已批准的阈值或目标部署 probe，因此默认只能采集，不报告正式 SLO 或容量。
+
+分析以计划全量为分母，检查结果中的缺失/重复 ID、计划 hash 和未完成 batch；按 planned phase 和固定窗口计算 offered/passing rate，跨窗口完成尾巴单列。`mode="formal"` 表示依据所给人工批准文件进行正式门槛计算；`formal_contract_checks_passed` 只表示自动检查的结构、绑定和批次完整性通过。结果另有 `evidence_authenticity="requires_primary_agent_verification"`、`stage_acceptance=null`，由主 agent 核验实际来源、原始 SSE 和批准的真实性，阶段验收不由脚本决定。正式 TTFT 从 planned deadline 起算，dispatch TTFT 只用于诊断。usage 已证明包含特殊 token 时，合法单 token 请求的 TPOT 为 `null`，冻结政策只检查可识别的 TTFT；多 token 仅有一个可识别输出事件时 TPOT 仍为 `null`、SLO 不可判定。多事件 TPOT 要求首末两个不同事件均有独立映射证明且 usage 包含全部特殊 token，取首末客户端事件时间差除以 `completion_tokens-1`。允许控制 choice 时仍可用独立已证明的两端和完整 usage 估计 TPOT，但不报告相邻 choice 的 chunk ITL；仅证明首端则只保留 TTFT。usage 未证明包含特殊 token 时，即使首末可识别也不能用该计数估计 TPOT，报告的 1 也不能证明实际仅输出一个 token，因此不能套用单 token TTFT-only 通过政策。chunk ITL 只在首末均可识别且无控制 choice 时报告为输出事件间隔；合并、缓存与网络带来的偏差目前未知，不能当作精确逐 token 时间。每次报告 P50/P90/P99 和样本数，失败及不可判定请求不从计划分母删除；单次 L3 不能称为稳态最大 goodput，五次 P99 的平均值也不是稳定 P99。

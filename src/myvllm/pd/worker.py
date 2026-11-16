@@ -12,6 +12,7 @@ import signal
 import socket
 import threading
 import time
+import traceback
 
 from myvllm.config import load_config
 from myvllm.engine.llm_engine import LLMEngine
@@ -40,6 +41,23 @@ async def _wait_for_cleanup(future):
             cancelled = exc
     if cancelled is not None:
         raise cancelled
+
+
+def _clear_error_frames(error):
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
 
 
 def _decode_endpoint(endpoint):
@@ -81,6 +99,7 @@ class _Owner:
         self._shutdown_future = None
         self.ready = threading.Event()
         self.cleanup_done = Future()
+        self.engine_shutdown_complete = False
         self.thread = threading.Thread(target=self.run, name="pd-model-owner")
         self.error = None
         self.contexts = {}
@@ -591,6 +610,13 @@ class _Owner:
                     if self.error is None:
                         self._stop(RuntimeError("PD engine shutdown failed"))
                         self.worker.loop.call_soon_threadsafe(self.worker.failed.set)
+                    # A rank failure can make exit raise after it has reaped every
+                    # process and closed the command resources.
+                    fields = ("model_runner", "processes", "events", "_shm", "_store")
+                    if isinstance(self.engine, LLMEngine) and all(name in vars(self.engine) for name in fields):
+                        self.engine_shutdown_complete = not any(getattr(self.engine, name) for name in fields)
+                else:
+                    self.engine_shutdown_complete = True
             self._stop()
             if timing_response is not None:
                 self.worker.loop.call_soon_threadsafe(
@@ -954,6 +980,8 @@ class PDWorker:
                 await _wait_for_cleanup(completion)
             except asyncio.CancelledError as exc:
                 cancelled = exc
+        if self.owner.error is not None and self.owner.engine_shutdown_complete:
+            _clear_error_frames(self.owner.error)
         if cancelled is not None:
             raise cancelled
         if self.owner.error is not None:

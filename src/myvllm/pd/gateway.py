@@ -57,10 +57,12 @@ def _worker_payload_limit(info):
     return payload
 
 
-def _validate_worker_role(info, role):
+def _validate_worker_role(info, role, *, legacy_fixed=False):
+    # M5 fixed workers only support TP1 and do not advertise world_size.
+    world_size = info.get("world_size", 1) if legacy_fixed else info["world_size"]
     if (info["role"] != role or
-            not (info["world_size"] == 1 or
-                 role == "prefill" and info["world_size"] == 2 and not info["pipeline_frame_bytes"])):
+            not (world_size == 1 or
+                 role == "prefill" and world_size == 2 and not info["pipeline_frame_bytes"])):
         raise ValueError(f"Incompatible {role} worker role or world size")
 
 
@@ -225,7 +227,7 @@ class PDGateway:
         for pe, de in self.pairs:
             pi, di = await asyncio.gather(PDClient.info(pe), PDClient.info(de))
             for info, role in ((pi, "prefill"), (di, "decode")):
-                _validate_worker_role(info, role)
+                _validate_worker_role(info, role, legacy_fixed=True)
                 if (info["role"] != role or info["model"] != spec
                         or info["max_model_length"] != self.config["max_model_length"]):
                     raise ValueError(f"Incompatible {role} worker model or length")

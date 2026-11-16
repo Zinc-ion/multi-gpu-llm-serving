@@ -449,7 +449,7 @@ def role_child(args):
         return
 
     async def worker_main():
-        opts = {"max_connections": 1, "max_transfer_bytes": args.max_transfer_bytes,
+        opts = {"max_connections": max(1, len(cases)), "max_transfer_bytes": args.max_transfer_bytes,
                 "request_timeout": args.request_timeout, "engine_factory": CaptureEngine}
         if args.role == "prefill":
             opts["decode_endpoint"] = tuple(json.loads((root / "decode.ready.json").read_text())["endpoint"])
@@ -640,6 +640,14 @@ async def run_requests(args, root, cases, config, endpoints, info, roles, manife
         raise RuntimeError("Selected engine does not support pipeline")
     pi, di = await asyncio.gather(PDClient.info(endpoints["prefill"], timeout=args.request_timeout),
                                   PDClient.info(endpoints["decode"], timeout=args.request_timeout))
+    budget = max(1, len(cases))
+    save_json(root / "worker-info.json", {
+        "case_count": len(cases), "connection_budget": budget,
+        "rationale": "Sequential capture uses at most one session per case and role; the finite case count tolerates legacy close-ACK session release lag.",
+        "prefill": pi, "decode": di,
+    })
+    if pi["max_connections"] != budget or di["max_connections"] != budget:
+        raise ValueError("Worker connection limits do not match the case-count budget")
     if pi["role"] != "prefill" or di["role"] != "decode" or pi["model"] != di["model"]:
         raise ValueError("P/D worker roles or model specifications differ")
     for index, case in enumerate(cases):

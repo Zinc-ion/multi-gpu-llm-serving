@@ -12,6 +12,8 @@ worker 在进入 `ModelRunner` 前监视 spawn 提供的 rank 0 sentinel，使�
 
 引擎退出时先记录实际 worker 的 PID 和退出码，再关闭已退出的 `Process`、pipe 与映射；结果分别保存在 `worker_pids` 和 `worker_exitcodes`。如果 worker 在 TERM/KILL 后仍存活，保留其进程对象和控制资源并报告清理错误。多次 `exit()` 安全；目标服务器 CUDA/NCCL、14B 及原 M4 BF16 TP2 严格 token 失败仍须独立验收。
 
+PD worker 关闭时，在连接任务和 owner 线程结束、引擎资源已关闭后，清理保留异常及其 cause/context/异常组中已结束帧的局部变量；异常对象、类型、消息、注释和 traceback 位置保留。引擎仍有未关闭的进程或控制资源时不执行该清理。若外部日志处理器保留另一个异常的原始 traceback，它仍可能持有对象；这里不控制外部日志的生命周期。
+
 ## TP2 prefill bulk
 
 PD worker 支持 `world_size=2` 的 prefill 和 `world_size=1` 的 decode，TP2 仅支持 bulk；TP2 early/pipeline、TP>1 decode 在入口拒绝。网关模型配置仍用 TP1 以描述全局架构和 tokenizer，load 模式可将同一个 P 配到多个允许的 D，并逐条检查采样 seed 不碰撞。TP2 P 的 KV head 数必须能被 2 整除；metadata 仍描述全部 head，D 按自己的 block table 恢复。P rank 按本地 cache 真实拷贝有效位置，尾块 data 补零、FP8 scale 补 1；独立 Gloo 组按 rank 收集原始 `uint8`，rank 0 依据全局 head 顺序合并 data 和 scale，不重新量化。该组只在 PD TP2 P 创建，默认 NCCL 组仍用于模型计算，组和命令均使用配置的 `tp_command_timeout_s`；1 MiB 槽只承载命令描述符。失败时不自动降级或重试。
@@ -43,7 +45,7 @@ uv run --no-sync python -m myvllm.pd.worker \
 - `enforce_eager`、`world_size`；已有 `pipeline_frame_bytes` 为零时表示流水未启用。TP2 只用于 bulk prefill，decode 仍为 TP1。
 - `max_transfer_bytes` 是该 worker 所有未完成交接的聚合逻辑预留上限；`max_payload_bytes` 是单个请求按 block 填充后的逻辑 payload 和 wire body 上限。两者也出现在事务 open 响应中。
 
-JSON 中端点为 `[host, port]`。固定网关继续按固定 pair 工作；下述负载模式会核对配置 inventory 中每条允许的 P/D 路径。
+JSON 中端点为 `[host, port]`。固定网关和 fixed ready 对旧 M5 worker 缺失的 `world_size` 按该版本只支持的 TP1 处理；其他模型、超时、payload、seed 和流水检查继续执行。load 模式仍要求实际的 `world_size` 和其他负载能力字段，并核对配置 inventory 中每条允许的 P/D 路径。
 
 worker 可通过 `--max-payload-bytes` 独立设置单请求上限，要求它为正整数且不超过 `--max-transfer-bytes`；省略时等于后者，保持旧配置的单包及聚合语义。bulk 和 pipeline 均在 P admission 与 D reserve 时检查完整、按 block 填充的 payload；pipeline 还要求每帧不超过 `pipeline_frame_bytes`，它自身不能大于 `max_payload_bytes`。因此显式配置较小的单包上限时，即使流水每帧都能放下，整次逻辑 payload 超限仍会被拒绝。
 
@@ -204,6 +206,8 @@ uv run python tools/analyze_trace.py --plan "$PLAN_JSONL" --run-dir "$RUN_DIR" -
 ## 独立 PD 数值捕获
 
 `tools/compare_pd.py` 供正确性诊断，reference 和 D 要求 `world_size=1`，bulk P 可为 TP1 或 TP2；TP2 P 的 `--prefill-gpu` 显式传两个不同的物理 GPU index（如 `0,1`）或两个 UUID，且不能使用 `--raw-kv`。TP2 的 rank 0 cache 快照仅包含局部 head，不作为全局 KV；全头字节通过上述交接测试单独核对。实际 engine 从指定 Git checkout 导入并核对完整 SHA，每个模型进程分别记录导入路径、被跟踪源码哈希、源码状态、实际 KV/scale 格式和输入及运行时配置。harness 的路径和哈希另记。三个实例必须使用相同模型、架构、精度、EOS 和总长度。各模型 step 显式在 `torch.inference_mode()` 下执行，采样保持 greedy。reference 每例完成后保存，且进程已退出后才启动 D、P。
+
+捕获按 case 串行，reference 直接运行而不是 worker；P 和 D worker 各使用 `max(1, case 数)` 的有限连接预算。旧 M5 的 close ACK 可能早于网络 session 计数释放；最多每例各创建一个 session，case 数预算允许先前 session 尚未释放，不增加并行模型请求。捕获目录的 `worker-info.json` 原子保存实际查询到的两端 info、预算和原因；这只用于诊断兼容，不修补旧 M5、证明其资源验收或补填 B0/B1/B2 性能数据。
 
 每例保留原始 `prompt` 和 `input_ids`，模型输入始终以原 ID 为准（token IDs authoritative），不重新编码替换。三方实际 tokenizer 的身份、`encode(prompt)` 和 `decode(input_ids)` 观测必须一致。若 `encode(prompt)==input_ids`，正常接受；否则仅当 `decode(input_ids)==prompt` 时允许，适配 `compare_hf.py prepare` 先截断 ID、再解码文本的表示。截断多字节字符可生成 `�`，使文本无法重新编码回原 ID；各角色 `*.engine.json` 的 `tokenizer` 记录 `input_decodings`、两种关系的布尔值及 `lossy_nonroundtrip=true`。该标记表示文本相对原 ID 的非往返表示，不改变实际模型输入。编码和解码关系均不匹配时拒绝；这项边界不构成模型数值一致性结论。
 

@@ -4,6 +4,10 @@ import asyncio
 import json
 import multiprocessing as mp
 import os
+from pathlib import Path
+import sys
+import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,50 +17,181 @@ from myvllm.pd.client import PDClient
 from myvllm.sampling_parameters import SamplingParams
 from pd_helpers import create_tiny_qwen_checkpoint
 from pd_tp_gpu_helpers import reference_on_gpu, worker_on_gpus
+from tools.compare_pd import stop_roles
 
 
 pytestmark = pytest.mark.skipif(os.environ.get('RUN_PD_TP2_GPU') != '1', reason='four-GPU smoke is opt-in')
 
+_START_TIMEOUT = 180
+_REFERENCE_TIMEOUT = 30
+_STOP_TIMEOUT = 90
+_TERM_TIMEOUT = 10
+_KILL_TIMEOUT = 10
 
-def _start(ctx, target, args):
+
+class _StopPipe:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def write(self, data):
+        try:
+            self.connection.send('stop')
+        except (ValueError, EOFError) as exc:
+            raise OSError(str(exc)) from exc
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.connection.close()
+
+
+class _Process:
+    def __init__(self, process, stop):
+        self.process = process
+        self.stdin = _StopPipe(stop)
+        self.returncode = None
+
+    def poll(self):
+        self.process.join(0)
+        self.returncode = self.process.exitcode
+        return self.returncode
+
+    def send_signal(self, sig):
+        os.kill(self.process.pid, sig)
+
+
+def _owned_entry(target, args, ready, stop):
+    os.setsid()
+    stat = Path('/proc/self/stat').read_text()
+    started = int(stat[stat.rfind(')') + 2:].split()[19])
+    ready.send(('group', os.getpid(), started))
+    try:
+        if stop.recv() == 'start':
+            target(*args, ready, stop)
+    finally:
+        ready.close()
+        stop.close()
+
+
+def _receive(connection, process, deadline):
+    while True:
+        if connection.poll(min(.1, max(0, deadline - time.monotonic()))):
+            return connection.recv()
+        if process.exitcode is not None:
+            raise RuntimeError(f'worker exited during startup: {process.exitcode}')
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f'worker startup timed out: {process.exitcode}')
+
+
+def _start(ctx, target, args, expected='ready', owners=None):
     parent, child = ctx.Pipe(duplex=False)
     stop_child, stop = ctx.Pipe(duplex=False)
-    process = ctx.Process(target=target, args=(*args, child, stop_child))
-    process.start()
-    child.close()
-    stop_child.close()
+    process = ctx.Process(target=_owned_entry, args=(target, args, child, stop_child))
+    item = {'process': _Process(process, stop), 'pid': None, 'group': None,
+            'start_ticks': None, 'signals': [], 'errors': [], 'remaining': []}
+    if owners is not None:
+        owners.append(item)
     try:
-        assert parent.poll(180), f'worker startup timed out: {process.exitcode}'
-        status = parent.recv()
-        assert status[0] == 'ready', status
-        return process, stop, status[1]
+        process.start()
+        item['pid'] = item['group'] = process.pid
+        child.close()
+        stop_child.close()
+        deadline = time.monotonic() + _START_TIMEOUT
+        group = _receive(parent, process, deadline)
+        assert group[0] == 'group' and group[1] == process.pid, group
+        item['start_ticks'] = group[2]
+        stop.send('start')
+        status = _receive(parent, process, deadline)
+        assert status[0] == expected, status
+        item['endpoint'] = status[1]
+        return item
     except BaseException:
-        if process.is_alive():
-            process.terminate()
-            process.join(10)
-        stop.close()
+        _stop_workers([item])
         raise
     finally:
         parent.close()
+        child.close()
+        stop_child.close()
 
 
 def _worker_entry(visible, role, config, decodes, ready, stop):
     worker_on_gpus(visible, role, config, ready, stop, decodes)
 
 
-def _stop(item):
-    process, stop, _ = item
+def _reference_entry(visible, config, cases, ready, stop):
+    reference_on_gpu(visible, config, cases, ready)
+
+
+def _stop_workers(workers):
+    original = sys.exception()
+    errors = []
+    active = {}
+    for index, item in enumerate(workers):
+        if item.get('closed'):
+            continue
+        process = item['process'].process
+        try:
+            if item['pid'] is None:
+                item['pid'] = item['group'] = process.pid
+            if item['pid'] is not None:
+                active[str(index)] = item
+        except BaseException as exc:
+            errors.append(f"process registration: {exc!r}")
+    timeouts = SimpleNamespace(normal_exit_timeout=_STOP_TIMEOUT, term_timeout=_TERM_TIMEOUT,
+                               kill_timeout=_KILL_TIMEOUT)
     try:
-        if process.is_alive():
-            stop.send('stop')
-            process.join(90)
-        if process.is_alive():
-            process.terminate()
-            process.join(10)
-            pytest.fail('GPU worker did not exit')
-        assert process.exitcode == 0
+        errors.extend(stop_roles(active, timeouts))
+    except BaseException as exc:
+        errors.append(repr(exc))
+        for name, item in active.items():
+            try:
+                errors.extend(stop_roles({name: item}, timeouts))
+            except BaseException as cleanup:
+                errors.append(repr(cleanup))
+    reports = []
+    for item in workers:
+        if item.get('closed'):
+            continue
+        process = item['process'].process
+        try:
+            if item['pid'] is None:
+                item['process'].stdin.close()
+            if not process.is_alive():
+                item['exitcode'] = process.exitcode
+                process.close()
+                item['closed'] = True
+            else:
+                item['closed'] = False
+                errors.append(f"pid {item['pid']} remains alive; process handle retained")
+        except BaseException as exc:
+            errors.append(f"pid {item['pid']} close: {exc!r}")
+        if item['signals']:
+            errors.append(f"pid {item['pid']} required signals {item['signals']}")
+        reports.append(f"GPU smoke pid={item['pid']} exitcode={item.get('exitcode')} "
+                       f"signals={item['signals']} remaining={item['remaining']}")
+    if reports:
+        try:
+            print('\n'.join(reports), flush=True)
+        except BaseException as exc:
+            errors.append(f"cleanup report: {exc!r}")
+    if errors:
+        message = f"GPU smoke cleanup failed: {errors}"
+        if original is not None:
+            original.add_note(message)
+        else:
+            raise RuntimeError(message)
+
+
+def _reference(ctx, visible, config, cases):
+    owners = []
+    try:
+        ref = _start(ctx, _reference_entry, (visible, config, cases), expected='ok', owners=owners)
+        process = ref['process'].process
+        process.join(_REFERENCE_TIMEOUT)
+        assert process.exitcode == 0, f'reference did not exit successfully: {process.exitcode}'
     finally:
-        stop.close()
+        _stop_workers(owners)
 
 
 async def _request(pe, de, case):
@@ -97,39 +232,24 @@ def test_four_gpu_tp2_bulk_against_tp1_reference(tmp_path, fp8):
               'sampling': {'temperature': 0, 'max_tokens': 3, 'ignore_eos': True}}
              for i in range(2)]
     ctx = mp.get_context('spawn')
-    parent, child = ctx.Pipe(duplex=False)
     reference_path = tmp_path / 'reference.pt'
     reference_config = {**config, 'capture_role': 'reference', 'capture_path': str(reference_path)}
-    ref = ctx.Process(target=reference_on_gpu, args=('0', reference_config, cases, child))
-    ref.start()
-    child.close()
-    try:
-        assert parent.poll(180) and parent.recv()[0] == 'ok'
-        ref.join(30)
-        assert ref.exitcode == 0
-    finally:
-        parent.close()
-        if ref.is_alive():
-            ref.terminate()
-            ref.join(10)
+    _reference(ctx, '0', reference_config, cases)
     workers = []
     try:
         decodes = []
         for i, gpu in enumerate(('3', '4')):
             dconfig = {**config, 'seed': i, 'capture_role': 'decode',
                        'capture_path': str(tmp_path / f'decode-{i}.pt')}
-            worker = _start(ctx, _worker_entry, (gpu, 'decode', dconfig, None))
-            workers.append(worker)
-            decodes.append(worker[2])
+            worker = _start(ctx, _worker_entry, (gpu, 'decode', dconfig, None), owners=workers)
+            decodes.append(worker['endpoint'])
         pconfig = {**config, 'world_size': 2, 'capture_role': 'prefill',
                    'capture_path': str(tmp_path / 'prefill.pt'),
                    'timing_path': str(tmp_path / 'prefill.jsonl')}
-        p = _start(ctx, _worker_entry, ('0,1', 'prefill', pconfig, decodes))
-        workers.append(p)
-        actual = [asyncio.run(_request(p[2], de, case)) for de, case in zip(decodes, cases)]
+        p = _start(ctx, _worker_entry, ('0,1', 'prefill', pconfig, decodes), owners=workers)
+        actual = [asyncio.run(_request(p['endpoint'], de, case)) for de, case in zip(decodes, cases)]
     finally:
-        for worker in reversed(workers):
-            _stop(worker)
+        _stop_workers(workers)
     reference = torch.load(reference_path, weights_only=False)['requests']
     prefill = torch.load(tmp_path / 'prefill.pt', weights_only=False)['requests']
     decodes_capture = [torch.load(tmp_path / f'decode-{i}.pt', weights_only=False)['requests'] for i in range(2)]

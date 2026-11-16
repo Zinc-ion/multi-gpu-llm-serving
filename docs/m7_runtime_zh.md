@@ -1,6 +1,6 @@
-# M7：FP8 KV 存储与 attention
+# M7：FP8 KV 存储、attention 与 PD 传输
 
-本单元为共置引擎增加可选的 FP8 KV 存储与读取。默认不启用；模型权重、activation 和 logits 的 dtype 仍由原有 `dtype` 配置决定。FP8 KV 是有损量化，不能把它与 BF16 KV 的输出差异当作无损传输误差。本机 tiny 模型的功能验证不能代替目标服务器、14B、长上下文质量或性能验收。
+本单元为引擎增加可选的 FP8 KV 存储、读取和 PD 传输。默认不启用；模型权重、activation 和 logits 的 dtype 仍由原有 `dtype` 配置决定。FP8 KV 是有损量化，不能把它与 BF16 KV 的输出差异当作无损传输误差。本机 tiny 模型的功能验证不能代替目标服务器、14B、长上下文质量或性能验收。
 
 ## 配置与布局
 
@@ -49,6 +49,24 @@ PYTHONPATH="$PWD/src" uv run --no-sync python tools/capacity_report.py \
 
 报告只描述 block 池容量，不是稳定并发或 goodput。profiling 在 CUDA Graph capture 之前进行，graph 和其他运行时内存仍须实测。
 
+## FP8 PD 交接
+
+M5 整块交接与 M6 逐层交接均可传输 FP8 KV；P、D 仍使用各自的 TP=1 引擎和物理 block table，经主存和 TCP 传递原始 data 与对应 scale，D 不重算 prompt 或重新量化。启动网关时核对模型与 cache 格式；D 在预留前核对版本、模型、字节序、形状和字节数。不匹配会被拒绝。
+
+`auto` 的 model spec 和整块版本 2、早期版本 3 保持原格式。FP8 的 model spec 另有：
+
+```json
+{"kv_cache": {"dtype": "float8_e4m3fn", "scale_dtype": "float32", "scale_granularity": "token_head"}}
+```
+
+FP8 整块 metadata 为版本 4，早期 metadata 为版本 5，逐层完成后的 `commit_early` 校验对应版本 4。`kv` 的 `shape` 为 `[2, layers, blocks, block_size, local_kv_heads, head_dim]`，`scale_shape` 为去掉最后一维的形状；`dtype`、`scale_dtype`、`byte_order`、`data_nbytes`、`scale_nbytes` 和总 `nbytes` 均参与校验。每个 payload 先按 C 顺序放置所有 FP8 data 字节，再按 C 顺序放置所有原生字节序 FP32 scale 字节。两段紧邻，没有额外 wire padding；即使 `head_dim` 为奇数，也通过 uint8 字节视图复制 scale，不依赖未对齐的 FP32 主存视图。
+
+令 prompt 有 N 个 token、block 大小为 S、块数 `B=ceil(N/S)`、层数 L、本地 KV head 数 H、每个 head 维数 D。整块的 data 字节为 `2*L*B*S*H*D`，scale 字节为 `2*L*B*S*H*4`；末块无效位置的 data 为 0、scale 为 1。逐层分帧只传有效位置，每帧有 C 个 token 时 data 字节为 `2*C*H*D`，scale 字节为 `2*C*H*4`；各层合计 `2*L*N*H*(D+4)` 字节。D 的早期预留会将末块无效位置初始化为 data 0、scale 1，即使该物理块曾被使用。有效 data 和 scale 均按原始字节恢复。
+
+流水仍为 opt-in：worker 两侧设置 `--pipeline-frame-bytes`，每帧至少容纳 `2*H*(D+4)` 字节；网关 `pipeline_min_tokens` 默认 0，继续走整块路径。流水支持 P whole/eager、D eager 或 graph；M6 的客户端顺序及其他约束见 [M6 逐层交接](m6_runtime_zh.md)，其中 FP8 不支持的旧状态以本节为准。每端每事务两个帧大小的 pinned slot 同时容纳 data 和 scale。P 的完成 event 在两者 D2H 后记录，runner 在 sampling/postprocess 前 drain，确保源 block 在 EOS、取消或重用前读完。D 的非末帧 ACK 只表示复制已提交；最终 `copies_done=True` 等待 data 和 scale 的 H2D 完成，并在计算流建立依赖。
+
+传输预留和帧限制均计入 data 与 scale；网关对整块计入尾部填充，对流水只计算有效 token。启用 timing 时，FP8 的 `payload_bytes` 是总字节，相关 worker、gateway、pipeline 记录及 `tools/analyze_pd.py` 还区分 `data_bytes`、`scale_bytes`；部分 sendall 的实际提交量仍遵循 M6 的 `partial_send_unknown` 语义。`tools/compare_runs.py` 将缺失 `kv_cache_dtype` 的旧配置视为 `auto`，拒绝把不同 cache 格式作为无损比较。
+
 ## 验证范围
 
 在执行前固定的算子比较使用独立 PyTorch 量化/反量化公式：FP8 原始字节逐位相等，FP32 scale `rtol=1e-6, atol=0`，零 head 的 scale 精确为 1。attention 与反量化后的 FP32 参考比较：FP32 输出 `rtol=1e-4, atol=1e-5`，FP16 输出 `0.005/0.005`，BF16 输出 `0.02/0.02`。这些容差覆盖浮点归约和输出 dtype 的舍入，比较对象已经使用相同的 FP8 KV，不是 BF16 与 FP8 之间的质量门槛。
@@ -68,4 +86,13 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH="$PWD/src
   --basetemp=/path/to/new-cpu-test-dir
 ```
 
-本单元没有启用 FP8 PD：现有 PD core 的 `model_spec` 对 cache dtype 与模型 dtype 不一致直接拒绝，不传输或恢复 FP8 scale。后续需要为整块和逐层交接定义并验证携带 data 与 scale 的格式。FP8 相对于 BF16 的任务质量、NaN/Inf、显存与吞吐/延迟变化，以及目标 4090、14B 和长上下文表现均待后续固定工作负载和质量门槛后实测；同格式 PD 的无损验证也待实现后执行。
+本机 RTX 5080 Laptop GPU 的 FP8 PD 测试使用 `scale=1.0` 的 tiny checkpoint 和独立的共置、P、D 进程；FP32/BF16 模型 dtype、D eager/graph 四组合分别比较共置、整块和逐层路径。greedy token 一致，同前缀 logits 使用 FP32 `rtol=1e-4, atol=1e-5`、BF16 `rtol=0.02, atol=0.02`，有效 FP8 data 与 FP32 scale 按字节精确比较。测试还覆盖不完整尾块、跨块、并发、EOS、源块重用、双槽背压下的取消、连接中断、超时和后续请求；这是同卡本地功能验证。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH="$PWD/src" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  uv run --no-sync python -m pytest -q -p no:cacheprovider \
+  --basetemp=/path/to/new-pd-test-dir tests/test_pd_fp8_gpu.py
+```
+
+FP8 相对于 BF16 的任务质量、显存与吞吐/延迟变化，以及目标 4090、14B 和长上下文表现均待后续固定工作负载和质量门槛后实测。

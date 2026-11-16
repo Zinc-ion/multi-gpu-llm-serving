@@ -61,6 +61,9 @@ def analyze(paths):
                      second_minus_first_ms=second - first if first is not None and second is not None else None,
                      payload_bytes=transfer.get("payload_bytes", handoff.get("payload_bytes")),
                      handoff_ms=handoff.get("handoff_ms"))
+        if "scale_bytes" in transfer or "scale_bytes" in handoff:
+            group["data_bytes"] = transfer.get("data_bytes", handoff.get("data_bytes"))
+            group["scale_bytes"] = transfer.get("scale_bytes", handoff.get("scale_bytes"))
         group["handoff_to_generation_ratio"] = (
             group["handoff_ms"] / completed if group["handoff_ms"] is not None and completed else None
         )
@@ -74,6 +77,12 @@ def analyze(paths):
             acked_bytes = observed["payload_bytes"] if observed else sum(r["payload_bytes"] for r in frames)
             acked_frames = observed["frames"] if observed else len(frames)
             group["payload_bytes"] = acked_bytes
+            if observed and "scale_bytes" in observed:
+                group["data_bytes"] = observed["data_bytes"]
+                group["scale_bytes"] = observed["scale_bytes"]
+            elif frames and "scale_bytes" in frames[0]:
+                group["data_bytes"] = sum(r["data_bytes"] for r in frames)
+                group["scale_bytes"] = sum(r["scale_bytes"] for r in frames)
             group["pipeline"] = {
                 "acked_frames": acked_frames, "acked_payload_bytes": acked_bytes,
                 "socket_submitted_bytes_lower_bound": (

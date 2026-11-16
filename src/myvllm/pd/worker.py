@@ -16,7 +16,7 @@ from myvllm.config import load_config
 from myvllm.engine.llm_engine import LLMEngine
 from myvllm.pd import DecodeCore, PrefillCore
 from myvllm.pd.pipeline import LayerSender
-from myvllm.pd.protocol import finite_number
+from myvllm.pd.protocol import descriptor_components, finite_number, token_byte_counts
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError, close_writer, read_body, read_header, write_frame
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.utils.timing import write_record
@@ -253,9 +253,10 @@ class _Owner:
                     raise ValueError("P pipeline has already been started")
                 identity = {"session_id": handle.session_id, "transaction_id": handle.transaction_id,
                             "request_id": handle.request_id, "role": "prefill"}
+                scales = self.engine.model_runner.kv_cache_scales if "kv_cache" in self.core.spec else None
                 ctx.sender = LayerSender(self.engine.model_runner.kv_cache, handle.sequence,
                                          self.worker.decode_endpoint, self.worker.pipeline_frame_bytes,
-                                         identity, handle.deadline, self.worker.config.get("timing_path"))
+                                         identity, handle.deadline, self.worker.config.get("timing_path"), scales)
                 result = True
             elif op == "start" and self.worker.role == "prefill":
                 if ctx.sender is None or not ctx.sender.ready.done() or ctx.sender.ready.exception() is not None:
@@ -276,7 +277,7 @@ class _Owner:
                     ctx.event_limit = min(sampling["max_tokens"],
                                           sampling["max_model_length"] - metadata["prompt_length"]) - 1
                     self._record("pd_reserved", ctx, payload_bytes=metadata["kv"]["nbytes"],
-                                 stats=self.core.stats())
+                                 stats=self.core.stats(), **descriptor_components(metadata["kv"]))
             elif op == "region" and self.worker.role == "decode":
                 self.core.restore_region(handle, fields["layer"], fields["start"], fields["end"], payload)
                 result = {"copies_done": handle._next_layer == self.core.spec["architecture"]["num_layers"],
@@ -289,7 +290,8 @@ class _Owner:
                 data = self.core.export(handle)
                 if first:
                     self._record("pd_export_done", ctx, payload_bytes=len(data),
-                                 export_ms=(time.perf_counter() - started) * 1000)
+                                 export_ms=(time.perf_counter() - started) * 1000,
+                                 **descriptor_components(handle._metadata["kv"]))
                 self._resolve(future, (None, data))
                 return True
             elif op == "restore" and self.worker.role == "decode":
@@ -298,7 +300,7 @@ class _Owner:
                 if result:
                     self._record("pd_restore_done", ctx, payload_bytes=len(payload),
                                  restore_ms=(time.perf_counter() - started) * 1000,
-                                 stats=self.core.stats())
+                                 stats=self.core.stats(), **descriptor_components(handle._metadata["kv"]))
             elif op == "acknowledge" and self.worker.role == "prefill":
                 result = self.core.acknowledge(handle)
                 if result:
@@ -385,8 +387,7 @@ class _Owner:
             self.core = core_type(self.engine, self.worker.max_connections,
                                   self.worker.max_transfer_bytes)
             if self.worker.pipeline_frame_bytes:
-                cache = self.engine.model_runner.kv_cache
-                if self.worker.pipeline_frame_bytes < 2 * cache.shape[-2] * cache.shape[-1] * cache.element_size():
+                if self.worker.pipeline_frame_bytes < sum(token_byte_counts(self.core.spec)):
                     raise ValueError("Pipeline frame must hold at least one K/V token")
             if self.worker.pipeline_frame_bytes and self.worker.role == "prefill":
                 self.engine.model_runner.layer_transfers = {}

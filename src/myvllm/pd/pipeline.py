@@ -10,6 +10,7 @@ import time
 import numpy as np
 import torch
 
+from myvllm.pd.protocol import cache_token_byte_counts
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError, _PREFIX
 from myvllm.utils.timing import write_record
 
@@ -61,15 +62,18 @@ def _send(sock, header, body=b""):
 
 
 class _Staging:
-    def __init__(self, cache, frame_bytes, identity, timing_path):
+    def __init__(self, cache, frame_bytes, identity, timing_path, scales=None):
         self.cache = cache
+        self.scales = scales
         self.frame_bytes = frame_bytes
         self.identity = identity
         self.timing_path = timing_path
         self.started = time.perf_counter()
         self.cuda = cache.is_cuda
         self.device = cache.device
-        self.token_bytes = 2 * cache.shape[-2] * cache.shape[-1] * cache.element_size()
+        self.data_token_bytes, self.scale_token_bytes = cache_token_byte_counts(
+            cache.shape[-2], cache.shape[-1], cache.dtype, scales is not None)
+        self.token_bytes = self.data_token_bytes + self.scale_token_bytes
         if type(frame_bytes) is not int or frame_bytes < self.token_bytes:
             raise ValueError("Pipeline frame must hold at least one K/V token")
         self.slots = [torch.empty(frame_bytes, dtype=torch.uint8, device="cpu",
@@ -99,14 +103,22 @@ class _Staging:
         size = sum(slot.numel() for slot in self.slots)
         return {"staging_bytes": size, "pinned_bytes": size if self.cuda else 0,
                 "slot_count": len(self.slots), "frame_bytes": self.frame_bytes,
-                "payload_bytes": self.payload_bytes, "frames": self.frames}
+                "payload_bytes": self.payload_bytes, "frames": self.frames,
+                **self.byte_counts(self.payload_bytes)}
+
+    def byte_counts(self, nbytes):
+        if self.scales is None:
+            return {}
+        tokens = nbytes // self.token_bytes
+        return {"data_bytes": tokens * self.data_token_bytes,
+                "scale_bytes": tokens * self.scale_token_bytes}
 
 
 class LayerSender(_Staging):
     """The model owner produces; this request's socket thread drains two slots."""
 
-    def __init__(self, cache, sequence, endpoint, frame_bytes, identity, deadline, timing_path=None):
-        super().__init__(cache, frame_bytes, identity, timing_path)
+    def __init__(self, cache, sequence, endpoint, frame_bytes, identity, deadline, timing_path=None, scales=None):
+        super().__init__(cache, frame_bytes, identity, timing_path, scales)
         self.sequence = sequence
         self.endpoint = endpoint
         self.deadline = deadline
@@ -176,8 +188,10 @@ class LayerSender(_Staging):
                 return
             count = end - start
             size = count * self.token_bytes
-            host = self.slots[index][:size].view(self.cache.dtype).reshape(
+            data_size = count * self.data_token_bytes
+            host = self.slots[index][:data_size].view(self.cache.dtype).reshape(
                 2, count, self.cache.shape[-2], self.cache.shape[-1])
+            host_scales = self.slots[index][data_size:size]
             begin = complete = None
             if self.cuda:
                 self.stream.wait_event(ready)
@@ -188,11 +202,21 @@ class LayerSender(_Staging):
                     for kv in range(2):
                         host[kv].copy_(self.cache[kv, layer].flatten(0, 1)[physical:physical + count],
                                        non_blocking=True)
+                        if self.scales is not None:
+                            width = count * self.scale_token_bytes // 2
+                            host_scales[kv * width:(kv + 1) * width].copy_(
+                                self.scales[kv, layer].flatten(0, 1)[physical:physical + count]
+                                .view(torch.uint8).reshape(-1), non_blocking=True)
                     complete = torch.cuda.Event(enable_timing=bool(self.timing_path))
                     complete.record(self.stream)
             else:
                 for kv in range(2):
                     host[kv].copy_(self.cache[kv, layer].flatten(0, 1)[physical:physical + count])
+                    if self.scales is not None:
+                        width = count * self.scale_token_bytes // 2
+                        host_scales[kv * width:(kv + 1) * width].copy_(
+                            self.scales[kv, layer].flatten(0, 1)[physical:physical + count]
+                            .view(torch.uint8).reshape(-1))
             with self.condition:
                 self.pending.append((index, layer, start, end, size, ready, begin, complete))
                 self.condition.notify_all()
@@ -242,11 +266,11 @@ class LayerSender(_Staging):
                                   "d2h_start_gpu_ms": self.origin.elapsed_time(begin),
                                   "d2h_end_gpu_ms": self.origin.elapsed_time(complete)}
                     self._record("pd_d2h_done", layer=layer, start=start, end=end,
-                                 payload_bytes=size, **timing)
+                                 payload_bytes=size, **self.byte_counts(size), **timing)
                     sock.settimeout(max(.001, self.deadline - time.monotonic()))
                     sent = time.perf_counter()
                     self._record("pd_region_send_start", layer=layer, start=start, end=end,
-                                 payload_bytes=size)
+                                 payload_bytes=size, **self.byte_counts(size))
                     body = memoryview(self.slots[index].numpy())[:size]
                     self.partial_send_unknown = True
                     _send(sock, {"op": "region", "layer": layer, "start": start, "end": end}, body)
@@ -254,7 +278,7 @@ class LayerSender(_Staging):
                     del body
                     self.sent_bytes += size
                     self._record("pd_region_socket_done", layer=layer, start=start, end=end,
-                                 payload_bytes=size)
+                                 payload_bytes=size, **self.byte_counts(size))
                     value = _response(sock)
                     last = layer + 1 == self.cache.shape[1] and end == self.sequence.num_prompt_tokens
                     if value != {"copies_done": last, "payload_bytes": size}:
@@ -262,13 +286,15 @@ class LayerSender(_Staging):
                     self.frames += 1
                     self.payload_bytes += size
                     self._record("pd_region_sent", layer=layer, start=start, end=end,
-                                 payload_bytes=size, socket_ms=(time.perf_counter() - sent) * 1000)
+                                 payload_bytes=size, socket_ms=(time.perf_counter() - sent) * 1000,
+                                 **self.byte_counts(size))
                     with self.condition:
                         self.free.append(index)
                         self.condition.notify_all()
                         if last:
                             self.done.set_result(({"payload_bytes": self.payload_bytes,
-                                                   "frames": self.frames}, b""))
+                                                   "frames": self.frames,
+                                                   **self.byte_counts(self.payload_bytes)}, b""))
                             return
         except Exception as exc:
             self.abort(exc)
@@ -296,8 +322,8 @@ class LayerSender(_Staging):
 class LayerReceiver(_Staging):
     """The D owner restores into its own table; a slot lives until H2D completes."""
 
-    def __init__(self, cache, frame_bytes, identity, timing_path=None):
-        super().__init__(cache, frame_bytes, identity, timing_path)
+    def __init__(self, cache, frame_bytes, identity, timing_path=None, scales=None):
+        super().__init__(cache, frame_bytes, identity, timing_path, scales)
         self.events = [None, None]
         self.next_slot = 0
 
@@ -319,31 +345,39 @@ class LayerReceiver(_Staging):
         self._wait_slot(index)
         size = len(payload)
         self.slots[index][:size].numpy()[:] = np.frombuffer(payload, dtype=np.uint8)
-        host = self.slots[index][:size].view(self.cache.dtype).reshape(
+        data_size = (end - start) * self.data_token_bytes
+        host = self.slots[index][:data_size].view(self.cache.dtype).reshape(
             2, end - start, self.cache.shape[-2], self.cache.shape[-1])
+        host_scales = self.slots[index][data_size:size]
         if self.cuda:
             with torch.cuda.stream(self.stream):
                 begin = None
                 if self.timing_path:
                     begin = torch.cuda.Event(enable_timing=True)
                     begin.record(self.stream)
-                self._copy(table, layer, start, end, host)
+                self._copy(table, layer, start, end, host, host_scales)
                 complete = torch.cuda.Event(enable_timing=bool(self.timing_path))
                 complete.record(self.stream)
             self.events[index] = (layer, start, end, begin, complete)
         else:
-            self._copy(table, layer, start, end, host)
+            self._copy(table, layer, start, end, host, host_scales)
             self._record("pd_h2d_done", layer=layer, start=start, end=end)
         self.frames += 1
         self.payload_bytes += size
         self.next_slot = 1 - index
 
-    def _copy(self, table, layer, start, end, host):
+    def _copy(self, table, layer, start, end, host, host_scales):
         for pos, stop, physical in contiguous_regions(
                 table, start, end, self.cache.shape[3], end - start):
             for kv in range(2):
                 self.cache[kv, layer].flatten(0, 1)[physical:physical + stop - pos].copy_(
                     host[kv, pos - start:stop - start], non_blocking=self.cuda)
+                if self.scales is not None:
+                    width = self.scale_token_bytes // 2
+                    offset = (kv * (end - start) + pos - start) * width
+                    self.scales[kv, layer].flatten(0, 1)[physical:physical + stop - pos].view(
+                        torch.uint8).reshape(-1).copy_(
+                            host_scales[offset:offset + (stop - pos) * width], non_blocking=self.cuda)
 
     def finish(self):
         for index in range(2):

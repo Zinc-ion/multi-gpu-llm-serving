@@ -10,7 +10,7 @@ import torch
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.pd.kv import export_kv, restore_kv
 from myvllm.pd.pipeline import LayerReceiver
-from myvllm.pd.protocol import finite_number, make_early_metadata, make_metadata, model_spec, payload_nbytes, tensor_dtype, validate_early_metadata, validate_metadata
+from myvllm.pd.protocol import bulk_version, finite_number, make_early_metadata, make_metadata, model_spec, payload_nbytes, tensor_dtype, token_byte_counts, validate_early_metadata, validate_metadata
 from myvllm.sampling_parameters import SamplingParams
 
 
@@ -306,9 +306,10 @@ class PrefillCore(_Core):
         if handle._metadata is None:
             handle._metadata = make_metadata(handle, self.spec, self.sampling_seed)
         try:
+            scales = self.engine.model_runner.kv_cache_scales if "kv_cache" in self.spec else None
             payload = export_kv(self.engine.model_runner.kv_cache,
                                 handle.sequence.block_table,
-                                handle.sequence.num_cached_tokens, self.spec)
+                                handle.sequence.num_cached_tokens, self.spec, scales)
         except Exception:
             self._cancel(handle, "failed")
             raise
@@ -452,6 +453,17 @@ class DecodeCore(_Core):
         seq = Sequence(metadata["token_ids"], self.manager.block_size,
                        SamplingParams(**metadata["sampling"]))
         self.manager.allocate(seq)
+        if "kv_cache" in self.spec and seq.num_prompt_tokens % self.manager.block_size:
+            try:
+                block = seq.block_table[-1]
+                offset = seq.num_prompt_tokens % self.manager.block_size
+                self.engine.model_runner.kv_cache[:, :, block, offset:].zero_()
+                self.engine.model_runner.kv_cache_scales[:, :, block, offset:].fill_(1)
+            except Exception:
+                self.manager.deallocate(seq)
+                self._release(handle)
+                handle.state = "failed"
+                raise
         handle.sequence = seq
         handle._early_metadata = deepcopy(metadata)
         handle.state = "early_reserved"
@@ -463,8 +475,9 @@ class DecodeCore(_Core):
             raise StateError("D handle cannot attach another data channel")
         identity = {"session_id": handle.session_id, "transaction_id": handle.transaction_id,
                     "request_id": handle.request_id, "role": "decode"}
+        scales = self.engine.model_runner.kv_cache_scales if "kv_cache" in self.spec else None
         handle._receiver = LayerReceiver(self.engine.model_runner.kv_cache, frame_bytes,
-                                         identity, timing_path)
+                                         identity, timing_path, scales)
         return handle._receiver
 
     def restore_region(self, handle, layer, start, end, payload):
@@ -481,7 +494,8 @@ class DecodeCore(_Core):
                     or type(start) is not int or type(end) is not int
                     or start != handle._next_offset or not start < end <= prompt_length):
                 raise ValueError("Invalid or duplicate KV region")
-            nbytes = 2 * (end - start) * arch["num_kv_heads"] * arch["head_dim"] * tensor_dtype(self.spec).itemsize
+            data_per_token, scale_per_token = token_byte_counts(self.spec)
+            nbytes = (end - start) * (data_per_token + scale_per_token)
             if type(payload) is not bytes or len(payload) != nbytes:
                 raise ValueError("Invalid KV region byte count")
             if handle._receiver is not None:
@@ -491,8 +505,15 @@ class DecodeCore(_Core):
                 if layer + 1 == arch["num_layers"] and end == prompt_length:
                     handle._receiver.finish()
             else:
-                host = torch.frombuffer(bytearray(payload), dtype=tensor_dtype(self.spec)).reshape(
+                raw = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+                data_nbytes = (end - start) * data_per_token
+                host = raw[:data_nbytes].view(tensor_dtype(self.spec)).reshape(
                     2, end - start, arch["num_kv_heads"], arch["head_dim"])
+                host_scales = None
+                if scale_per_token:
+                    host_scales = torch.empty((2, end - start, arch["num_kv_heads"]),
+                                              dtype=torch.float32, device="cpu")
+                    host_scales.view(torch.uint8).reshape(-1).copy_(raw[data_nbytes:])
                 cache = self.engine.model_runner.kv_cache
                 block_size = self.manager.block_size
                 pos = start
@@ -501,6 +522,9 @@ class DecodeCore(_Core):
                     offset = pos % block_size
                     count = min(end - pos, block_size - offset)
                     cache[:, layer, block, offset:offset + count].copy_(host[:, pos - start:pos - start + count])
+                    if host_scales is not None:
+                        self.engine.model_runner.kv_cache_scales[:, layer, block, offset:offset + count].copy_(
+                            host_scales[:, pos - start:pos - start + count])
                     pos += count
         except Exception:
             self._cancel(handle, "failed")
@@ -527,7 +551,7 @@ class DecodeCore(_Core):
             validate_metadata(metadata, handle.session_id, self.spec,
                               self.scheduler.max_model_length)
             expected = deepcopy(handle._early_metadata)
-            expected["version"] = 2
+            expected["version"] = bulk_version(self.spec)
             expected["token_ids"].append(metadata["token_ids"][-1])
             expected["cached_tokens"] = expected["next_position"] = expected["prompt_length"]
             expected["completion_count"] = 1
@@ -567,8 +591,9 @@ class DecodeCore(_Core):
         seq.append_token(metadata["token_ids"][-1])
         try:
             self.manager.allocate(seq)
+            scales = self.engine.model_runner.kv_cache_scales if "kv_cache" in self.spec else None
             restore_kv(self.engine.model_runner.kv_cache, seq.block_table, payload,
-                       self.spec, metadata["cached_tokens"])
+                       self.spec, metadata["cached_tokens"], scales)
         except Exception:
             self.manager.deallocate(seq)
             self._cancel(handle, "failed")

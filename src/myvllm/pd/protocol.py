@@ -5,7 +5,7 @@ import sys
 
 import torch
 
-from myvllm.config import resolve_dtype
+from myvllm.config import resolve_dtype, resolve_kv_cache_dtype
 
 
 _ARCHITECTURE_FIELDS = (
@@ -20,6 +20,16 @@ _DTYPE_NAMES = {
     torch.bfloat16: "bfloat16",
 }
 _DTYPES = {name: dtype for dtype, name in _DTYPE_NAMES.items()}
+_DTYPES["float8_e4m3fn"] = torch.float8_e4m3fn
+
+
+def cache_spec(config):
+    dtype = resolve_kv_cache_dtype(config.get("kv_cache_dtype", "auto"),
+                                   resolve_dtype(config.get("dtype", "float32")))
+    if dtype == torch.float8_e4m3fn:
+        return {"dtype": "float8_e4m3fn", "scale_dtype": "float32",
+                "scale_granularity": "token_head"}
+    return None
 
 
 def finite_number(value):
@@ -39,7 +49,9 @@ def model_spec(engine):
         raise ValueError("PD core requires an explicit model_revision")
     cache = engine.model_runner.kv_cache
     dtype = resolve_dtype(config.get("dtype", "float32"))
-    if dtype not in _DTYPE_NAMES or cache.dtype != dtype:
+    cache_format = cache_spec(config)
+    expected_dtype = torch.float8_e4m3fn if cache_format is not None else dtype
+    if dtype not in _DTYPE_NAMES or cache.dtype != expected_dtype:
         raise ValueError("KV cache dtype does not match the configured PD dtype")
     block_size = config["block_size"]
     heads = config["num_kv_heads"]
@@ -48,7 +60,12 @@ def model_spec(engine):
              block_size, heads, head_dim)
     if tuple(cache.shape) != shape or block_size != engine.scheduler.block_manager.block_size:
         raise ValueError("KV cache shape does not match the scheduler and model")
-    return {
+    if cache_format is not None:
+        scales = engine.model_runner.kv_cache_scales
+        if (scales.dtype != torch.float32 or tuple(scales.shape) != shape[:-1]
+                or scales.device != cache.device):
+            raise ValueError("KV cache scales do not match the FP8 cache")
+    spec = {
         "name": config["model_name_or_path"],
         "revision": config["model_revision"],
         "tokenizer_revision": config.get("tokenizer_revision"),
@@ -57,6 +74,9 @@ def model_spec(engine):
         "architecture": {key: config[key] for key in _ARCHITECTURE_FIELDS if key in config},
         "eos": sorted(engine.scheduler.eos),
     }
+    if cache_format is not None:
+        spec["kv_cache"] = cache_format
+    return spec
 
 
 def payload_shape(spec, cached_tokens):
@@ -67,19 +87,64 @@ def payload_shape(spec, cached_tokens):
 
 
 def payload_nbytes(spec, cached_tokens):
-    dtype = _DTYPES[spec["dtype"]]
-    return math.prod(payload_shape(spec, cached_tokens)) * dtype.itemsize
+    data, scales = payload_byte_counts(spec, cached_tokens)
+    return data + scales
+
+
+def payload_byte_counts(spec, cached_tokens):
+    shape = payload_shape(spec, cached_tokens)
+    data = math.prod(shape) * tensor_dtype(spec).itemsize
+    scales = math.prod(shape[:-1]) * torch.float32.itemsize if "kv_cache" in spec else 0
+    return data, scales
+
+
+def token_byte_counts(spec):
+    arch = spec["architecture"]
+    return cache_token_byte_counts(arch["num_kv_heads"], arch["head_dim"],
+                                   tensor_dtype(spec), "kv_cache" in spec)
+
+
+def cache_token_byte_counts(heads, head_dim, dtype, has_scales):
+    heads *= 2
+    data = heads * head_dim * dtype.itemsize
+    scales = heads * torch.float32.itemsize if has_scales else 0
+    return data, scales
+
+
+def bulk_version(spec):
+    return 4 if "kv_cache" in spec else 2
 
 
 def tensor_dtype(spec):
-    return _DTYPES[spec["dtype"]]
+    return _DTYPES[spec["kv_cache"]["dtype"] if "kv_cache" in spec else spec["dtype"]]
+
+
+def kv_descriptor(spec, cached_tokens):
+    shape = payload_shape(spec, cached_tokens)
+    data, scales = payload_byte_counts(spec, cached_tokens)
+    descriptor = {
+        "shape": shape,
+        "dtype": str(tensor_dtype(spec)).removeprefix("torch."),
+        "byte_order": sys.byteorder,
+        "nbytes": data + scales,
+    }
+    if "kv_cache" in spec:
+        descriptor.update(data_nbytes=data, scale_shape=shape[:-1],
+                          scale_dtype="float32", scale_nbytes=scales)
+    return descriptor
+
+
+def descriptor_components(kv):
+    if "scale_nbytes" not in kv:
+        return {}
+    return {"data_bytes": kv["data_nbytes"], "scale_bytes": kv["scale_nbytes"]}
 
 
 def make_metadata(handle, spec, sampling_seed):
     seq = handle.sequence
     cached = seq.num_cached_tokens
     return {
-        "version": 2,
+        "version": bulk_version(spec),
         "session_id": handle.session_id,
         "transaction_id": handle.transaction_id,
         "request_id": handle.request_id,
@@ -97,21 +162,15 @@ def make_metadata(handle, spec, sampling_seed):
             "max_model_length": seq.max_model_length,
         },
         "model": spec,
-        "kv": {
-            "shape": payload_shape(spec, cached),
-            "dtype": spec["dtype"],
-            "byte_order": sys.byteorder,
-            "nbytes": payload_nbytes(spec, cached),
-        },
+        "kv": kv_descriptor(spec, cached),
     }
 
 
 def make_early_metadata(handle, spec, sampling_seed):
     metadata = make_metadata(handle, spec, sampling_seed)
     prompt_length = metadata["prompt_length"]
-    metadata["version"] = 3
-    metadata["kv"]["shape"] = payload_shape(spec, prompt_length)
-    metadata["kv"]["nbytes"] = payload_nbytes(spec, prompt_length)
+    metadata["version"] = bulk_version(spec) + 1
+    metadata["kv"] = kv_descriptor(spec, prompt_length)
     return metadata
 
 
@@ -137,7 +196,7 @@ def _validate_metadata(metadata, session_id, spec, max_model_length, early):
     }
     if not isinstance(metadata, dict) or set(metadata) != fields:
         raise ValueError("Invalid PD metadata fields")
-    if type(metadata["version"]) is not int or metadata["version"] != (3 if early else 2):
+    if type(metadata["version"]) is not int or metadata["version"] != bulk_version(spec) + int(early):
         raise ValueError("Unsupported PD protocol version")
     if metadata["session_id"] != session_id:
         raise ValueError("PD session does not match this handle")
@@ -184,17 +243,9 @@ def _validate_metadata(metadata, session_id, spec, max_model_length, early):
         raise ValueError("Invalid token history")
     if not early and not sampling["ignore_eos"] and tokens[-1] in spec["eos"]:
         raise ValueError("Terminal EOS cannot be handed off")
-    expected = {
-        "shape": payload_shape(spec, prompt_length),
-        "dtype": spec["dtype"],
-        "byte_order": sys.byteorder,
-        "nbytes": payload_nbytes(spec, prompt_length),
-    }
+    expected = kv_descriptor(spec, prompt_length)
     kv = metadata["kv"]
-    if (not isinstance(kv, dict) or set(kv) != set(expected)
-            or not isinstance(kv["shape"], list)
-            or any(type(dim) is not int for dim in kv["shape"])
-            or type(kv["nbytes"]) is not int or kv != expected):
+    if not _matches_model(kv, expected):
         raise ValueError("Invalid KV shape, dtype or byte count")
 
 

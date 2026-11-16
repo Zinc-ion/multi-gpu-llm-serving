@@ -7,10 +7,8 @@ import pytest
 import torch
 
 from fp8_helpers import quantize_reference
+from pd_fp8_helpers import fp8_engine
 from myvllm.config import resolve_kv_cache_dtype
-from myvllm.engine.llm_engine import LLMEngine
-from myvllm.engine.model_runner import ModelRunner
-from myvllm.engine.scheduler import Scheduler
 from myvllm.layers.attention import store_kvcache
 from myvllm.pd.protocol import model_spec
 
@@ -24,14 +22,11 @@ def test_cache_dtype_resolution_is_independent_of_model_dtype(model_dtype):
             resolve_kv_cache_dtype(value, model_dtype)
 
 
-def test_pd_rejects_fp8_storage_before_transport():
-    engine = LLMEngine.__new__(LLMEngine)
-    engine.config = {"world_size": 1, "model_revision": "a" * 40, "dtype": "bfloat16"}
-    engine.model_runner = ModelRunner.__new__(ModelRunner)
-    engine.model_runner.kv_cache = torch.zeros(2, 1, 4, 4, 1, 16, dtype=torch.float8_e4m3fn)
-    engine.scheduler = Scheduler(1, 8, 4, 4, [0], 8)
-    with pytest.raises(ValueError, match="KV cache dtype"):
-        model_spec(engine)
+def test_pd_model_spec_describes_fp8_storage_separately():
+    spec = model_spec(fp8_engine({"dtype": "bfloat16"}))
+    assert spec["dtype"] == "bfloat16"
+    assert spec["kv_cache"] == {
+        "dtype": "float8_e4m3fn", "scale_dtype": "float32", "scale_granularity": "token_head"}
 
 
 def test_capacity_report_includes_scale_bytes(tmp_path):

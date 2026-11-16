@@ -6,6 +6,9 @@ from pathlib import Path
 import re
 import shlex
 
+from myvllm.config import resolve_dtype, resolve_kv_cache_dtype
+from myvllm.pd.protocol import cache_token_byte_counts
+
 
 ROOT = Path("/Data2/zincion/ai-infra")
 TOPOLOGIES = {
@@ -43,7 +46,11 @@ def generate(args):
     if bool(args.pipeline_min_tokens) != bool(args.pipeline_frame_bytes):
         raise ValueError("pipeline requires both min-tokens and frame-bytes")
     if args.pipeline_frame_bytes:
-        token_bytes = 2 * config["num_kv_heads"] * config["head_dim"] * 2
+        cache_dtype = resolve_kv_cache_dtype(config.get("kv_cache_dtype", "auto"),
+                                              resolve_dtype(config["dtype"]))
+        token_bytes = sum(cache_token_byte_counts(
+            config["num_kv_heads"], config["head_dim"], cache_dtype,
+            config.get("kv_cache_dtype", "auto") != "auto"))
         if not token_bytes <= args.pipeline_frame_bytes <= PAYLOAD_LIMIT:
             raise ValueError("pipeline frame must fit one KV token and the payload limit")
         if not config.get("enforce_eager") or config.get("enable_chunked_prefill", False):

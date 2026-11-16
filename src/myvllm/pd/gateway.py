@@ -16,7 +16,7 @@ from myvllm.config import load_config, resolve_dtype
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.pd.client import PDClient, PDRemoteError, PDTimingError
 from myvllm.pd.http import GatewayError
-from myvllm.pd.protocol import _ARCHITECTURE_FIELDS
+from myvllm.pd.protocol import _ARCHITECTURE_FIELDS, cache_spec, token_byte_counts
 from myvllm.pd.wire import ProtocolError
 from myvllm.utils.timing import write_record
 
@@ -33,7 +33,7 @@ def _endpoint(value):
 
 
 def _model_spec(config):
-    return {
+    spec = {
         "name": config["model_name_or_path"],
         "revision": config["model_revision"],
         "tokenizer_revision": config["tokenizer_revision"],
@@ -42,6 +42,10 @@ def _model_spec(config):
         "architecture": {key: config[key] for key in _ARCHITECTURE_FIELDS if key in config},
         "eos": sorted(set(config["eos"])),
     }
+    cache_format = cache_spec(config)
+    if cache_format is not None:
+        spec["kv_cache"] = cache_format
+    return spec
 
 
 def _request_error(exc, phase):
@@ -273,10 +277,16 @@ class PDGateway:
             if not terminal:
                 phase = "describe"
                 metadata = await prefill.describe()
-                arch = metadata["model"]["architecture"]
-                nbytes = (2 * arch["num_layers"] * metadata["prompt_length"]
-                          * arch["num_kv_heads"] * arch["head_dim"]
-                          * resolve_dtype(metadata["model"]["dtype"]).itemsize) if pipeline else metadata["kv"]["nbytes"]
+                if pipeline:
+                    data_per_token, scale_per_token = token_byte_counts(metadata["model"])
+                    tokens = metadata["model"]["architecture"]["num_layers"] * metadata["prompt_length"]
+                    data_bytes, scale_bytes = tokens * data_per_token, tokens * scale_per_token
+                    nbytes = data_bytes + scale_bytes
+                else:
+                    nbytes = metadata["kv"]["nbytes"]
+                    data_bytes = metadata["kv"].get("data_nbytes", nbytes)
+                    scale_bytes = metadata["kv"].get("scale_nbytes", 0)
+                components = {"data_bytes": data_bytes, "scale_bytes": scale_bytes} if scale_bytes else {}
                 if not pipeline:
                     if nbytes > self.max_payload_bytes or self.staging_bytes + self.max_payload_bytes > self.max_staging_bytes:
                         raise GatewayError(503, "PD gateway transfer capacity exhausted")
@@ -284,11 +294,11 @@ class PDGateway:
                     staging = True
                 phase = "handoff"
                 handoff_start = time.perf_counter()
-                self._record(entry, "pd_gateway_handoff_start", payload_bytes=nbytes)
+                self._record(entry, "pd_gateway_handoff_start", payload_bytes=nbytes, **components)
                 handoff = PDClient.handoff_pipeline if pipeline else PDClient.handoff
                 await handoff(prefill, decode, metadata, timing_path=self.config.get("timing_path"))
                 self._record(entry, "pd_gateway_handoff_done", payload_bytes=nbytes,
-                             handoff_ms=(time.perf_counter() - handoff_start) * 1000)
+                             handoff_ms=(time.perf_counter() - handoff_start) * 1000, **components)
                 if staging:
                     self.staging_bytes -= self.max_payload_bytes
                     staging = False

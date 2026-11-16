@@ -12,6 +12,9 @@ def compare_runs(baseline, candidate):
                   "tokenizer_revision", "dtype", "eos"):
         if baseline["metadata"]["config"][field] != candidate["metadata"]["config"][field]:
             raise ValueError(f"Different {field}")
+    if (baseline["metadata"]["config"].get("kv_cache_dtype", "auto")
+            != candidate["metadata"]["config"].get("kv_cache_dtype", "auto")):
+        raise ValueError("Different kv_cache_dtype")
     if [case["name"] for case in baseline["cases"]] != [case["name"] for case in candidate["cases"]]:
         raise ValueError("Runs must contain the same ordered prompt cases")
     rows = []

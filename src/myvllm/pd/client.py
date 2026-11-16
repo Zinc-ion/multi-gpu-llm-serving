@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import asdict
 import time
 
+from myvllm.pd.protocol import descriptor_components
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError, close_writer, read_body, read_header, write_frame
 from myvllm.utils.timing import write_record
 
@@ -207,7 +208,7 @@ class PDClient:
                     "event": "pd_transfer_done", "request_id": metadata["request_id"],
                     "session_id": metadata["session_id"],
                     "transaction_id": metadata["transaction_id"],
-                    "payload_bytes": nbytes, "transfer_ms": elapsed,
+                    "payload_bytes": nbytes, "transfer_ms": elapsed, **descriptor_components(metadata["kv"]),
                 })
             except OSError as exc:
                 raise PDTimingError(*exc.args) from exc

@@ -123,6 +123,8 @@ cd "$REPO"
 
 默认是两任务相同的 `temperature=0`、`top_p=1`、`max_tokens=1024`，用于在本服务支持的采样契约下减少对比中的随机性；这不等同于数据集或模型推荐的完整采样方案，结果不能直接当成外部排行榜口径。NIAH 使用长度 1024、7680、14336 与深度 0%、50%、100% 的英中网格。长度上限加 1024 token 的 chat 预算和生成预算严格小于配置的 `max_model_length=17408`；准备后的 `materialize.sh` 还会用服务环境的 tokenizer 和实际 `tokenize_request` 对每个原生样本应用 chat template，逐条检查实际 prompt 加回复预算。输入不截断；命中 `max_tokens` 的回复数量会在比较结果中单独记录。
 
+如需分别设置回复上限，可在准备命令中添加 `--math-max-tokens 8192 --needle-max-tokens 1024`；未指定的任务继承 `--max-tokens`。新计划记录各任务的实际上限；使用独立参数时，版本 2 计划生成每个任务独立的 evalscope `TaskConfig` 和 `baseline/<task>`、`candidate/<task>` 工作目录，并用各自上限检查每条实际输入；原生 prediction 的输入 token 数须与物化结果一致，输出 token 数不得超过该任务上限。物化和执行各任务时均使用计划中的同一个 seed，比较结果按任务记录输出 token 总数和停止原因。仍须先物化、冻结 baseline，再执行 candidate；设置预算本身不代表质量门槛或实验总预算已获批准。省略两个独立参数时保留原版本 1 计划及目录；旧计划缺少任务上限字段时使用其共享 `max_tokens`，已冻结的旧计划继续使用准备时哈希固定的原工具核验。
+
 NIAH 明确使用 `judge_strategy=rule`，即 evalscope 的归一化精确匹配；这不同于该数据集默认的 LLM judge，两种 KV 格式始终使用同一规则，不把待测模型作为 judge。math 使用原生 `mean_acc`。两边的 `use_cache` 均为 null、prediction/review/work_dir 完全分开；evalscope 的 `use_cache` 会恢复预测和 review，不能指向另一格式的结果。固定源码中 `generation_config.retries` 是总尝试次数，因此设为 1；SDK 的 `model_args.max_retries=0` 禁止 SDK 重试。配置也显式包含 `generation_config.max_retries=0`，但源码只读取 `retries`，不能依靠前者控制外层重试。不发送请求级 seed；数据生成 seed 位于 TaskConfig。
 
 每次准备固定一个新的 run ID，baseline 和 candidate 使用各自的服务模型别名作为 HTTP `model`；evalscope 的 `model_id` 仍为 `Qwen3-14B`，用于原生文件和报告。项目服务严格校验请求模型，因此 baseline 继续占用端口且 candidate 启动失败时，candidate 别名会被 baseline 拒绝。比较器同时核对原生 prediction 的模型和 HTTP 响应模型；这不能证明任意忽略请求模型或伪造响应的外部服务实际使用了哪个配置。

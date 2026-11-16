@@ -33,12 +33,32 @@ def save_new(path, value):
         handle.write(json_text(value))
 
 
+def task_budget(plan, task):
+    return plan['max_tokens'] if plan['version'] == 1 else plan['task_max_tokens'][task]
+
+
+def eval_config_path(plan, root, variant, task=None):
+    suffix = '' if plan['version'] == 1 else f'-{task}'
+    return root / f'eval-{variant}{suffix}.json'
+
+
 def load_plan(path):
     path = Path(path).resolve()
     plan = load_json(path)
     root = path.parent
-    if plan['version'] != 1 or plan['output_dir'] != str(root):
+    if plan['version'] not in (1, 2) or plan['output_dir'] != str(root):
         raise ValueError('plan location or version does not match')
+    if (plan['tasks'] != ['math_500', 'needle_haystack']
+            or type(plan['max_tokens']) is not int or plan['max_tokens'] < 1):
+        raise ValueError('invalid planned tasks or shared output budget')
+    if 'task_max_tokens' in plan:
+        if (set(plan['task_max_tokens']) != set(plan['tasks'])
+                or any(type(value) is not int or value < 1 for value in plan['task_max_tokens'].values())):
+            raise ValueError('invalid task output budgets')
+        if plan['version'] == 1 and any(value != plan['max_tokens'] for value in plan['task_max_tokens'].values()):
+            raise ValueError('version 1 task output budgets must match the shared budget')
+    elif plan['version'] == 2:
+        raise ValueError('version 2 requires task output budgets')
     repo = Path(plan['repo_dir'])
     if Path(__file__).resolve() != repo / 'tools/compare_fp8_eval.py' or tool_hashes(repo) != plan['tool_sha256']:
         raise ValueError('quality tools differ from the prepared versions')
@@ -50,24 +70,46 @@ def load_plan(path):
     servers = [load_json(root / f'server-{variant}.json') for variant in ('baseline', 'candidate')]
     if [server.pop('kv_cache_dtype') for server in servers] != ['auto', 'float8_e4m3fn'] or servers[0] != servers[1]:
         raise ValueError('server configurations must differ only in KV format')
-    tasks = [load_json(root / f'eval-{variant}.json') for variant in ('baseline', 'candidate')]
-    work_dirs = [task.pop('work_dir') for task in tasks]
-    aliases = [task.pop('model') for task in tasks]
     run_id = plan['run_id']
     if (not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id)
             or plan['api_model_aliases'] != {
-                variant: f'Qwen3-14B-{run_id}-{variant}' for variant in ('baseline', 'candidate')}
-            or aliases != [plan['api_model_aliases'][variant] for variant in ('baseline', 'candidate')]
-            or work_dirs != [str(root / 'baseline'), str(root / 'candidate')] or tasks[0] != tasks[1]):
-        raise ValueError('eval configurations must differ only in work directory and planned model alias')
-    task = tasks[0]
-    gen = task['generation_config']
-    if (task['model_id'] != 'Qwen3-14B' or task['datasets'] != plan['tasks'] or task['use_cache'] is not None
-            or task['ignore_errors'] or task['analysis_report'] or task['judge_strategy'] != 'rule'
-            or not task['no_timestamp'] or task['model_args']['max_retries'] != 0
-            or gen != {'stream': False, 'temperature': 0, 'top_p': 1, 'max_tokens': plan['max_tokens'],
-                       'timeout': gen['timeout'], 'retries': 1, 'max_retries': 0}):
-        raise ValueError('eval configuration violates the fixed quality contract')
+                variant: f'Qwen3-14B-{run_id}-{variant}' for variant in ('baseline', 'candidate')}):
+        raise ValueError('invalid planned model aliases')
+    common_config = None
+    groups = [plan['tasks']] if plan['version'] == 1 else [[name] for name in plan['tasks']]
+    for group in groups:
+        paths = [eval_config_path(plan, root, variant, group[0]) for variant in ('baseline', 'candidate')]
+        if any(path.name not in plan['files_sha256'] for path in paths):
+            raise ValueError('eval configuration is not frozen in the plan')
+        tasks = [load_json(path) for path in paths]
+        work_dirs = [task.pop('work_dir') for task in tasks]
+        aliases = [task.pop('model') for task in tasks]
+        expected_dirs = [root / variant for variant in ('baseline', 'candidate')]
+        if plan['version'] == 2:
+            expected_dirs = [directory / group[0] for directory in expected_dirs]
+        if (aliases != [plan['api_model_aliases'][variant] for variant in ('baseline', 'candidate')]
+                or work_dirs != list(map(str, expected_dirs)) or tasks[0] != tasks[1]):
+            raise ValueError('eval configurations must differ only in work directory and planned model alias')
+        task = tasks[0]
+        gen = task['generation_config']
+        if (task['model_id'] != 'Qwen3-14B' or task['datasets'] != group or task['use_cache'] is not None
+                or task['ignore_errors'] or task['analysis_report'] or task['judge_strategy'] != 'rule'
+                or not task['no_timestamp'] or task['model_args']['max_retries'] != 0
+                or gen != {'stream': False, 'temperature': 0, 'top_p': 1,
+                           'max_tokens': task_budget(plan, group[0]),
+                           'timeout': gen['timeout'], 'retries': 1, 'max_retries': 0}):
+            raise ValueError('eval configuration violates the fixed quality contract')
+        if plan['version'] == 2:
+            if set(task['dataset_args']) != set(group):
+                raise ValueError('eval configuration contains another task dataset')
+            common = dict(task)
+            common.pop('datasets')
+            common.pop('dataset_args')
+            common['generation_config'] = dict(gen)
+            common['generation_config'].pop('max_tokens')
+            if common_config is not None and common != common_config:
+                raise ValueError('task configurations differ beyond dataset and output budget')
+            common_config = common
     assets = load_json(root / 'assets.json')
     if (plan['model_revision_status'] != 'UNVERIFIED_USER_DECLARATION'
             or assets['model']['revision_status'] != plan['model_revision_status']
@@ -124,7 +166,7 @@ def validate_cases(plan, rows):
                 or any(set(message) != {'role', 'content'} or message['role'] not in ('system', 'user', 'assistant')
                        or not isinstance(message['content'], str) for message in row['messages'])):
             raise ValueError(f'invalid materialized chat messages: {key}')
-        if row['prompt_tokens'] + plan['max_tokens'] >= plan['max_model_length']:
+        if row['prompt_tokens'] + task_budget(plan, row['task']) >= plan['max_model_length']:
             raise ValueError(f'actual prompt and reply exceed the strict context budget: {key}')
     if sum(math_subsets.values()) != plan['math_count'] or not all(math_subsets.values()):
         raise ValueError(f'incomplete math_500: {math_subsets}')
@@ -150,10 +192,14 @@ def materialize(plan, root, plan_sha):
     from evalscope.utils.model_utils import seed_everything
     if version('evalscope') != '1.5.1':
         raise ValueError('materialization requires evalscope==1.5.1')
-    config = TaskConfig.from_json(str(root / 'eval-baseline.json'))
-    seed_everything(config.seed)
+    if plan['version'] == 1:
+        config = TaskConfig.from_json(str(eval_config_path(plan, root, 'baseline')))
+        seed_everything(config.seed)
     rows = []
     for task in plan['tasks']:
+        if plan['version'] == 2:
+            config = TaskConfig.from_json(str(eval_config_path(plan, root, 'baseline', task)))
+            seed_everything(config.seed)
         benchmark = get_benchmark(task, config)
         for subset, samples in benchmark.load_dataset().items():
             for sample in samples:
@@ -201,7 +247,7 @@ print(json.dumps([len(tokenize_request(tokenizer, {'messages': item}, True))
     return counts
 
 
-def check_server(root, variant):
+def check_server(plan, root, variant):
     path = root / f'server-{variant}.log'
     matches = []
     for line in path.read_text(encoding='utf-8').splitlines():
@@ -217,7 +263,7 @@ def check_server(root, variant):
     if len(matches) != 1 or matches[0]['config'] != load_json(root / f'server-{variant}.json'):
         raise ValueError(f'{variant} server startup configuration is missing or mismatched')
     arguments = matches[0]['arguments']
-    task = load_json(root / f'eval-{variant}.json')
+    task = load_json(eval_config_path(plan, root, variant, plan['tasks'][0]))
     url = urlparse(task['api_url'])
     if (arguments['config'] != str(root / f'server-{variant}.json')
             or arguments['served_model_name'] != task['model']
@@ -290,14 +336,16 @@ def check_metric(metric, by_subset):
 
 
 def read_run(plan, root, variant, cases):
-    work = root / variant
     alias = plan['api_model_aliases'][variant]
     expected = {sample_key(row): row for row in cases}
     grouped = {task: {} for task in plan['tasks']}
     native_hashes = {}
     terminations = {}
+    task_terminations = {task: {} for task in plan['tasks']}
+    task_output_tokens = {task: 0 for task in plan['tasks']}
     actual_keys = set()
     for task in plan['tasks']:
+        work = root / variant if plan['version'] == 1 else root / variant / task
         subsets = plan['math_subsets'] if task == 'math_500' else plan['needle_subsets']
         for subset in subsets:
             review_path = work / 'reviews/Qwen3-14B' / f'{task}_{subset}.jsonl'
@@ -319,6 +367,18 @@ def read_run(plan, root, variant, cases):
                 reason = choices[0]['stop_reason']
                 if reason not in ('stop', 'max_tokens'):
                     raise ValueError(f'failed or unexpected prediction stop reason: {reason}')
+                if plan['version'] == 2:
+                    key = (task, subset, index)
+                    if key not in expected:
+                        raise ValueError(f'unexpected native prediction: {key}')
+                    usage = output['usage']
+                    if (type(usage['input_tokens']) is not int
+                            or usage['input_tokens'] != expected[key]['prompt_tokens']
+                            or type(usage['output_tokens']) is not int
+                            or not 0 <= usage['output_tokens'] <= task_budget(plan, task)):
+                        raise ValueError(f'native token usage disagrees with task budget or prompt: {key}')
+                    task_output_tokens[task] += usage['output_tokens']
+                    task_terminations[task][reason] = task_terminations[task].get(reason, 0) + 1
                 content = choices[0]['message']['content']
                 terminations[reason] = terminations.get(reason, 0) + 1
                 preds[index] = prediction_text(content)
@@ -359,6 +419,7 @@ def read_run(plan, root, variant, cases):
         raise ValueError('run is incomplete or has different native case identities')
     results = {}
     for task in plan['tasks']:
+        work = root / variant if plan['version'] == 1 else root / variant / task
         path = work / 'reports/Qwen3-14B' / f'{task}.json'
         report = load_json(path)
         native_hashes[str(path.relative_to(root))] = sha_file(path)
@@ -384,8 +445,12 @@ def read_run(plan, root, variant, cases):
         results[task] = {'accuracy': sum(all_scores) / len(all_scores), 'count': len(all_scores),
                          'correct': int(sum(all_scores)),
                          'cells': cell_results if task == 'needle_haystack' else {}}
-    return {'tasks': results, 'native_sha256': native_hashes, 'termination_counts': terminations,
-            'server_start_sha256': check_server(root, variant)}
+    result = {'tasks': results, 'native_sha256': native_hashes, 'termination_counts': terminations,
+              'server_start_sha256': check_server(plan, root, variant)}
+    if plan['version'] == 2:
+        result['termination_counts_by_task'] = task_terminations
+        result['output_tokens_by_task'] = task_output_tokens
+    return result
 
 
 def freeze(plan, root, plan_sha):
@@ -476,7 +541,7 @@ def main():
                 data = materialized(plan, root, plan_sha)
                 if args.stage == 'candidate':
                     frozen_baseline(plan, root, plan_sha, data)
-                check_server(root, args.stage)
+                check_server(plan, root, args.stage)
             print('quality preparation checks passed')
         elif compare(plan, root, plan_sha, args.output):
             raise SystemExit(1)

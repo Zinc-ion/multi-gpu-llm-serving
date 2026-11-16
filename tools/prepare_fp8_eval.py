@@ -103,7 +103,12 @@ def generate(args):
         raise ValueError('candidate-commit must be a full 40-character commit SHA')
     if not 0 <= args.seed < 2**32:
         raise ValueError('seed must be a 32-bit unsigned integer')
-    if (args.batch_size < 1 or args.max_tokens < 1 or args.timeout <= 0
+    task_max_tokens = {
+        'math_500': args.max_tokens if args.math_max_tokens is None else args.math_max_tokens,
+        'needle_haystack': args.max_tokens if args.needle_max_tokens is None else args.needle_max_tokens,
+    }
+    separate_tasks = args.math_max_tokens is not None or args.needle_max_tokens is not None
+    if (args.batch_size < 1 or args.max_tokens < 1 or min(task_max_tokens.values()) < 1 or args.timeout <= 0
             or not math.isfinite(args.timeout) or not math.isfinite(args.temperature)
             or args.temperature != 0):
         raise ValueError('batch-size, max-tokens and timeout must be positive; temperature must be 0')
@@ -131,8 +136,11 @@ def generate(args):
         raise ValueError('base config must be the pinned TP=1 Qwen3-14B BF16 configuration')
     if args.context_max <= 1024 or (args.context_max - 1024) % 2:
         raise ValueError('context-max must be greater than 1024 with an even difference')
-    if args.chat_budget < 1 or args.context_max + args.chat_budget + args.max_tokens >= config['max_model_length']:
+    if (args.chat_budget < 1
+            or args.context_max + args.chat_budget + task_max_tokens['needle_haystack'] >= config['max_model_length']):
         raise ValueError('context, chat budget and reply must fit strictly below max_model_length')
+    if task_max_tokens['math_500'] + 1 >= config['max_model_length']:
+        raise ValueError('math reply must leave room below max_model_length for a prompt')
     model, math_data, needle = map(lambda p: Path(p).resolve(),
                                    (args.model_path, args.math_data, args.needle_data))
     if (math_data / 'dataset_infos.json').exists():
@@ -209,7 +217,14 @@ def generate(args):
                                   'max_tokens': args.max_tokens, 'timeout': args.timeout,
                                   'retries': 1, 'max_retries': 0},
         }
-        files[f'eval-{variant}.json'] = json_text(task)
+        if separate_tasks:
+            for name, max_tokens in task_max_tokens.items():
+                task_config = dict(task, datasets=[name], dataset_args={name: task['dataset_args'][name]},
+                                   work_dir=str(output / variant / name),
+                                   generation_config=dict(task['generation_config'], max_tokens=max_tokens))
+                files[f'eval-{variant}-{name}.json'] = json_text(task_config)
+        else:
+            files[f'eval-{variant}.json'] = json_text(task)
         validate = command([client, comparison, 'check', '--plan', plan_path, '--stage', variant])
         server_cmd = [args.server_python, '-P', '-m', 'myvllm.server', '--config', output / f'server-{variant}.json',
                       '--served-model-name', aliases[variant], '--host', '127.0.0.1', '--port', url.port]
@@ -220,8 +235,13 @@ def generate(args):
         files[f'server-{variant}.sh'] = server
         run_code = ('from importlib.metadata import version; '
                     'assert version("evalscope") == "1.5.1"; '
-                    'from evalscope import run_task; '
-                    f'run_task(task_cfg={str(output / f"eval-{variant}.json")!r})')
+                    'from evalscope import run_task; ')
+        if separate_tasks:
+            paths = [str(output / f'eval-{variant}-{name}.json') for name in task_max_tokens]
+            run_code += ('from evalscope.config import TaskConfig; '
+                         f'run_task(task_cfg=[TaskConfig.from_json(path) for path in {paths!r}])')
+        else:
+            run_code += f'run_task(task_cfg={str(output / f"eval-{variant}.json")!r})'
         run = prefix + "export CUDA_VISIBLE_DEVICES='' PYTHONPATH=''\n" + validate + '\n'
         run += f'test ! -e {shlex.quote(str(output / variant))}\n'
         run += command([client, '-c', run_code]) + f' > {shlex.quote(str(output / f"eval-{variant}.log"))} 2>&1\n'
@@ -235,7 +255,7 @@ def generate(args):
     files['compare.sh'] = prefix + "export CUDA_VISIBLE_DEVICES='' PYTHONPATH=''\n" + command(
         [client, comparison, 'compare', '--plan', plan_path, '--output', output / 'comparison.json']) + '\n'
     plan = {
-        'version': 1, 'evalscope_version': '1.5.1', 'evalscope_commit': EVALSCOPE_COMMIT,
+        'version': 2 if separate_tasks else 1, 'evalscope_version': '1.5.1', 'evalscope_commit': EVALSCOPE_COMMIT,
         'candidate_commit': args.candidate_commit, 'output_dir': str(output), 'model_revision': MODEL_REVISION,
         'model_revision_status': 'UNVERIFIED_USER_DECLARATION', 'run_id': run_id, 'api_model_aliases': aliases,
         'repo_dir': str(repo), 'server_python': args.server_python,
@@ -245,7 +265,7 @@ def generate(args):
         'needle_subsets': ['english', 'chinese'],
         'context_lengths': [1024, (1024 + args.context_max) // 2, args.context_max],
         'depths': [0, 50, 100], 'max_model_length': config['max_model_length'],
-        'chat_budget': args.chat_budget, 'max_tokens': args.max_tokens,
+        'chat_budget': args.chat_budget, 'max_tokens': args.max_tokens, 'task_max_tokens': task_max_tokens,
         'accuracy_drop_gates': {'math_500': args.math_gate, 'needle_haystack': args.needle_gate},
         'files_sha256': {name: sha_text(text) for name, text in files.items()},
     }
@@ -265,6 +285,8 @@ def main():
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--temperature', type=float, default=0)
     parser.add_argument('--max-tokens', type=int, default=1024)
+    parser.add_argument('--math-max-tokens', type=int, help='Math output budget; defaults to --max-tokens')
+    parser.add_argument('--needle-max-tokens', type=int, help='Needle output budget; defaults to --max-tokens')
     parser.add_argument('--timeout', type=float, default=600)
     parser.add_argument('--context-max', type=int, default=14336)
     parser.add_argument('--chat-budget', type=int, default=1024)

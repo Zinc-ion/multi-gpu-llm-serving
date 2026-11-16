@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import os
 import socket
 import traceback
 from contextlib import ExitStack, contextmanager
@@ -62,14 +63,25 @@ def engine_process(config, connection):
     try:
         with cpu_backend(config), patch.object(engine_module, "worker_process", cpu_worker):
             engine = LLMEngine(config)
-            shm_name = engine.model_runner.shm.name if config["world_size"] > 1 else None
+            if config["world_size"] > 1:
+                slot = engine.model_runner.shm
+                stat = os.fstat(slot._fd)
+                shm_name = (stat.st_dev, stat.st_ino)
+            else:
+                slot = None
+                shm_name = None
             assert "_instance_resources" not in config
             store = getattr(engine, "_store", None)
             connection.send(("ready", store.port if store else None, shm_name))
             while (command := connection.recv()) == "ping":
+                if slot is not None:
+                    stat = os.fstat(slot._fd)
+                    assert (stat.st_dev, stat.st_ino) == shm_name
+                    assert all(process.is_alive() for process in engine.processes)
                 connection.send(("pong", dist.is_initialized()))
             engine.exit()
-            worker_exitcodes = [process.exitcode for process in engine.processes]
+            assert slot is None or (slot._fd is None and slot.buf is None)
+            worker_exitcodes = engine.worker_exitcodes
             if command == "exit":
                 engine.exit()
             connection.send(("closed", worker_exitcodes))
@@ -228,11 +240,11 @@ def test_engine_does_not_unlink_existing_shared_memory(engine_config):
         finally:
             attached.close()
         assert actual == b"keep"
-        assert response[2] != sentinel.name
+        stat = os.fstat(sentinel._fd)
+        assert response[2] != (stat.st_dev, stat.st_ino)
         connection.send("exit")
         assert receive(connection) == ("closed", [0])
-        with pytest.raises(FileNotFoundError):
-            SharedMemory(name=response[2])
+        assert isinstance(response[2], tuple)
         attached = SharedMemory(name=sentinel.name)
         attached.close()
     finally:
@@ -279,16 +291,10 @@ def test_multi_rank_instances_keep_separate_resources(engine_config):
         assert first_response[2] != second_response[2]
         first_conn.send("exit")
         assert receive(first_conn) == ("closed", [0])
-        with pytest.raises(FileNotFoundError):
-            SharedMemory(name=first_response[2])
-        attached = SharedMemory(name=second_response[2])
-        attached.close()
         second_conn.send("ping")
         assert receive(second_conn) == ("pong", True)
         second_conn.send("exit")
         assert receive(second_conn) == ("closed", [0])
-        with pytest.raises(FileNotFoundError):
-            SharedMemory(name=second_response[2])
     finally:
         stop_engine(first, first_conn)
         if second is not None:

@@ -168,7 +168,7 @@ def engine_process(config, output_dir):
             assert not engine.scheduler.block_manager.used_block_ids
             result = {"tokens": list(seq.token_ids), "prefixes": prefixes}
             engine.exit()
-            result["worker_exitcodes"] = [process.exitcode for process in engine.processes]
+            result["worker_exitcodes"] = engine.worker_exitcodes
             assert not dist.is_initialized()
         torch.save(result, Path(output_dir) / "engine.pt")
     finally:

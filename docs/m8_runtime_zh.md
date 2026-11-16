@@ -2,6 +2,14 @@
 
 本节描述 PD worker 和可选负载路由；TP2 PD 与 M8 阶段验收尚未完成。固定 P/D 路径与协议版本 2、3、4、5 继续可用；完整交接及部署约束见 [M5](m5_runtime_zh.md)、[M6](m6_runtime_zh.md) 和 [M7](m7_runtime_zh.md)。
 
+## TP 命令与生命周期
+
+多 rank 引擎在 Linux 上用匿名 `memfd` 和共享映射保存至多 1 MiB 的单槽命令描述符；KV 数据不经过该槽。spawn 时通过标准库的 FD reduction 为每个 rank 传递句柄，不创建命名共享内存或命名信号量。每个 worker 的单向 pipe 只承载空的 ready 和 consumed 通知，rank 0 等所有 rank 消费旧槽后才能重用；worker 完成反序列化后、进入可能的 collective 前发送 consumed。超长描述符在写槽前拒绝，命令 ACK 和退出等待均有期限。消费确认和有限关闭借鉴 vLLM 0.15.0 的 `f176443446f659dbab5315e056e605d8984fd976`：`distributed/device_communicators/shm_broadcast.py:439–563` 与 `v1/executor/multiproc_executor.py:376–405`。
+
+worker 在进入 `ModelRunner` 前监视 spawn 提供的 rank 0 sentinel，使用 Linux `F_SETOWN`、`F_SETSIG` 和 `O_ASYNC`，父进程退出时由内核发送 `SIGKILL`；注册后还检查 sentinel 是否已经就绪，覆盖注册前父进程已退出的窗口。此信号针对父进程存活，不依赖创建 worker 的线程持续存活。依据为 CPython 3.11.16 的 `multiprocessing/spawn.py` 和 `popen_spawn_posix.py` 中 bootstrap pipe 的生命周期，以及 Linux v6.12 `fs/pipe.c`、`fs/fcntl.c` 中 pipe 异步通知和信号配置机制；v6.12 源码不是对目标服务器内核版本的声明，信号发送失败时该版本源码还有回退到 `SIGIO` 的路径。纯 Python 监视线程无法在持有 GIL 的 C 调用中保证运行；本机真实 checkpoint FIFO 和 CPU/Gloo 已覆盖这里的初始化阻塞。监视从 worker 目标函数开始，不覆盖此前的 spawn bootstrap；如果额外 fork 的进程继承并保留 sentinel 写端，父进程死亡通知会延迟，内核不可杀 I/O 也不能保证有限时间退出。
+
+引擎退出时先记录实际 worker 的 PID 和退出码，再关闭已退出的 `Process`、pipe 与映射；结果分别保存在 `worker_pids` 和 `worker_exitcodes`。如果 worker 在 TERM/KILL 后仍存活，保留其进程对象和控制资源并报告清理错误。多次 `exit()` 安全；目标服务器 CUDA/NCCL、14B 及原 M4 BF16 TP2 严格 token 失败仍须独立验收。
+
 ## P 可选择 D
 
 P 的 `decode_endpoint=(host, port)` 仍是默认目标。可通过构造参数 `allowed_decode_endpoints` 显式指定非空、无重复的端点列表；默认目标必须包含在列表中。省略列表时只允许默认目标。端点必须是非空 host 和 1–65535 的整数 port；D 不接受这两个 P 配置。命令行示例：

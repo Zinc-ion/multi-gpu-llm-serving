@@ -1,31 +1,40 @@
 import math
 import json
 import torch
-import pickle
 import torch.distributed as dist
+from datetime import timedelta
 from pathlib import Path
+from multiprocessing import parent_process
 from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
 
 from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.input_batch import build_prefill_batch
+from myvllm.engine.ipc import read_command, write_command, wait_for_consumption
 from myvllm.utils import *
 from myvllm.config import resolve_dtype, resolve_kv_cache_dtype, seed_everything
 from myvllm.utils.timing import StepTimings
 
 class ModelRunner:
+    tp_command_timeout_s = 30
+    _worker_processes = ()
+
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
         self._standalone_store = None
+        self.shm = None
         had_process_group = dist.is_initialized()
         try:
             self._initialize(config, rank, event)
         except BaseException:
             try:
-                if not had_process_group and dist.is_initialized():
-                    dist.destroy_process_group()
+                try:
+                    if self.shm is not None:
+                        self.shm.close()
+                finally:
+                    if not had_process_group and dist.is_initialized():
+                        dist.destroy_process_group()
             finally:
                 self._standalone_store = None
             raise
@@ -39,6 +48,7 @@ class ModelRunner:
         # set distributed config
         self.block_size = config['block_size']
         self.world_size = config['world_size']
+        self.tp_command_timeout_s = config.get("tp_command_timeout_s", 30)
         self.enforce_eager = config.get('enforce_eager', False)
 
         self.rank = rank
@@ -47,17 +57,21 @@ class ModelRunner:
         self.kv_cache_dtype = resolve_kv_cache_dtype(config.get('kv_cache_dtype', 'auto'), model_dtype)
         torch.set_default_dtype(model_dtype)
         resources = config.get("_instance_resources")
+        distributed_timeout = (
+            {"timeout": timedelta(seconds=self.tp_command_timeout_s)}
+            if self.world_size > 1 else {}
+        )
         if resources is None:
             if self.world_size != 1:
                 raise ValueError("Multi-rank ModelRunner requires engine instance resources")
             self._standalone_store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
             # A failed process-group initialization may retain its store in the traceback.
             store = dist.TCPStore("127.0.0.1", self._standalone_store.port, is_master=False)
-            shm_name = None
+            shm = None
         else:
-            port, shm_name = resources
-            store = dist.TCPStore("127.0.0.1", port, is_master=False)
-        dist.init_process_group('nccl', store=store, world_size=config['world_size'], rank=rank)
+            port, shm = resources
+            store = dist.TCPStore("127.0.0.1", port, is_master=False, **distributed_timeout)
+        dist.init_process_group('nccl', store=store, world_size=config['world_size'], rank=rank, **distributed_timeout)
         torch.cuda.set_device(rank)
 
         # set model
@@ -136,13 +150,13 @@ class ModelRunner:
         if config.get("timing_path") and self.rank == 0:
             self.timings = StepTimings()
 
-        # IMPORTANT: Attach shared memory and barrier AFTER all model initialization
+        # IMPORTANT: Enable shared memory and barrier AFTER all model initialization
         # This ensures both ranks complete warmup/allocation before rank 1 enters its event loop
         if self.world_size > 1:
-            # Synchronize before attaching shared memory
+            # Synchronize before using shared memory
             dist.barrier()
-            self.shm = SharedMemory(name=shm_name)
-            # Wait until all ranks have attached before issuing calls.
+            self.shm = shm
+            # Wait until all ranks are ready before issuing calls.
             dist.barrier()
             # Don't call self.loop() here - let the spawning code handle it
             # Otherwise we'll be stuck in an infinite loop during __init__
@@ -150,23 +164,15 @@ class ModelRunner:
     # only use read when rank != 0
     def read_shm(self):
         assert self.world_size > 1 and self.rank != 0, "read_shm can only be called when world_size > 1 and rank != 0"
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[:4], 'little') # read length
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
-        return method_name, args
+        return read_command(self.shm, self.event, self.tp_command_timeout_s)
 
     # only use write when rank == 0
     def write_shm(self, method_name: str, args: tuple):
         assert self.world_size > 1 and self.rank == 0, "write_shm can only be called when world_size > 1 and rank == 0"
         # encode the length first
         # Flatten: (method_name, args) where args is a tuple -> (method_name, *args)
-        data = pickle.dumps((method_name, *args))
-        n = len(data)
-        self.shm.buf[:4] = n.to_bytes(4, 'little')
-        self.shm.buf[4:n+4] = data
-        for event in self.event:
-            event.set()
+        write_command(self.shm, self.event, method_name, args,
+                      self.tp_command_timeout_s, self._worker_processes)
 
     # close shared memory, destroy process group, delete graphs
     def exit(self):
@@ -196,7 +202,13 @@ class ModelRunner:
     def loop(self):
         assert self.world_size > 1 and self.rank != 0, "loop can only be called when world_size > 1 and rank != 0"
         while True:
-            method_name, args = self.read_shm()
+            try:
+                method_name, args = self.read_shm()
+            except TimeoutError:
+                parent = parent_process()
+                if parent is not None and not parent.is_alive():
+                    raise RuntimeError("TP engine parent exited")
+                continue
             self.call(method_name, *args) # Unpack args when calling
             if method_name == 'exit':
                 break
@@ -207,6 +219,8 @@ class ModelRunner:
     def call(self, method_name: str, *args: dict):
         if self.world_size > 1 and self.rank == 0: # will be called in main engine
             self.write_shm(method_name, args)
+            wait_for_consumption(self.event, self.tp_command_timeout_s,
+                                 self._worker_processes, exiting=method_name == "exit")
         method = getattr(self, method_name, None)
         if method:
             return method(*args)

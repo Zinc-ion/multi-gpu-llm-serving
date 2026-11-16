@@ -21,8 +21,13 @@ uv run --no-sync python -m myvllm.pd.worker \
 - `allowed_decode_endpoints`：P 的允许列表；D 为 `null`。`decode_endpoint` 仍是 P 的默认目标。
 - `enable_chunked_prefill`：实际 Scheduler 是否启用 chunked prefill；`local_prefill_enabled` 仅在 D 且已启用时为 true。
 - `enforce_eager`、`world_size`；已有 `pipeline_frame_bytes` 为零时表示流水未启用。当前 PD worker 仍限制 `world_size=1`。
+- `max_transfer_bytes` 是该 worker 所有未完成交接的聚合逻辑预留上限；`max_payload_bytes` 是单个请求按 block 填充后的逻辑 payload 和 wire body 上限。两者也出现在事务 open 响应中。
 
 JSON 中端点为 `[host, port]`。固定网关继续按固定 pair 工作；下述负载模式会核对配置 inventory 中每条允许的 P/D 路径。
+
+worker 可通过 `--max-payload-bytes` 独立设置单请求上限，要求它为正整数且不超过 `--max-transfer-bytes`；省略时等于后者，保持旧配置的单包及聚合语义。bulk 和 pipeline 均在 P admission 与 D reserve 时检查完整、按 block 填充的 payload；pipeline 还要求每帧不超过 `pipeline_frame_bytes`，它自身不能大于 `max_payload_bytes`。因此显式配置较小的单包上限时，即使流水每帧都能放下，整次逻辑 payload 超限仍会被拒绝。
+
+网关启动及 ready 按 worker 实际单包上限与网关 `max_payload_bytes` 比较；旧 worker 的 info/open 没有该字段时按其 `max_transfer_bytes` 作为真实 wire 上限。需先升级网关和 client：旧网关仍把 worker 聚合上限当作 wire 上限。bulk 网关先校验 metadata，再按其中的填充后 `kv.nbytes` 同步预留 staging，并在读取 export body 前核对响应长度；完成、失败和取消都释放对应预留。`max_staging_bytes` 是并发 bulk 交接的逻辑 payload 预算，pipeline 使用独立的有界帧缓冲；两者均不是 RSS 上限，host tensor、bytes、socket 缓冲和各进程副本也会占用内存。
 
 ## D 本地请求
 
@@ -108,6 +113,8 @@ load 模式按实际 JSON/UTF-8 编码检查选路时已知的请求字段和控
 ## 同候选四卡配置
 
 `tools/prepare_pd.py --m8-comparison` 以 `--physical-gpus P0 P1 D0 D1` 明确指定同一组四张卡；GPU2 如使用，只能替换原四卡中的一张。除负载轮询、弹性策略和 `--chunk-tokens` 外，需显式提供 `--pipeline-min-tokens` 和 `--pipeline-frame-bytes`，以准备 bulk/pipeline 消融；这些值须先按目标硬件校准。
+
+部署生成器可用 `--worker-max-connections`、`--worker-max-transfer-bytes`、`--worker-max-payload-bytes`、`--gateway-max-active-requests`、`--gateway-max-payload-bytes` 和 `--gateway-max-staging-bytes` 显式设定资源。默认分别为 4、3 GiB、3 GiB、8、3 GiB 和 6 GiB；生成器会检查 worker 单包不超过其聚合限额及网关单包限额，网关 staging 至少容纳一个网关最大 payload，所有 fixed/load/elastic 脚本及 manifest 使用同一组值。例如可分别设置 8、24 GiB、3 GiB、8、3 GiB、24 GiB；这只是逻辑预算配置，并不证明目标服务器的 GPU block、resident、RSS 或稳定并发容量。
 
 `--m8-routing-transfer bulk` 是默认值，令 fixed/load/elastic 路由组均使用 bulk；选择 `pipeline` 时三组均使用相同流水阈值和帧上限。三组的 P 都为 whole/eager，D 都开启 chunked，使用相同 chunk budget 和 base config 中的 D eager/graph 模式；P、D 从 base 独立派生。生成的 `fixed-bulk-gateway.sh` 与 `fixed-pipeline-gateway.sh` 使用相同 fixed P/D worker 配置及各自网关计时文件，用于单独的机制比较。先为所选 D 模式完成实际 GPU 正确性验证，再执行任何性能比较。
 

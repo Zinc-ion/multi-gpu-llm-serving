@@ -67,7 +67,7 @@ nvidia-smi topo -m > "$M5_OUT/topology.txt"
 numactl --hardware > "$M5_OUT/numa.txt"
 ```
 
-生成的 `env.sh` 将相同类别的缓存和临时文件重新指向本次 `M5_OUT`；每个脚本在启动 Python 前 source 它，不修改 `HOME`。配置继承 `configs/qwen3_14b.json` 的 BF16 及固定 revision，配置缓存也位于 `M5_OUT`。默认 worker 的 `max_transfer_bytes=3 GiB`，网关的单 payload 上限也是 3 GiB、总逻辑中转预留 6 GiB；14B BF16 每 token 结构 KV 为 163840 B，16384 token 的整块 payload 为 2.5 GiB。这是可容纳该大小的配置界限，并非启动后的实测显存、进程 RSS 或可用并发。每个 worker 的 3 GiB 为该 worker **所有请求的总预留**，故不能据此假定多个 16K 请求能同时交接。更改这些限制须保留配置和对应测量，不能用理论上限代替容量日志。
+生成的 `env.sh` 将相同类别的缓存和临时文件重新指向本次 `M5_OUT`；每个脚本在启动 Python 前 source 它，不修改 `HOME`。配置继承 `configs/qwen3_14b.json` 的 BF16 及固定 revision，配置缓存也位于 `M5_OUT`。默认 worker 的 `max_transfer_bytes=3 GiB`，网关的单 payload 上限也是 3 GiB、总逻辑中转预留 6 GiB；14B BF16 每 token 结构 KV 为 163840 B，16384 token 的整块 payload 为 2.5 GiB。这是可容纳该大小的配置界限，并非启动后的实测显存、进程 RSS 或可用并发。每个 worker 的 3 GiB 为该 worker **所有请求的总预留**，故不能据此假定多个 16K 请求能同时交接。生成器现在也可独立设置 worker 的聚合与单 payload 限额，以及网关的 payload 和 staging 预算；默认单 payload 仍为 3 GiB，字段、旧版本兼容和逻辑记账边界见 [M8 runtime](m8_runtime_zh.md#p-可选择-d)。更改这些限制须保留配置和对应测量，不能用理论上限代替容量日志。
 
 ## 前台启动、检查与关闭
 

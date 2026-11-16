@@ -7,7 +7,7 @@ import json
 import httpx
 
 from myvllm.pd.client import PDClient
-from myvllm.pd.gateway import PDGateway, _validate_load_edge, _validate_load_worker
+from myvllm.pd.gateway import PDGateway, _validate_load_edge, _validate_load_worker, _worker_payload_limit
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT
 
 
@@ -51,6 +51,9 @@ async def check(settings, base_url):
                                         PDClient.info(tuple(pair["decode"])))
             if p["role"] != "prefill" or d["role"] != "decode" or p["decode_endpoint"] != pair["decode"]:
                 raise ValueError("Worker role or fixed pair does not match configuration")
+            for info, role in ((p, "prefill"), (d, "decode")):
+                if _worker_payload_limit(info) > settings["max_payload_bytes"]:
+                    raise ValueError(f"{role} worker body limit exceeds gateway payload limit")
             pairs.append({"prefill": p, "decode": d})
     if base_url:
         async with httpx.AsyncClient(trust_env=False, timeout=10) as client:

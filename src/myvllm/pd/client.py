@@ -35,10 +35,12 @@ class PDConnection:
         self.transaction_id = None
         self.request_id = None
 
-    async def _call(self, op, body=b"", **fields):
+    async def _call(self, op, body=b"", *, expected_body_bytes=None, **fields):
         async with self._lock:
             try:
                 async with asyncio.timeout_at(self._deadline):
+                    if self.session_id is not None and len(body) > self._max_body_bytes:
+                        raise ProtocolError("Body exceeds transfer limit")
                     try:
                         await write_frame(self._writer, {"op": op, **fields}, body,
                                           max_header_bytes=self._max_header_bytes)
@@ -46,13 +48,17 @@ class PDConnection:
                         raise PDHeaderLimitError(str(exc)) from exc
                     header, size = await read_header(self._reader, DEFAULT_HEADER_LIMIT,
                                                      self._max_body_bytes)
+                    if set(header) != {"ok", "value"} and set(header) != {"ok", "error", "message"}:
+                        raise ProtocolError("Invalid response")
+                    if header["ok"] is False:
+                        if size:
+                            raise ProtocolError("Error response must have no body")
+                        raise PDRemoteError(header["error"], header["message"])
+                    if header["ok"] is not True:
+                        raise ProtocolError("Invalid response status")
+                    if expected_body_bytes is not None and size != expected_body_bytes:
+                        raise ProtocolError("Unexpected response body size")
                     data = await read_body(self._reader, size)
-                if set(header) != {"ok", "value"} and set(header) != {"ok", "error", "message"}:
-                    raise ProtocolError("Invalid response")
-                if header["ok"] is False:
-                    raise PDRemoteError(header["error"], header["message"])
-                if header["ok"] is not True:
-                    raise ProtocolError("Invalid response status")
                 return header["value"], data
             except BaseException:
                 self._writer.transport.abort()
@@ -94,8 +100,8 @@ class PDConnection:
         value, _ = await self._call("reserve", metadata=metadata)
         return value
 
-    async def export(self):
-        _, data = await self._call("export")
+    async def export(self, expected_bytes=None):
+        _, data = await self._call("export", expected_body_bytes=expected_bytes)
         return data
 
     async def restore(self, payload):
@@ -150,7 +156,7 @@ class PDClient:
         connection = PDConnection(reader, writer, deadline, max_header_bytes)
         try:
             value, _ = await connection._call(op, lifetime=lifetime, **fields)
-            connection._max_body_bytes = value["max_transfer_bytes"]
+            connection._max_body_bytes = value.get("max_payload_bytes", value["max_transfer_bytes"])
             connection.session_id = value["session_id"]
             connection.transaction_id = value.get("transaction_id")
             connection.request_id = fields.get("request_id")
@@ -220,7 +226,7 @@ class PDClient:
         if on_reserved is not None:
             on_reserved()
         started = time.perf_counter()
-        payload = await prefill.export()
+        payload = await prefill.export(expected_bytes=metadata["kv"]["nbytes"])
         nbytes = len(payload)
         try:
             await decode.restore(payload)

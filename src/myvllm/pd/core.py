@@ -55,11 +55,15 @@ class _Handle:
 class _Core:
     _seed_mask = 0
 
-    def __init__(self, engine, max_open_requests, max_transfer_bytes):
+    def __init__(self, engine, max_open_requests, max_transfer_bytes, max_payload_bytes=None):
         if type(max_open_requests) is not int or max_open_requests <= 0:
             raise ValueError("max_open_requests must be a positive integer")
         if type(max_transfer_bytes) is not int or max_transfer_bytes <= 0:
             raise ValueError("max_transfer_bytes must be a positive integer")
+        if max_payload_bytes is None:
+            max_payload_bytes = max_transfer_bytes
+        if type(max_payload_bytes) is not int or not 0 < max_payload_bytes <= max_transfer_bytes:
+            raise ValueError("max_payload_bytes must be positive and no greater than max_transfer_bytes")
         seed = engine.config.get("seed", 0)
         if type(seed) is not int or not 0 <= seed < 2**32:
             raise ValueError("seed must be a 32-bit unsigned integer")
@@ -71,6 +75,7 @@ class _Core:
         self.spec = model_spec(engine)
         self.max_open_requests = max_open_requests
         self.max_transfer_bytes = max_transfer_bytes
+        self.max_payload_bytes = max_payload_bytes
         self._handles = {}
         self._sequences = {}
         self._reserved_bytes = 0
@@ -238,7 +243,7 @@ class PrefillCore(_Core):
             blocks += sum((h.sequence.num_prompt_tokens + block_size - 1) // block_size for h in pending)
             if blocks > len(self.manager.blocks):
                 raise CapacityError("P prompt block capacity exhausted")
-        if self._reserved_bytes + nbytes > self.max_transfer_bytes:
+        if nbytes > self.max_payload_bytes or self._reserved_bytes + nbytes > self.max_transfer_bytes:
             raise CapacityError("P transfer capacity exhausted")
         handle = self._open(session_id, deadline)
         seq = Sequence(prompt_token_ids, self.manager.block_size, params)
@@ -420,8 +425,8 @@ class DecodeCore(_Core):
 
     _seed_mask = 0x80000000
 
-    def __init__(self, engine, max_open_requests, max_transfer_bytes):
-        super().__init__(engine, max_open_requests, max_transfer_bytes)
+    def __init__(self, engine, max_open_requests, max_transfer_bytes, max_payload_bytes=None):
+        super().__init__(engine, max_open_requests, max_transfer_bytes, max_payload_bytes)
         self._reserved_blocks = 0
         self._resident = 0
         self._local_resident = 0
@@ -490,7 +495,7 @@ class DecodeCore(_Core):
             raise CapacityError("D resident sequence capacity exhausted")
         if self._reserved_blocks + blocks > len(self.manager.blocks):
             raise CapacityError("D KV block capacity exhausted")
-        if self._reserved_bytes + nbytes > self.max_transfer_bytes:
+        if nbytes > self.max_payload_bytes or self._reserved_bytes + nbytes > self.max_transfer_bytes:
             raise CapacityError("D transfer capacity exhausted")
         handle._reserved_bytes = nbytes
         handle._reserved_blocks = blocks

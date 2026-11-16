@@ -37,6 +37,20 @@ def generate(args):
         raise ValueError("candidate-commit must be a full 40-character commit SHA")
     if not 0 <= args.base_seed < 2**32:
         raise ValueError("base-seed must be a 32-bit unsigned integer")
+    resources = {
+        "worker_max_connections": args.worker_max_connections,
+        "worker_max_transfer_bytes": args.worker_max_transfer_bytes,
+        "worker_max_payload_bytes": args.worker_max_payload_bytes,
+        "gateway_max_active_requests": args.gateway_max_active_requests,
+        "gateway_max_payload_bytes": args.gateway_max_payload_bytes,
+        "gateway_max_staging_bytes": args.gateway_max_staging_bytes,
+    }
+    if any(type(value) is not int or value <= 0 for value in resources.values()):
+        raise ValueError("resource limits must be positive integers")
+    if (resources["worker_max_payload_bytes"] > resources["worker_max_transfer_bytes"]
+            or resources["worker_max_payload_bytes"] > resources["gateway_max_payload_bytes"]
+            or resources["gateway_max_payload_bytes"] > resources["gateway_max_staging_bytes"]):
+        raise ValueError("worker payload must fit its aggregate and gateway payload; staging must fit gateway payload")
     topology = TOPOLOGIES[args.topology]
     if args.m8_comparison:
         if args.topology != "2p2d" or args.physical_gpus is None:
@@ -78,7 +92,7 @@ def generate(args):
         token_bytes = sum(cache_token_byte_counts(
             config["num_kv_heads"], config["head_dim"], cache_dtype,
             config.get("kv_cache_dtype", "auto") != "auto"))
-        if not token_bytes <= args.pipeline_frame_bytes <= PAYLOAD_LIMIT:
+        if not token_bytes <= args.pipeline_frame_bytes <= resources["worker_max_payload_bytes"]:
             raise ValueError("pipeline frame must fit one KV token and the payload limit")
         if (not args.m8_comparison and
                 (not config.get("enforce_eager") or config.get("enable_chunked_prefill", False))):
@@ -90,8 +104,9 @@ def generate(args):
     config["model_name_or_path"] = args.model_path
     config["cache_dir"] = str(cache / "hf-hub")
     config.pop("timing_path", None)
-    settings = {"pairs": [], "max_active_requests": 8, "max_payload_bytes": PAYLOAD_LIMIT,
-                "max_staging_bytes": 2 * PAYLOAD_LIMIT, "max_request_bytes": 2 * 1024**2,
+    settings = {"pairs": [], "max_active_requests": resources["gateway_max_active_requests"],
+                "max_payload_bytes": resources["gateway_max_payload_bytes"],
+                "max_staging_bytes": resources["gateway_max_staging_bytes"], "max_request_bytes": 2 * 1024**2,
                 "request_timeout": 600}
     if args.pipeline_min_tokens and (not args.m8_comparison or args.m8_routing_transfer == "pipeline"):
         settings["pipeline_min_tokens"] = args.pipeline_min_tokens
@@ -135,7 +150,9 @@ def generate(args):
             files[f"{name}.json"] = json.dumps(role_config, indent=2) + "\n"
             cmd = [python, "-m", "myvllm.pd.worker", "--role", role,
                    "--config", output / f"{name}.json", "--host", endpoint[0], "--port", endpoint[1],
-                   "--max-connections", 4, "--max-transfer-bytes", PAYLOAD_LIMIT, "--request-timeout", 600]
+                   "--max-connections", resources["worker_max_connections"],
+                   "--max-transfer-bytes", resources["worker_max_transfer_bytes"],
+                   "--max-payload-bytes", resources["worker_max_payload_bytes"], "--request-timeout", 600]
             if role == "prefill":
                 cmd += ["--decode-host", de[0], "--decode-port", de[1]]
                 if args.m8_comparison:
@@ -177,7 +194,8 @@ def generate(args):
                 "numa": {"gpu_nodes": {str(gpu): 0 if gpu in (0, 1, 2) else 1
                                        for pair in topology for gpu in pair},
                          "gateway_node": 0, "client_node": 0},
-                "payload_limit_bytes": PAYLOAD_LIMIT, "gateway_settings": settings,
+                "payload_limit_bytes": resources["gateway_max_payload_bytes"], "resources": resources,
+                "gateway_settings": settings,
                 "pipeline_frame_bytes": args.pipeline_frame_bytes,
                 "workloads": {name: str(dataset) for name, _, dataset in workloads},
                 "bench_seed": 7, "warmups": 8, "l1_repetitions": 1, "l2_repetitions": 5}
@@ -235,7 +253,9 @@ def generate(args):
                     files[f"{name}.json"] = json.dumps(role_config, indent=2) + "\n"
                     cmd = [python, "-m", "myvllm.pd.worker", "--role", role,
                            "--config", output / f"{name}.json", "--host", endpoint[0], "--port", endpoint[1],
-                           "--max-connections", 4, "--max-transfer-bytes", PAYLOAD_LIMIT, "--request-timeout", 600]
+                           "--max-connections", resources["worker_max_connections"],
+                           "--max-transfer-bytes", resources["worker_max_transfer_bytes"],
+                           "--max-payload-bytes", resources["worker_max_payload_bytes"], "--request-timeout", 600]
                     if role == "prefill":
                         cmd += ["--decode-host", de[0], "--decode-port", de[1],
                                 "--allowed-decode-endpoints", json.dumps(allowed)]
@@ -291,6 +311,12 @@ def main():
     parser.add_argument("--model-path", required=True, help="Existing pinned local model snapshot")
     parser.add_argument("--base-config", default="configs/qwen3_14b.json")
     parser.add_argument("--base-seed", type=int, default=0)
+    parser.add_argument("--worker-max-connections", type=int, default=4)
+    parser.add_argument("--worker-max-transfer-bytes", type=int, default=PAYLOAD_LIMIT)
+    parser.add_argument("--worker-max-payload-bytes", type=int, default=PAYLOAD_LIMIT)
+    parser.add_argument("--gateway-max-active-requests", type=int, default=8)
+    parser.add_argument("--gateway-max-payload-bytes", type=int, default=PAYLOAD_LIMIT)
+    parser.add_argument("--gateway-max-staging-bytes", type=int, default=2 * PAYLOAD_LIMIT)
     parser.add_argument("--pipeline-min-tokens", type=int, default=0,
                         help="Opt-in prompt threshold; uncalibrated until measured on target hardware")
     parser.add_argument("--pipeline-frame-bytes", type=int, default=0)

@@ -163,6 +163,7 @@ class _Owner:
             "max_completion_tokens": scheduler.max_model_length - 1,
             "max_connections": self.worker.max_connections,
             "max_transfer_bytes": self.worker.max_transfer_bytes,
+            "max_payload_bytes": self.worker.max_payload_bytes,
             "max_header_bytes": self.worker.max_header_bytes,
             "request_timeout": self.worker.request_timeout,
             "sampling_seed": self.core.sampling_seed,
@@ -284,7 +285,8 @@ class _Owner:
             self._record("pd_admitted", ctx, queue_ms=(time.monotonic() - ctx.accepted) * 1000,
                          prompt_tokens=len(fields["token_ids"]))
         return {"session_id": handle.session_id, "transaction_id": handle.transaction_id,
-                "max_transfer_bytes": self.worker.max_transfer_bytes}
+                "max_transfer_bytes": self.worker.max_transfer_bytes,
+                "max_payload_bytes": self.worker.max_payload_bytes}
 
     def _command(self, ctx, op, fields, payload, future):
         if op == "shutdown":
@@ -505,7 +507,7 @@ class _Owner:
             self.engine = self.engine_factory(self.worker.config)
             core_type = PrefillCore if self.worker.role == "prefill" else DecodeCore
             self.core = core_type(self.engine, self.worker.max_connections,
-                                  self.worker.max_transfer_bytes)
+                                  self.worker.max_transfer_bytes, self.worker.max_payload_bytes)
             if self.worker.pipeline_frame_bytes:
                 if self.worker.pipeline_frame_bytes < sum(token_byte_counts(self.core.spec)):
                     raise ValueError("Pipeline frame must hold at least one K/V token")
@@ -594,7 +596,7 @@ class PDWorker:
     def __init__(self, role, config, *, max_connections, max_transfer_bytes,
                  request_timeout, max_header_bytes=DEFAULT_HEADER_LIMIT,
                  decode_endpoint=None, allowed_decode_endpoints=None,
-                 engine_factory=LLMEngine, pipeline_frame_bytes=0):
+                 engine_factory=LLMEngine, pipeline_frame_bytes=0, max_payload_bytes=None):
         if role not in ("prefill", "decode"):
             raise ValueError("role must be prefill or decode")
         if config["world_size"] != 1:
@@ -618,10 +620,14 @@ class PDWorker:
                             ("max_header_bytes", max_header_bytes)):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if max_payload_bytes is None:
+            max_payload_bytes = max_transfer_bytes
+        if type(max_payload_bytes) is not int or not 0 < max_payload_bytes <= max_transfer_bytes:
+            raise ValueError("max_payload_bytes must be positive and no greater than max_transfer_bytes")
         if not finite_number(request_timeout) or request_timeout <= 0:
             raise ValueError("request_timeout must be a positive finite number")
-        if type(pipeline_frame_bytes) is not int or not 0 <= pipeline_frame_bytes <= max_transfer_bytes:
-            raise ValueError("pipeline_frame_bytes must be between 0 and max_transfer_bytes")
+        if type(pipeline_frame_bytes) is not int or not 0 <= pipeline_frame_bytes <= max_payload_bytes:
+            raise ValueError("pipeline_frame_bytes must be between 0 and max_payload_bytes")
         if pipeline_frame_bytes and role == "prefill":
             if not config.get("enforce_eager", False) or config.get("enable_chunked_prefill", False):
                 raise ValueError("Pipeline requires TP1 whole eager prefill")
@@ -629,6 +635,7 @@ class PDWorker:
         self.config = config
         self.max_connections = max_connections
         self.max_transfer_bytes = max_transfer_bytes
+        self.max_payload_bytes = max_payload_bytes
         self.max_header_bytes = max_header_bytes
         self.decode_endpoint = decode_endpoint
         self.allowed_decode_endpoints = allowed_decode_endpoints
@@ -774,7 +781,7 @@ class PDWorker:
             async with asyncio.timeout_at(deadline) as timeout:
                 while True:
                     header, size = await read_header(reader, self.max_header_bytes,
-                                                     self.max_transfer_bytes)
+                                                     self.max_payload_bytes)
                     op = header.get("op")
                     if op == "pipeline" and not session and self.role == "decode":
                         data_channel = True
@@ -949,6 +956,7 @@ async def _serve(args):
     decode_endpoint = (args.decode_host, args.decode_port) if args.decode_host else None
     worker = PDWorker(args.role, config, max_connections=args.max_connections,
                       max_transfer_bytes=args.max_transfer_bytes,
+                      max_payload_bytes=args.max_payload_bytes,
                       request_timeout=args.request_timeout, max_header_bytes=args.max_header_bytes,
                       decode_endpoint=decode_endpoint, allowed_decode_endpoints=args.allowed_decode_endpoints,
                       pipeline_frame_bytes=args.pipeline_frame_bytes)
@@ -976,6 +984,7 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--max-connections", type=int, required=True)
     parser.add_argument("--max-transfer-bytes", type=int, required=True)
+    parser.add_argument("--max-payload-bytes", type=int)
     parser.add_argument("--request-timeout", type=float, required=True)
     parser.add_argument("--max-header-bytes", type=int, default=DEFAULT_HEADER_LIMIT)
     parser.add_argument("--decode-host")

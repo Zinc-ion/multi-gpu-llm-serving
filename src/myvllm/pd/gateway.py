@@ -17,7 +17,7 @@ from myvllm.config import load_config, resolve_dtype
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.pd.client import PDClient, PDHeaderLimitError, PDRemoteError, PDTimingError
 from myvllm.pd.http import GatewayError
-from myvllm.pd.protocol import _ARCHITECTURE_FIELDS, cache_spec, make_early_metadata, make_metadata, payload_nbytes, token_byte_counts
+from myvllm.pd.protocol import _ARCHITECTURE_FIELDS, cache_spec, make_early_metadata, make_metadata, payload_nbytes, token_byte_counts, validate_metadata
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError
 from myvllm.utils.timing import write_record
 
@@ -49,12 +49,20 @@ def _model_spec(config):
     return spec
 
 
+def _worker_payload_limit(info):
+    aggregate = info["max_transfer_bytes"]
+    payload = info.get("max_payload_bytes", aggregate)
+    if type(aggregate) is not int or type(payload) is not int or not 0 < payload <= aggregate:
+        raise ValueError("Invalid worker transfer or payload limit")
+    return payload
+
+
 def _validate_load_worker(info, role, request_timeout, max_payload_bytes):
     if info["role"] != role or info["world_size"] != 1:
         raise ValueError(f"Incompatible {role} worker role or world size")
     if info["request_timeout"] < request_timeout:
         raise ValueError(f"{role} worker timeout is shorter than gateway timeout")
-    if not 0 < info["max_transfer_bytes"] <= max_payload_bytes:
+    if _worker_payload_limit(info) > max_payload_bytes:
         raise ValueError(f"{role} worker body limit exceeds gateway payload limit")
     if info["max_header_bytes"] <= 0 or info["max_connections"] <= 0:
         raise ValueError(f"{role} worker has invalid protocol limits")
@@ -216,7 +224,7 @@ class PDGateway:
                     raise ValueError(f"Incompatible {role} worker model or length")
                 if info["request_timeout"] < self.request_timeout:
                     raise ValueError(f"{role} worker timeout is shorter than gateway timeout")
-                if info["max_transfer_bytes"] > self.max_payload_bytes:
+                if _worker_payload_limit(info) > self.max_payload_bytes:
                     raise ValueError(f"{role} worker body limit exceeds gateway payload limit")
             if tuple(pi["decode_endpoint"] or ()) != de or di["decode_endpoint"] is not None:
                 raise ValueError("Prefill worker's fixed decode endpoint does not match pair")
@@ -355,6 +363,11 @@ class PDGateway:
                 pheader = max(popen, pmeta)
                 can_transfer = (pbytes + transfer_bytes <= self.infos[pe]["max_transfer_bytes"]
                                 and dbytes + transfer_bytes <= self.infos[de]["max_transfer_bytes"]
+                                and transfer_bytes <= self.infos[pe].get("max_payload_bytes",
+                                                                          self.infos[pe]["max_transfer_bytes"])
+                                and transfer_bytes <= self.infos[de].get("max_payload_bytes",
+                                                                          self.infos[de]["max_transfer_bytes"])
+                                and transfer_bytes <= self.max_payload_bytes
                                 and pconnections + 1 <= self.infos[pe]["max_connections"]
                                 and pcapacity
                                 and pheader <= min(self.infos[pe]["max_header_bytes"], DEFAULT_HEADER_LIMIT)
@@ -622,7 +635,7 @@ class PDGateway:
 
     async def _run(self, entry):
         prefill = decode = None
-        staging = False
+        staging = 0
         cancelled = False
         error = None
         phase = "open_d"
@@ -684,6 +697,11 @@ class PDGateway:
             if entry.route == "remote" and not terminal:
                 phase = "describe"
                 metadata = await prefill.describe()
+                validate_metadata(metadata, decode.session_id, _model_spec(self.config),
+                                  self.config["max_model_length"])
+                if (metadata["transaction_id"] != prefill.transaction_id
+                        or metadata["request_id"] != entry.pending.request_id):
+                    raise ProtocolError("PD metadata does not match the request")
                 if pipeline:
                     data_per_token, scale_per_token = token_byte_counts(metadata["model"])
                     tokens = metadata["model"]["architecture"]["num_layers"] * metadata["prompt_length"]
@@ -695,10 +713,10 @@ class PDGateway:
                     scale_bytes = metadata["kv"].get("scale_nbytes", 0)
                 components = {"data_bytes": data_bytes, "scale_bytes": scale_bytes} if scale_bytes else {}
                 if not pipeline:
-                    if nbytes > self.max_payload_bytes or self.staging_bytes + self.max_payload_bytes > self.max_staging_bytes:
+                    if nbytes > self.max_payload_bytes or self.staging_bytes + nbytes > self.max_staging_bytes:
                         raise GatewayError(503, "PD gateway transfer capacity exhausted")
-                    self.staging_bytes += self.max_payload_bytes
-                    staging = True
+                    self.staging_bytes += nbytes
+                    staging = nbytes
                 phase = "handoff"
                 handoff_start = time.perf_counter()
                 self._record(entry, "pd_gateway_handoff_start", payload_bytes=nbytes, **components)
@@ -712,8 +730,8 @@ class PDGateway:
                 self._record(entry, "pd_gateway_handoff_done", payload_bytes=nbytes,
                              handoff_ms=(time.perf_counter() - handoff_start) * 1000, **components)
                 if staging:
-                    self.staging_bytes -= self.max_payload_bytes
-                    staging = False
+                    self.staging_bytes -= staging
+                    staging = 0
                 phase = "decode"
                 while not terminal:
                     event = await decode.next_token()
@@ -741,7 +759,7 @@ class PDGateway:
                 self._release_booking(entry, "prefill_connection")
                 self._release_booking(entry, "decode_connection")
             if staging:
-                self.staging_bytes -= self.max_payload_bytes
+                self.staging_bytes -= staging
             try:
                 self._record(entry, "pd_gateway_released", close_errors=[str(r) for r in results if isinstance(r, BaseException)],
                              staging_bytes=self.staging_bytes)

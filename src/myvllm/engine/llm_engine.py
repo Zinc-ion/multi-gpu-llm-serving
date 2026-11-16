@@ -11,7 +11,7 @@ from multiprocessing.connection import wait
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.engine.scheduler import Scheduler
 from myvllm.engine.model_runner import ModelRunner
-from myvllm.engine.ipc import CommandSignal, CommandSlot, stop_workers, validate_timeout
+from myvllm.engine.ipc import CommandSignal, CommandSizeError, CommandSlot, stop_workers, validate_timeout
 from myvllm.sampling_parameters import SamplingParams
 from transformers import AutoTokenizer
 
@@ -233,7 +233,13 @@ class LLMEngine:
             if seq.num_cached_tokens + seq.num_scheduled_tokens == len(seq)
         ]
         # run the model
-        outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+        try:
+            outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+        except CommandSizeError:
+            for seq in scheduled_sequences:
+                self.cancel(seq.seq_id)
+                self.request_ids.pop(seq.seq_id, None)
+            raise
         # Move outputs to CPU and convert them to a list
         if timings:
             d2h_start = time.perf_counter()

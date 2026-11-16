@@ -15,6 +15,10 @@ from multiprocessing import reduction
 from multiprocessing.context import assert_spawning
 
 
+class CommandSizeError(ValueError):
+    """A command descriptor exceeds the shared slot."""
+
+
 class CommandSlot:
     def __init__(self, size, fd=None):
         if fd is None:
@@ -169,7 +173,7 @@ def write_command(shm, events, method_name, args, timeout, processes=()):
     data = pickle.dumps((method_name, *args))
     n = len(data)
     if n > shm.size - 4:
-        raise ValueError(f"TP command descriptor is {n} bytes; limit is {shm.size - 4}")
+        raise CommandSizeError(f"TP command descriptor is {n} bytes; limit is {shm.size - 4}")
     wait_for_consumption(events, timeout, processes)
     shm.buf[4:n+4] = data
     shm.buf[:4] = n.to_bytes(4, 'little')

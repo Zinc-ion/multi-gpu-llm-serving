@@ -49,11 +49,13 @@ class _Handle:
         self._receiver = None
         self._reserved_bytes = 0
         self._reserved_blocks = 0
+        self._tp_export_metrics = None
         self.local = False
 
 
 class _Core:
     _seed_mask = 0
+    _allow_tp_prefill = False
 
     def __init__(self, engine, max_open_requests, max_transfer_bytes, max_payload_bytes=None):
         if type(max_open_requests) is not int or max_open_requests <= 0:
@@ -72,7 +74,7 @@ class _Core:
         self.manager = self.scheduler.block_manager
         if not self.scheduler.is_finished() or self.manager.used_block_ids:
             raise ValueError("PD core requires an empty, exclusively owned scheduler")
-        self.spec = model_spec(engine)
+        self.spec = model_spec(engine, allow_tp_prefill=self._allow_tp_prefill)
         self.max_open_requests = max_open_requests
         self.max_transfer_bytes = max_transfer_bytes
         self.max_payload_bytes = max_payload_bytes
@@ -206,10 +208,14 @@ class _Core:
 class PrefillCore(_Core):
     """Own P requests from admission through a synchronous transfer ACK."""
 
+    _allow_tp_prefill = True
+
     def open(self, session_id, request_id, prompt_token_ids, params, deadline=None):
         return self._open_request(session_id, request_id, prompt_token_ids, params, deadline, early=False)
 
     def prepare(self, session_id, request_id, prompt_token_ids, params, deadline=None):
+        if self.engine.config["world_size"] != 1:
+            raise ValueError("Early transfer requires TP1 prefill")
         if self.scheduler.enable_chunked_prefill or not self.engine.config.get("enforce_eager", False):
             raise ValueError("Early transfer requires whole eager prefill")
         return self._open_request(session_id, request_id, prompt_token_ids, params, deadline, early=True)
@@ -343,10 +349,15 @@ class PrefillCore(_Core):
         if handle._metadata is None:
             handle._metadata = make_metadata(handle, self.spec, self.sampling_seed)
         try:
-            scales = self.engine.model_runner.kv_cache_scales if "kv_cache" in self.spec else None
-            payload = export_kv(self.engine.model_runner.kv_cache,
-                                handle.sequence.block_table,
-                                handle.sequence.num_cached_tokens, self.spec, scales)
+            if self.engine.config["world_size"] == 2:
+                payload, handle._tp_export_metrics = self.engine.model_runner.call(
+                    "export_pd_tp_kv", handle.sequence.block_table,
+                    handle.sequence.num_cached_tokens, self.spec)
+            else:
+                scales = self.engine.model_runner.kv_cache_scales if "kv_cache" in self.spec else None
+                payload = export_kv(self.engine.model_runner.kv_cache,
+                                    handle.sequence.block_table,
+                                    handle.sequence.num_cached_tokens, self.spec, scales)
         except Exception:
             self._cancel(handle, "failed")
             raise

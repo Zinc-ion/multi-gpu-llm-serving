@@ -1,4 +1,4 @@
-"""Capture independent TP1 reference/P/D runs and analyze frozen logits gates."""
+"""Capture independent reference/P/D runs and analyze frozen logits gates."""
 
 import argparse
 import asyncio
@@ -318,8 +318,17 @@ def read_inputs(args):
     for role in ("reference", "prefill", "decode"):
         path = Path(getattr(args, role + "_config")).resolve()
         configs[role] = json.loads(path.read_text())
-        if configs[role]["world_size"] != 1:
-            raise ValueError("TP2 capture is unsupported; TP1 is required for every role")
+        world_size = configs[role]["world_size"]
+        if world_size != 1 and not (role == "prefill" and world_size == 2):
+            raise ValueError("Capture requires TP1 reference/decode and TP1 or TP2 prefill")
+    if configs["prefill"]["world_size"] == 2:
+        if args.transfer != "bulk" or args.raw_kv:
+            raise ValueError("TP2 prefill capture requires bulk and does not support --raw-kv")
+        devices = prefill_gpu_selection(args.prefill_gpu).split(",")
+        if len(devices) != 2:
+            raise ValueError("TP2 prefill requires exactly two visible GPUs")
+    elif "," in args.prefill_gpu:
+        raise ValueError("TP1 prefill requires exactly one visible GPU")
     fields = ("model_name_or_path", "model_type", "model_revision", "tokenizer_revision", "dtype",
               "eos", "max_model_length", "block_size", "num_layers", "num_kv_heads", "head_dim", "vocab_size")
     for field in fields:
@@ -380,6 +389,21 @@ def gpu_selection(value):
     if not value.isdecimal() and not (value.startswith("GPU-") and
             all(character in "0123456789abcdefABCDEF-" for character in value[4:]) and len(value) > 4):
         raise argparse.ArgumentTypeError("expected one physical GPU index or GPU UUID")
+    return value
+
+
+def prefill_gpu_selection(value):
+    devices = value.split(",")
+    if len(devices) > 2:
+        raise argparse.ArgumentTypeError("expected one or two prefill GPU indices or UUIDs")
+    for device in devices:
+        gpu_selection(device)
+    if len(devices) == 2:
+        if devices[0].isdecimal() != devices[1].isdecimal():
+            raise argparse.ArgumentTypeError("use two indices or two UUIDs for TP2 prefill")
+        identifiers = [int(device) if device.isdecimal() else device.lower() for device in devices]
+        if identifiers[0] == identifiers[1]:
+            raise argparse.ArgumentTypeError("TP2 prefill GPUs must be distinct")
     return value
 
 
@@ -887,7 +911,8 @@ def main():
     cap.add_argument("--expected-sha", required=True)
     for role in ("reference", "prefill", "decode"):
         cap.add_argument(f"--{role}-config", required=True)
-        cap.add_argument(f"--{role}-gpu", type=gpu_selection, required=True)
+        cap.add_argument(f"--{role}-gpu", type=prefill_gpu_selection if role == "prefill" else gpu_selection,
+                         required=True)
         cap.add_argument(f"--{role}-numa", type=numa_selection)
     cap.add_argument("--prompts", required=True)
     cap.add_argument("--max-tokens", type=positive_int, required=True)

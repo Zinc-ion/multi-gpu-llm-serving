@@ -1,6 +1,6 @@
 # M8：D 本地 prefill 与可选 D 端点
 
-本节描述 PD worker 和可选负载路由；TP2 PD 与 M8 阶段验收尚未完成。固定 P/D 路径与协议版本 2、3、4、5 继续可用；完整交接及部署约束见 [M5](m5_runtime_zh.md)、[M6](m6_runtime_zh.md) 和 [M7](m7_runtime_zh.md)。
+本节描述 PD worker 和可选负载路由；TP2 bulk 的目标 GPU 正确性及 M8 阶段验收尚未完成。固定 P/D 路径与协议版本 2、3、4、5 继续可用；完整交接及部署约束见 [M5](m5_runtime_zh.md)、[M6](m6_runtime_zh.md) 和 [M7](m7_runtime_zh.md)。
 
 ## TP 命令与生命周期
 
@@ -9,6 +9,16 @@
 worker 在进入 `ModelRunner` 前监视 spawn 提供的 rank 0 sentinel，使用 Linux `F_SETOWN`、`F_SETSIG` 和 `O_ASYNC`，父进程退出时由内核发送 `SIGKILL`；注册后还检查 sentinel 是否已经就绪，覆盖注册前父进程已退出的窗口。此信号针对父进程存活，不依赖创建 worker 的线程持续存活。依据为 CPython 3.11.16 的 `multiprocessing/spawn.py` 和 `popen_spawn_posix.py` 中 bootstrap pipe 的生命周期，以及 Linux v6.12 `fs/pipe.c`、`fs/fcntl.c` 中 pipe 异步通知和信号配置机制；v6.12 源码不是对目标服务器内核版本的声明，信号发送失败时该版本源码还有回退到 `SIGIO` 的路径。纯 Python 监视线程无法在持有 GIL 的 C 调用中保证运行；本机真实 checkpoint FIFO 和 CPU/Gloo 已覆盖这里的初始化阻塞。监视从 worker 目标函数开始，不覆盖此前的 spawn bootstrap；如果额外 fork 的进程继承并保留 sentinel 写端，父进程死亡通知会延迟，内核不可杀 I/O 也不能保证有限时间退出。
 
 引擎退出时先记录实际 worker 的 PID 和退出码，再关闭已退出的 `Process`、pipe 与映射；结果分别保存在 `worker_pids` 和 `worker_exitcodes`。如果 worker 在 TERM/KILL 后仍存活，保留其进程对象和控制资源并报告清理错误。多次 `exit()` 安全；目标服务器 CUDA/NCCL、14B 及原 M4 BF16 TP2 严格 token 失败仍须独立验收。
+
+## TP2 prefill bulk
+
+PD worker 支持 `world_size=2` 的 prefill 和 `world_size=1` 的 decode，TP2 仅支持 bulk；TP2 early/pipeline、TP>1 decode 在入口拒绝。网关模型配置仍用 TP1 以描述全局架构和 tokenizer，load 模式可将同一个 P 配到多个允许的 D，并逐条检查采样 seed 不碰撞。TP2 P 的 KV head 数必须能被 2 整除；metadata 仍描述全部 head，D 按自己的 block table 恢复。P rank 按本地 cache 真实拷贝有效位置，尾块 data 补零、FP8 scale 补 1；独立 Gloo 组按 rank 收集原始 `uint8`，rank 0 依据全局 head 顺序合并 data 和 scale，不重新量化。该组只在 PD TP2 P 创建，默认 NCCL 组仍用于模型计算，组和命令均使用配置的 `tp_command_timeout_s`；1 MiB 槽只承载命令描述符。失败时不自动降级或重试。
+
+启用 P `timing_path` 后，实际 `pd_export_done` 包含总 `payload_bytes`、`data_bytes`、`scale_bytes` 和 `tp_export`。后者的 `ranks` 分别记录按尾块填充的 `data_bytes`/`scale_bytes`、有效位置的 `valid_data_bytes`/`valid_scale_bytes` 和 `export_host_ms`；`gather_pack_host_ms` 包含 rank 0 等待 Gloo gather、合并和生成 bytes 的主机墙钟时间。这些值不是 PCIe CUDA event 时间，也不代表测得链路带宽。
+
+内存预算可按单个填充后 payload `W`、其中 scale 字节 `S`、每 rank shard `A=W/2` 和 P 的聚合上限 `B=max_transfer_bytes` 估算。显式分配在 rank 0 包括本地 shard `A`、gather 列表 `W`、全局 pack `W`、不可变 payload bytes `W`、全局 scale 临时 `S` 和一个局部 scale 临时 `S/2`，另有至多 `B-W` 的其他已保留 payload；保守合计不超过 `B-W+A+3W+1.5S`，即不超过 `5B`。rank 1 的显式 shard 与 scale 临时至多 `A+S/2`。D 的一次 restore 同时持有 payload、`bytearray` 和 scale 临时，约 `2W+S`。这些只统计上述明确的 host 对象，不包括 Gloo、PyTorch allocator、TCP/asyncio 缓冲、网关 staging、模型和 GPU cache，也不是 RSS 实测或总 RSS 上限；并发逻辑预算仍由两端和网关分别执行。
+
+CPU 测试通过真实两进程 Gloo、生产 runner 命令、core、worker、TCP 和网关检查 BF16/FP8 scale 的全头原始字节、乱序块表和尾块，以及 rank 退出后的有界失败和重启。CPU 模型替身不验证 CUDA D2H/NCCL、真实模型数值或性能。原 M4 BF16 TP2 strict token 失败保持 FAIL；目标服务器 14B、GPU 全头传输和冻结 logits gate 仍待验收。
 
 ## P 可选择 D
 
@@ -28,7 +38,7 @@ uv run --no-sync python -m myvllm.pd.worker \
 
 - `allowed_decode_endpoints`：P 的允许列表；D 为 `null`。`decode_endpoint` 仍是 P 的默认目标。
 - `enable_chunked_prefill`：实际 Scheduler 是否启用 chunked prefill；`local_prefill_enabled` 仅在 D 且已启用时为 true。
-- `enforce_eager`、`world_size`；已有 `pipeline_frame_bytes` 为零时表示流水未启用。当前 PD worker 仍限制 `world_size=1`。
+- `enforce_eager`、`world_size`；已有 `pipeline_frame_bytes` 为零时表示流水未启用。TP2 只用于 bulk prefill，decode 仍为 TP1。
 - `max_transfer_bytes` 是该 worker 所有未完成交接的聚合逻辑预留上限；`max_payload_bytes` 是单个请求按 block 填充后的逻辑 payload 和 wire body 上限。两者也出现在事务 open 响应中。
 
 JSON 中端点为 `[host, port]`。固定网关继续按固定 pair 工作；下述负载模式会核对配置 inventory 中每条允许的 P/D 路径。
@@ -128,7 +138,9 @@ load 模式按实际 JSON/UTF-8 编码检查选路时已知的请求字段和控
 
 同一输出目录另外生成四个 `whole-control-N` 与四个 `chunk-control-N` 单实例配置和启动脚本，逐卡独立配置、seed、端口和计时文件；各组以 manifest 中的四个 endpoint 组成一个目的地集合。manifest 同时记录物理 GPU 顺序、NUMA 映射、P/D 采样种子、策略与 chunk budget。各比较组复用相同物理端口和 GPU，按组依次启动；它们不是要同时启动的八个 GPU 实例。实际 GPU 空闲、NUMA 绑定、独立引擎资源及运行结果仍须在目标服务器核验。
 
-当前已完成真实 CPU worker/TCP/HTTP 的负载路由和资源回收测试；CPU 测试使用模型执行替身，不证明 CUDA Graph、DMA 或 14B 的正确性与性能。目标服务器 GPU、跨 NUMA、L3、TP2 和完整 M8 评测仍待验收。
+显式追加 `--m8-tp2-bulk` 且使用 `--physical-gpus 0 1 3 4` 时，另生成 `tp2-bulk-*` 配置：一个 TP2 P 使用 GPU0/1，两个 TP1 D 使用 GPU3/4，D 的 chunk budget 与同一比较组一致；gateway 使用一个重复的 P endpoint 和两个 D endpoint，load 选路、禁用 elastic、仅 bulk。原 TP1 配置继续独立生成；请求计划、客户端、输出预算和四卡集合由同一比较实验指定。生成器仍要求为现有 M8 bulk/pipeline 消融显式提供 pipeline 参数，但 TP2 的 worker 和 gateway 配置不启用 pipeline。manifest 单独标识 TP2 配置、设备和 seed。
+
+当前已完成真实 CPU worker/TCP/HTTP 的负载路由和资源回收测试；CPU 测试使用模型执行替身，不证明 CUDA Graph、DMA 或 14B 的正确性与性能。目标服务器 GPU、跨 NUMA、L3、TP2 和完整 M8 评测仍待验收。四卡 tiny smoke 入口为 `RUN_PD_TP2_GPU=1 python -m pytest -q -s tests/test_pd_tp_gpu.py`；运行前须由主 agent 调度 GPU0/1/3/4，且测试的 token 或 logits 差异会失败并保留报告。它不能取代原 M4 strict 测试及 14B gate。
 
 ## L2/L3 请求计划与公共流式客户端
 
@@ -189,7 +201,7 @@ uv run python tools/analyze_trace.py --plan "$PLAN_JSONL" --run-dir "$RUN_DIR" -
 
 ## 独立 PD 数值捕获
 
-`tools/compare_pd.py` 供正确性诊断，要求 reference、P、D 的 `world_size=1`，明确拒绝 TP2；实际 engine 从指定 Git checkout 导入并核对完整 SHA，每个模型进程分别记录导入路径、被跟踪源码哈希、源码状态、实际 KV/scale 格式和输入及运行时配置。harness 的路径和哈希另记。三个实例必须使用相同模型、架构、精度、EOS 和总长度。各模型 step 显式在 `torch.inference_mode()` 下执行，采样保持 greedy。reference 每例完成后保存，且进程已退出后才启动 D、P。
+`tools/compare_pd.py` 供正确性诊断，reference 和 D 要求 `world_size=1`，bulk P 可为 TP1 或 TP2；TP2 P 的 `--prefill-gpu` 显式传两个不同的物理 GPU index（如 `0,1`）或两个 UUID，且不能使用 `--raw-kv`。TP2 的 rank 0 cache 快照仅包含局部 head，不作为全局 KV；全头字节通过上述交接测试单独核对。实际 engine 从指定 Git checkout 导入并核对完整 SHA，每个模型进程分别记录导入路径、被跟踪源码哈希、源码状态、实际 KV/scale 格式和输入及运行时配置。harness 的路径和哈希另记。三个实例必须使用相同模型、架构、精度、EOS 和总长度。各模型 step 显式在 `torch.inference_mode()` 下执行，采样保持 greedy。reference 每例完成后保存，且进程已退出后才启动 D、P。
 
 每例保留原始 `prompt` 和 `input_ids`，模型输入始终以原 ID 为准（token IDs authoritative），不重新编码替换。三方实际 tokenizer 的身份、`encode(prompt)` 和 `decode(input_ids)` 观测必须一致。若 `encode(prompt)==input_ids`，正常接受；否则仅当 `decode(input_ids)==prompt` 时允许，适配 `compare_hf.py prepare` 先截断 ID、再解码文本的表示。截断多字节字符可生成 `�`，使文本无法重新编码回原 ID；各角色 `*.engine.json` 的 `tokenizer` 记录 `input_decodings`、两种关系的布尔值及 `lossy_nonroundtrip=true`。该标记表示文本相对原 ID 的非往返表示，不改变实际模型输入。编码和解码关系均不匹配时拒绝；这项边界不构成模型数值一致性结论。
 

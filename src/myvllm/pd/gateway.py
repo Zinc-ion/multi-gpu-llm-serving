@@ -57,9 +57,15 @@ def _worker_payload_limit(info):
     return payload
 
 
-def _validate_load_worker(info, role, request_timeout, max_payload_bytes):
-    if info["role"] != role or info["world_size"] != 1:
+def _validate_worker_role(info, role):
+    if (info["role"] != role or
+            not (info["world_size"] == 1 or
+                 role == "prefill" and info["world_size"] == 2 and not info["pipeline_frame_bytes"])):
         raise ValueError(f"Incompatible {role} worker role or world size")
+
+
+def _validate_load_worker(info, role, request_timeout, max_payload_bytes):
+    _validate_worker_role(info, role)
     if info["request_timeout"] < request_timeout:
         raise ValueError(f"{role} worker timeout is shorter than gateway timeout")
     if _worker_payload_limit(info) > max_payload_bytes:
@@ -219,6 +225,7 @@ class PDGateway:
         for pe, de in self.pairs:
             pi, di = await asyncio.gather(PDClient.info(pe), PDClient.info(de))
             for info, role in ((pi, "prefill"), (di, "decode")):
+                _validate_worker_role(info, role)
                 if (info["role"] != role or info["model"] != spec
                         or info["max_model_length"] != self.config["max_model_length"]):
                     raise ValueError(f"Incompatible {role} worker model or length")

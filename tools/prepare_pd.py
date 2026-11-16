@@ -52,6 +52,8 @@ def generate(args):
             or resources["gateway_max_payload_bytes"] > resources["gateway_max_staging_bytes"]):
         raise ValueError("worker payload must fit its aggregate and gateway payload; staging must fit gateway payload")
     topology = TOPOLOGIES[args.topology]
+    if args.m8_tp2_bulk and (not args.m8_comparison or args.physical_gpus != [0, 1, 3, 4]):
+        raise ValueError("TP2 bulk requires M8 comparison with physical-gpus 0 1 3 4")
     if args.m8_comparison:
         if args.topology != "2p2d" or args.physical_gpus is None:
             raise ValueError("M8 comparison requires 2p2d and four explicit physical GPUs")
@@ -296,6 +298,55 @@ def generate(args):
                           "load": ["http://127.0.0.1:8000"],
                           "elastic": ["http://127.0.0.1:8000"], **controls},
         }
+        if args.m8_tp2_bulk:
+            pe = ["127.0.0.1", 9100]
+            decodes = [["127.0.0.1", 9200 + index] for index in range(2)]
+            tp2_settings = {**load, "pairs": [{"prefill": pe, "decode": de} for de in decodes],
+                            "elastic": {"enabled": False}}
+            tp2_settings.pop("pipeline_min_tokens", None)
+            files["tp2-bulk-gateway.json"] = json.dumps(tp2_settings, indent=2) + "\n"
+            gateway_model = dict(config, timing_path=str(output / "tp2-bulk-gateway.timing.jsonl"))
+            files["tp2-bulk-gateway-model.json"] = json.dumps(gateway_model, indent=2) + "\n"
+            tp2_gateway = [python, "-m", "myvllm.pd.gateway",
+                           "--config", output / "tp2-bulk-gateway-model.json",
+                           "--gateway-config", output / "tp2-bulk-gateway.json",
+                           "--served-model-name", "Qwen3-14B", "--host", "127.0.0.1", "--port", 8000]
+            files["tp2-bulk-gateway.sh"] = (
+                prefix + "export CUDA_VISIBLE_DEVICES=''\nexec "
+                + command(["numactl", "--cpunodebind=0", "--membind=0", *tp2_gateway]) + "\n")
+            tp2_ready = [python, "-m", "myvllm.pd.ready", "--gateway-config", output / "tp2-bulk-gateway.json"]
+            files["tp2-bulk-ready.sh"] = prefix + "export CUDA_VISIBLE_DEVICES=''\nexec " + command(tp2_ready) + "\n"
+            files["tp2-bulk-workers-ready.sh"] = (
+                prefix + "export CUDA_VISIBLE_DEVICES=''\nexec " + command(tp2_ready + ["--workers-only"]) + "\n")
+            roles = [("prefill", None, pe, "0,1", 0, seeds[0])]
+            roles += [("decode", index, endpoint, str(gpu), 1, seeds[index])
+                      for index, (endpoint, gpu) in enumerate(zip(decodes, (3, 4)))]
+            for role, index, endpoint, gpu, node, seed in roles:
+                name = "tp2-bulk-prefill" if role == "prefill" else f"tp2-bulk-decode-{index}"
+                role_config = dict(config, seed=seed, timing_path=str(output / f"{name}.timing.jsonl"),
+                                   world_size=2 if role == "prefill" else 1)
+                if role == "prefill":
+                    role_config.update(enable_chunked_prefill=False, enforce_eager=True)
+                else:
+                    role_config.update(enable_chunked_prefill=True, max_num_batched_tokens=args.chunk_tokens)
+                files[f"{name}.json"] = json.dumps(role_config, indent=2) + "\n"
+                cmd = [python, "-m", "myvllm.pd.worker", "--role", role,
+                       "--config", output / f"{name}.json", "--host", endpoint[0], "--port", endpoint[1],
+                       "--max-connections", resources["worker_max_connections"],
+                       "--max-transfer-bytes", resources["worker_max_transfer_bytes"],
+                       "--max-payload-bytes", resources["worker_max_payload_bytes"], "--request-timeout", 600]
+                if role == "prefill":
+                    cmd += ["--decode-host", decodes[0][0], "--decode-port", decodes[0][1],
+                            "--allowed-decode-endpoints", json.dumps(decodes)]
+                files[f"{name}.sh"] = (
+                    prefix + f"export CUDA_VISIBLE_DEVICES={gpu}\nexec "
+                    + command(["numactl", f"--cpunodebind={node}", f"--membind={node}", *cmd]) + "\n")
+            manifest["m8_comparison"]["tp2_bulk"] = {
+                "prefill_gpus": [0, 1], "decode_gpus": [3, 4], "prefill_seed": seeds[0],
+                "decode_sampling_seeds": [seed ^ 0x80000000 for seed in seeds],
+                "chunk_tokens": args.chunk_tokens, "gateway_settings": tp2_settings,
+                "endpoint": "http://127.0.0.1:8000", "transfer": "bulk",
+            }
     files["manifest.json"] = json.dumps(manifest, indent=2) + "\n"
     return output, files
 
@@ -321,6 +372,7 @@ def main():
                         help="Opt-in prompt threshold; uncalibrated until measured on target hardware")
     parser.add_argument("--pipeline-frame-bytes", type=int, default=0)
     parser.add_argument("--m8-comparison", action="store_true")
+    parser.add_argument("--m8-tp2-bulk", action="store_true")
     parser.add_argument("--m8-routing-transfer", choices=("bulk", "pipeline"), default="bulk")
     parser.add_argument("--physical-gpus", type=int, nargs=4, metavar=("P0", "P1", "D0", "D1"))
     parser.add_argument("--poll-interval-s", type=float)

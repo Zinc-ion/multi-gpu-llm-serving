@@ -15,6 +15,7 @@ from myvllm.engine.input_batch import build_prefill_batch
 from myvllm.engine.ipc import read_command, write_command, wait_for_consumption
 from myvllm.utils import *
 from myvllm.config import resolve_dtype, resolve_kv_cache_dtype, seed_everything
+from myvllm.pd.tp import export_tp_kv
 from myvllm.utils.timing import StepTimings
 
 class ModelRunner:
@@ -44,6 +45,7 @@ class ModelRunner:
         self.event = event
         self.timings = None
         self._exited = False
+        self.tp_export_group = None
 
         # set distributed config
         self.block_size = config['block_size']
@@ -73,6 +75,8 @@ class ModelRunner:
             store = dist.TCPStore("127.0.0.1", port, is_master=False, **distributed_timeout)
         dist.init_process_group('nccl', store=store, world_size=config['world_size'], rank=rank, **distributed_timeout)
         torch.cuda.set_device(rank)
+        if config.get("_pd_tp_bulk"):
+            self.tp_export_group = dist.new_group(backend='gloo', timeout=timedelta(seconds=self.tp_command_timeout_s))
 
         # set model
         path_str = self.config['model_name_or_path']
@@ -190,11 +194,20 @@ class ModelRunner:
                 self.timings.flush()
         finally:
             try:
-                # Check if process group exists before destroying
-                if dist.is_initialized():
-                    dist.destroy_process_group()
+                try:
+                    if self.tp_export_group is not None:
+                        dist.destroy_process_group(self.tp_export_group)
+                        self.tp_export_group = None
+                finally:
+                    # Check if process group exists before destroying
+                    if dist.is_initialized():
+                        dist.destroy_process_group()
             finally:
                 self._standalone_store = None
+
+    def export_pd_tp_kv(self, block_table, cached_tokens, spec):
+        return export_tp_kv(self.kv_cache, self.kv_cache_scales, block_table,
+                            cached_tokens, spec, self.rank, self.tp_export_group)
     
     # wait to read method and args from shared memory
     # execute the method with args

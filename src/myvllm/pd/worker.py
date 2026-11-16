@@ -1,4 +1,4 @@
-"""TP=1 PD worker: bounded TCP transactions and one engine-owner thread."""
+"""PD worker: bounded TCP transactions and one engine-owner thread."""
 
 import argparse
 import asyncio
@@ -401,9 +401,14 @@ class _Owner:
                 started = time.perf_counter()
                 data = self.core.export(handle)
                 if first:
+                    tp_metrics = ({"tp_export": handle._tp_export_metrics}
+                                  if handle._tp_export_metrics is not None else {})
+                    components = descriptor_components(handle._metadata["kv"])
+                    if tp_metrics and not components:
+                        components = {"data_bytes": len(data), "scale_bytes": 0}
                     self._record("pd_export_done", ctx, payload_bytes=len(data),
                                  export_ms=(time.perf_counter() - started) * 1000,
-                                 **descriptor_components(handle._metadata["kv"]))
+                                 **components, **tp_metrics)
                 self._resolve(future, (None, data))
                 return True
             elif op == "restore" and self.worker.role == "decode":
@@ -599,8 +604,14 @@ class PDWorker:
                  engine_factory=LLMEngine, pipeline_frame_bytes=0, max_payload_bytes=None):
         if role not in ("prefill", "decode"):
             raise ValueError("role must be prefill or decode")
-        if config["world_size"] != 1:
-            raise ValueError("PD workers require world_size == 1")
+        world_size = config["world_size"]
+        if world_size != 1 and not (role == "prefill" and world_size == 2):
+            raise ValueError("PD workers require TP1 or TP2 bulk prefill")
+        if world_size == 2:
+            if pipeline_frame_bytes:
+                raise ValueError("TP2 prefill supports bulk only")
+            if config["num_kv_heads"] % 2:
+                raise ValueError("TP2 prefill requires an even number of KV heads")
         if role == "prefill":
             decode_endpoint = _decode_endpoint(decode_endpoint)
             if allowed_decode_endpoints is None:
@@ -632,7 +643,7 @@ class PDWorker:
             if not config.get("enforce_eager", False) or config.get("enable_chunked_prefill", False):
                 raise ValueError("Pipeline requires TP1 whole eager prefill")
         self.role = role
-        self.config = config
+        self.config = {**config, "_pd_tp_bulk": True} if world_size == 2 else config
         self.max_connections = max_connections
         self.max_transfer_bytes = max_transfer_bytes
         self.max_payload_bytes = max_payload_bytes

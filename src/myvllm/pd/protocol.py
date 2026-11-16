@@ -41,10 +41,11 @@ def finite_number(value):
         return False
 
 
-def model_spec(engine):
+def model_spec(engine, allow_tp_prefill=False):
     config = engine.config
-    if config["world_size"] != 1:
-        raise ValueError("PD core requires world_size == 1")
+    world_size = config["world_size"]
+    if world_size != 1 and not (allow_tp_prefill and world_size == 2 and config.get("_pd_tp_bulk")):
+        raise ValueError("PD core requires world_size == 1 or TP2 bulk prefill")
     if not isinstance(config.get("model_revision"), str) or not config["model_revision"]:
         raise ValueError("PD core requires an explicit model_revision")
     cache = engine.model_runner.kv_cache
@@ -56,8 +57,10 @@ def model_spec(engine):
     block_size = config["block_size"]
     heads = config["num_kv_heads"]
     head_dim = config["head_dim"]
+    if heads % world_size:
+        raise ValueError("KV heads must be divisible by world_size")
     shape = (2, config["num_layers"], len(engine.scheduler.block_manager.blocks),
-             block_size, heads, head_dim)
+             block_size, heads // world_size, head_dim)
     if tuple(cache.shape) != shape or block_size != engine.scheduler.block_manager.block_size:
         raise ValueError("KV cache shape does not match the scheduler and model")
     if cache_format is not None:

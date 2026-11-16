@@ -32,6 +32,10 @@ GPU 入口使用 `tests/tp_engine_helpers.py` 创建真实 tokenizer/checkpoint�
 
 `tests/test_tp_engine_gpu.py` 的 TP=1 入口于 2026-11-15 在本机 RTX 5080 Laptop GPU 实测通过：FP32/HF 最大绝对误差 `1.4901161e-7`，BF16/HF 为 `0.0029296875`，各自三个 greedy token 完全一致。`tests/test_tp_gpu.py` 复用相同 helper 对照 TP=1/TP=2/HF，但本机只有一张 GPU，两种 dtype 均明确 skip。单卡没有 TP collective，不能将其零次通信记录当作双卡 NCCL 测量；真实 TP=2、目标服务器和 14B 仍未验收。
 
+2026-11-16 的目标服务器 tiny 复现中，原 M4 `c7bf6d331b42b1a7e078f6f728126218dc774d51` 的 BF16 TP2 第三个 greedy token 为 62，HF/TP1 为 41；三个同前缀 logits 事后复算在原 tiny 阈值内，严格 token 验收仍失败。`tools/diagnose_tp.py --help` 提供独立诊断入口：显式指定原源码、原 checkpoint、两份配置、已有 HF/TP 捕获及资产清单，在新目录逐 rank 保存加载权重、模块输入输出和真实 collective 前后张量；仅对相同前缀和匹配的分片语义做比较。它不修改原引擎，每步等待 worker 的完成标记；CPU 拷贝、等待和 hook 可能改变同步或编译边界，插桩结果须与原失败分开报告。控制器在启动 TP2 子进程前独占创建并持有通信共享内存，引擎附着并按原逻辑退出；进程组退出后，只回收本次创建且设备与 inode 仍匹配的段。清理期间记录中断并完成进程组及共享内存处理，所有期限须为有限正数。`--preflight-only` 仅核验输入和实际导入的源码，不启动 GPU 引擎；退出码 2 表示原始或插桩后的严格 greedy/原 logits 门槛失败，3 表示输入来源哈希未核验，4 表示分片权重不匹配，1 表示运行错误。
+
+同日 GPU0/1 的原 M4 插桩使用诊断脚本 SHA-256 `88d69243b5582f04a027d580928fba350b8584d23dff00ea0530959b7b802555`：TP1/TP2 的三个 token 分别仍为 `[32, 33, 41]` / `[32, 33, 62]`，三个 rank 的加载权重均与对应 checkpoint 分片一致。首个观察到的精确差异位于第 0 层 `self_attn.o_proj` 输出，113/320 个元素不同，最大绝对差为 `0.000244140625`；这不能确定根因。该轮使用的是共享内存强制清理修复前的脚本，作为历史结果保留。后续 `p3a-gpu-bf16-04` 使用固定候选 `fb51c70bb4d0061a5b5b901d70ac44a4f79d2501`、诊断脚本 SHA-256 `5099d7628205e150832956b0adabba14e018fc9f0022801ddbacea3a35195c96` 对原 M4 BF16 用例复跑，TP1/TP2 lane 均正常退出（exit 0），输出仍分别为 `[32, 33, 41]` / `[32, 33, 62]`，无 TERM/KILL 或存活进程组，TP2 通信共享内存记录为 `already_released`。该次正常 GPU 运行未触发异常或强杀清理，相关异常路径由 CPU 验证；原 strict greedy 仍为 FAIL，继续阻塞 TP2 验收。
+
 ## 目标服务器复现模板
 
 以下命令在服务器项目根目录执行，**尚未运行**。先固定经审核的候选 commit，并确认指定的两张 GPU 获准使用且空闲。所有新增文件、缓存和日志位于 `/Data2/zincion/ai-infra` 下；`M4_DATA` 每轮使用新目录。示例依赖 M2 已保存的配置及捕获文件；如果路径不同，应先定位同一模型 revision、精度和输入，不重新生成假数据。

@@ -5,15 +5,32 @@ import torch
 import torch.nn as nn
 
 @triton.jit
+def _maximum_propagate_nan(a, b):
+    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@triton.jit
+def _fp16_round_to_odd(x):
+    half = x.to(tl.float16, fp_downcast_rounding="rtz")
+    bits = half.to(tl.uint16, bitcast=True)
+    # Preserve discarded FP32 bits so the subsequent FP8 ties round correctly.
+    bits = bits | (half.to(tl.float32) != x).to(tl.uint16)
+    return bits.to(tl.float16, bitcast=True)
+
+
+@triton.jit
 def store_kvcache_kernel(
     key_ptr, # pointer to what we want to store
     value_ptr,
     k_cache_ptr, # pointer to where we want to store
     v_cache_ptr,
     slot_mapping_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    block_size: tl.constexpr
+    block_size: tl.constexpr,
+    FP8_CACHE: tl.constexpr,
 ):
     """
     Store keys and values into paged KV cache.
@@ -58,6 +75,27 @@ def store_kvcache_kernel(
     # load key and value value floats from the pointers's memory
     key = tl.load(key_ptr + input_offset)
     value = tl.load(value_ptr + input_offset)
+
+    if FP8_CACHE:
+        key = key.to(tl.float32)
+        value = value.to(tl.float32)
+        key_amax = tl.reduce(tl.abs(key), 0, _maximum_propagate_nan)
+        value_amax = tl.reduce(tl.abs(value), 0, _maximum_propagate_nan)
+        # Match PyTorch's FP32 scalar division, which multiplies by the rounded reciprocal.
+        key_scale = tl.where(key_amax == 0, 1.0, tl.maximum(key_amax * (1.0 / 448.0), 1.1754943508222875e-38, propagate_nan=tl.PropagateNan.ALL))
+        value_scale = tl.where(value_amax == 0, 1.0, tl.maximum(value_amax * (1.0 / 448.0), 1.1754943508222875e-38, propagate_nan=tl.PropagateNan.ALL))
+        scale_offset = slot_idx * num_kv_heads + head_idx
+        tl.store(k_scale_ptr + scale_offset, key_scale)
+        tl.store(v_scale_ptr + scale_offset, value_scale)
+        # Triton's div_rn emits an FTZ instruction; preserve subnormal inputs.
+        key = tl.inline_asm_elementwise("div.rn.f32 $0, $1, $2;", "=f,f,f", [key, key_scale],
+                                        dtype=tl.float32, is_pure=True, pack=1)
+        value = tl.inline_asm_elementwise("div.rn.f32 $0, $1, $2;", "=f,f,f", [value, value_scale],
+                                          dtype=tl.float32, is_pure=True, pack=1)
+        key = tl.minimum(tl.maximum(key, -448.0, propagate_nan=tl.PropagateNan.ALL), 448.0, propagate_nan=tl.PropagateNan.ALL)
+        value = tl.minimum(tl.maximum(value, -448.0, propagate_nan=tl.PropagateNan.ALL), 448.0, propagate_nan=tl.PropagateNan.ALL)
+        key = _fp16_round_to_odd(key)
+        value = _fp16_round_to_odd(value)
     
     # store into cache
     tl.store(k_cache_ptr + cache_offset, key)
@@ -70,7 +108,9 @@ def store_kvcache(
     k_cache: torch.Tensor, 
     v_cache: torch.Tensor, 
     slot_mapping: torch.Tensor,
-    block_size: int
+    block_size: int,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ):
     """
     Store key-value pairs into paged cache.
@@ -102,9 +142,12 @@ def store_kvcache(
         k_cache,
         v_cache,
         slot_mapping,
+        k_scale_cache if k_scale_cache is not None else k_cache,
+        v_scale_cache if v_scale_cache is not None else v_cache,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
-        block_size=block_size
+        block_size=block_size,
+        FP8_CACHE=k_scale_cache is not None,
     )
 
 
@@ -285,10 +328,11 @@ def flash_attention_prefill(
 @triton.jit
 def paged_attention_prefill_kernel(
     Q, K, V, O, cu_seqlens_q_ptr, cu_seqlens_k_ptr, block_tables_ptr,
+    K_scale, V_scale,
     scale,
     num_heads: tl.constexpr, num_kv_heads: tl.constexpr, head_dim: tl.constexpr,
     block_size: tl.constexpr, max_num_blocks: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, FP8_CACHE: tl.constexpr,
 ):
     start_m, head_idx, seq_idx = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     kv_head_idx = head_idx // (num_heads // num_kv_heads)
@@ -301,6 +345,8 @@ def paged_attention_prefill_kernel(
     offs_d = tl.arange(0, head_dim)
     q_ptrs = Q + (q_start + offs_m[:, None]) * num_heads * head_dim + head_idx * head_dim + offs_d[None, :]
     q = tl.load(q_ptrs, mask=(offs_m < q_len)[:, None], other=0.0)
+    if FP8_CACHE:
+        q = q.to(tl.float32)
     acc = tl.zeros([BLOCK_M, head_dim], tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     m_i = tl.full([BLOCK_M], -1e10, tl.float32)
@@ -319,12 +365,19 @@ def paged_attention_prefill_kernel(
             + kv_head_idx * head_dim
         )
         k = tl.load(K + cache_offsets[None, :] + offs_d[:, None], mask=valid[None, :], other=0.0)
+        if FP8_CACHE:
+            scale_offsets = (physical_block * block_size + offs_n % block_size) * num_kv_heads + kv_head_idx
+            k_scale = tl.load(K_scale + scale_offsets, mask=valid, other=1.0)
+            k = k.to(tl.float32) * k_scale[None, :]
         scores = tl.dot(q, k, input_precision="ieee") * scale
         scores = tl.where(valid[None, :] & (offs_n[None, :] <= positions[:, None]), scores, -1e10)
         m_new = tl.maximum(m_i, tl.max(scores, 1))
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(scores - m_new[:, None])
         v = tl.load(V + cache_offsets[:, None] + offs_d[None, :], mask=valid[:, None], other=0.0)
+        if FP8_CACHE:
+            v_scale = tl.load(V_scale + scale_offsets, mask=valid, other=1.0)
+            v = v.to(tl.float32) * v_scale[:, None]
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision="ieee")
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_new
@@ -335,6 +388,7 @@ def paged_attention_prefill_kernel(
 def paged_attention_prefill(
     q, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k, block_tables,
     max_seqlen_q, scale, num_heads, num_kv_heads, head_dim, block_size,
+    k_scale_cache=None, v_scale_cache=None,
 ):
     """Packed suffix queries read their entire causal prefix through block tables."""
     q = q.contiguous()
@@ -343,9 +397,11 @@ def paged_attention_prefill(
     grid = (triton.cdiv(max_seqlen_q, tile_size), num_heads, cu_seqlens_q.numel() - 1)
     paged_attention_prefill_kernel[grid](
         q, k_cache, v_cache, output, cu_seqlens_q, cu_seqlens_k, block_tables,
+        k_scale_cache if k_scale_cache is not None else k_cache,
+        v_scale_cache if v_scale_cache is not None else v_cache,
         scale, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
         block_size=block_size, max_num_blocks=block_tables.shape[1],
-        BLOCK_M=tile_size, BLOCK_N=tile_size,
+        BLOCK_M=tile_size, BLOCK_N=tile_size, FP8_CACHE=k_scale_cache is not None,
     )
     return output
 
@@ -358,6 +414,8 @@ def paged_attention_decode_kernel(
     v_cache_ptr,
     block_tables_ptr,
     context_lens_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     scale: tl.constexpr,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -365,6 +423,7 @@ def paged_attention_decode_kernel(
     block_size: tl.constexpr,
     max_num_blocks: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    FP8_CACHE: tl.constexpr,
 ):
     """
     Optimized paged attention kernel for decode phase.
@@ -438,6 +497,10 @@ def paged_attention_decode_kernel(
             # Compute attention scores for this chunk
             k = tl.load(k_cache_ptr + kv_offset, mask=valid[None, :], other=0.0)
             k = tl.cast(k, tl.float32)
+            if FP8_CACHE:
+                scale_offset = (physical_block * block_size + offs_in_block) * num_kv_heads + kv_head_idx
+                k_scale = tl.load(k_scale_ptr + scale_offset, mask=valid, other=1.0)
+                k = k * k_scale[None, :]
             score = tl.sum(q[:, None] * k, axis=0) * scale
             qk = tl.where(valid, score, -1e10)
 
@@ -454,6 +517,9 @@ def paged_attention_decode_kernel(
             # Accumulate weighted values
             v = tl.load(v_cache_ptr + kv_offset, mask=valid[None, :], other=0.0)
             v = tl.cast(v, tl.float32)
+            if FP8_CACHE:
+                v_scale = tl.load(v_scale_ptr + scale_offset, mask=valid, other=1.0)
+                v = v * v_scale[None, :]
             weight = tl.where(valid, p, 0.0)
             acc = acc + tl.sum(weight[None, :] * v, axis=1)
             l_i = l_i + tl.sum(weight)
@@ -478,7 +544,9 @@ def paged_attention_decode(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    block_size: int
+    block_size: int,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute attention in decode mode using paged KV cache.
@@ -514,6 +582,8 @@ def paged_attention_decode(
         v_cache,
         block_tables,
         context_lens,
+        k_scale_cache if k_scale_cache is not None else k_cache,
+        v_scale_cache if v_scale_cache is not None else v_cache,
         scale=scale,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -521,6 +591,7 @@ def paged_attention_decode(
         block_size=block_size,
         max_num_blocks=max_num_blocks,
         BLOCK_N=BLOCK_N,
+        FP8_CACHE=k_scale_cache is not None,
     )
     
     return output
@@ -542,10 +613,12 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.block_size = block_size
         self.k_cache = self.v_cache = torch.tensor([])
+        self.k_scale_cache = self.v_scale_cache = None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        cache_scales = () if self.k_scale_cache is None else (self.k_scale_cache, self.v_scale_cache)
 
         # Store current k, v into cache if cache is allocated
         if k_cache.numel() > 0 and v_cache.numel() > 0 and context.slot_mapping is not None:
@@ -560,7 +633,7 @@ class Attention(nn.Module):
                 k_to_store = k.contiguous()
                 v_to_store = v.contiguous()
             
-            store_kvcache(k_to_store, v_to_store, k_cache, v_cache, context.slot_mapping, self.block_size)
+            store_kvcache(k_to_store, v_to_store, k_cache, v_cache, context.slot_mapping, self.block_size, *cache_scales)
 
         scale = self.scale / (self.head_dim ** 0.5)
 
@@ -575,7 +648,7 @@ class Attention(nn.Module):
                 o = paged_attention_prefill(
                     q, k_cache, v_cache, cu_seqlens, context.cu_seqlens_k,
                     context.block_tables, context.max_seqlen_q, scale,
-                    self.num_heads, self.num_kv_heads, self.head_dim, self.block_size,
+                    self.num_heads, self.num_kv_heads, self.head_dim, self.block_size, *cache_scales,
                 )
             else:
                 o = flash_attention_prefill(q, k, v, cu_seqlens, scale,
@@ -593,7 +666,8 @@ class Attention(nn.Module):
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                self.block_size
+                self.block_size,
+                *cache_scales
             )
             # o: (batch_size, num_heads, head_dim) -> (batch_size, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)

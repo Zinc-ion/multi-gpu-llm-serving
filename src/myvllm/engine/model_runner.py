@@ -13,14 +13,28 @@ from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.input_batch import build_prefill_batch
 from myvllm.utils import *
-from myvllm.config import resolve_dtype, seed_everything
+from myvllm.config import resolve_dtype, resolve_kv_cache_dtype, seed_everything
 from myvllm.utils.timing import StepTimings
 
 class ModelRunner:
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
+        self._standalone_store = None
+        had_process_group = dist.is_initialized()
+        try:
+            self._initialize(config, rank, event)
+        except BaseException:
+            try:
+                if not had_process_group and dist.is_initialized():
+                    dist.destroy_process_group()
+            finally:
+                self._standalone_store = None
+            raise
+
+    def _initialize(self, config: dict, rank: int, event: Event | list[Event]):
         self.config = config
         self.event = event
         self.timings = None
+        self._exited = False
 
         # set distributed config
         self.block_size = config['block_size']
@@ -29,8 +43,21 @@ class ModelRunner:
 
         self.rank = rank
         seed_everything(config.get('seed', 0))
-        torch.set_default_dtype(resolve_dtype(config.get('dtype', 'float32')))
-        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
+        model_dtype = resolve_dtype(config.get('dtype', 'float32'))
+        self.kv_cache_dtype = resolve_kv_cache_dtype(config.get('kv_cache_dtype', 'auto'), model_dtype)
+        torch.set_default_dtype(model_dtype)
+        resources = config.get("_instance_resources")
+        if resources is None:
+            if self.world_size != 1:
+                raise ValueError("Multi-rank ModelRunner requires engine instance resources")
+            self._standalone_store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+            # A failed process-group initialization may retain its store in the traceback.
+            store = dist.TCPStore("127.0.0.1", self._standalone_store.port, is_master=False)
+            shm_name = None
+        else:
+            port, shm_name = resources
+            store = dist.TCPStore("127.0.0.1", port, is_master=False)
+        dist.init_process_group('nccl', store=store, world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
 
         # set model
@@ -109,28 +136,16 @@ class ModelRunner:
         if config.get("timing_path") and self.rank == 0:
             self.timings = StepTimings()
 
-        # IMPORTANT: Set up shared memory and barrier AFTER all model initialization
+        # IMPORTANT: Attach shared memory and barrier AFTER all model initialization
         # This ensures both ranks complete warmup/allocation before rank 1 enters its event loop
         if self.world_size > 1:
-            # Synchronize before setting up shared memory
+            # Synchronize before attaching shared memory
             dist.barrier()
-            if self.rank == 0:
-                # Try to clean up existing shared memory first
-                try:
-                    old_shm = SharedMemory(name='myvllm')
-                    old_shm.close()
-                    old_shm.unlink()
-                except FileNotFoundError:
-                    pass  # Doesn't exist, which is fine
-                self.shm = SharedMemory(name='myvllm', create=True, size=2**20)
-                # Barrier to ensure rank 1 waits until shared memory is created
-                dist.barrier()
-            else:
-                # Wait for rank 0 to create shared memory
-                dist.barrier()
-                self.shm = SharedMemory(name='myvllm')
-                # Don't call self.loop() here - let the spawning code handle it
-                # Otherwise we'll be stuck in an infinite loop during __init__
+            self.shm = SharedMemory(name=shm_name)
+            # Wait until all ranks have attached before issuing calls.
+            dist.barrier()
+            # Don't call self.loop() here - let the spawning code handle it
+            # Otherwise we'll be stuck in an infinite loop during __init__
 
     # only use read when rank != 0
     def read_shm(self):
@@ -155,19 +170,25 @@ class ModelRunner:
 
     # close shared memory, destroy process group, delete graphs
     def exit(self):
-        if self.world_size > 1:
-            self.shm.close()
-            if self.rank == 0:
-                self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs
-            del self.graph_vars
-        torch.cuda.synchronize()
-        if self.timings:
-            self.timings.flush()
-        # Check if process group exists before destroying
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        if self._exited:
+            return
+        self._exited = True
+        try:
+            if self.world_size > 1:
+                self.shm.close()
+            if not self.enforce_eager:
+                del self.graphs
+                del self.graph_vars
+            torch.cuda.synchronize()
+            if self.timings:
+                self.timings.flush()
+        finally:
+            try:
+                # Check if process group exists before destroying
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            finally:
+                self._standalone_store = None
     
     # wait to read method and args from shared memory
     # execute the method with args
@@ -178,7 +199,6 @@ class ModelRunner:
             method_name, args = self.read_shm()
             self.call(method_name, *args) # Unpack args when calling
             if method_name == 'exit':
-                self.exit()
                 break
 
     # will be called by both rank == 0 and rank != 0
@@ -224,7 +244,10 @@ class ModelRunner:
 
         # check whether the current free memory can hold at least one block
         # compute the actual byte required of each block
-        block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
+        block_elements = self.block_size * 2 * num_layers * num_kv_heads
+        data_block_bytes = block_elements * head_dim * self.kv_cache_dtype.itemsize
+        scale_block_bytes = block_elements * torch.float32.itemsize if self.kv_cache_dtype == torch.float8_e4m3fn else 0
+        block_bytes = data_block_bytes + scale_block_bytes
         num_available_kv_blocks = min(int(available_mem // block_bytes), self.config['max_cached_blocks'])
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
         
@@ -266,6 +289,9 @@ class ModelRunner:
                 "warmup_peak_allocated_bytes": peak_mem_usage,
                 "current_allocated_bytes": current_mem_usage,
                 "warmup_extra_bytes": peak_mem_usage - current_mem_usage,
+                "model_dtype": str(self.default_dtype).removeprefix("torch."),
+                "kv_cache_dtype": str(self.kv_cache_dtype).removeprefix("torch."),
+                "data_block_bytes": data_block_bytes, "scale_block_bytes": scale_block_bytes,
                 "block_bytes": block_bytes, "block_count": self.config['max_cached_blocks'],
                 "kv_token_capacity": self.config['max_cached_blocks'] * self.block_size,
             }), flush=True)
@@ -273,12 +299,19 @@ class ModelRunner:
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, dtype=self.kv_cache_dtype, device=f'cuda:{self.rank}')
+        self.kv_cache = allocated_kv_cache
+        self.kv_cache_scales = None
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
+            self.kv_cache_scales = torch.ones(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, dtype=torch.float32, device=f'cuda:{self.rank}')
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
                 module.k_cache = allocated_kv_cache[0, layer_id]
                 module.v_cache = allocated_kv_cache[1, layer_id]
+                if self.kv_cache_scales is not None:
+                    module.k_scale_cache = self.kv_cache_scales[0, layer_id]
+                    module.v_scale_cache = self.kv_cache_scales[1, layer_id]
                 layer_id += 1
 
     # given seqs
@@ -389,6 +422,7 @@ class ModelRunner:
     # run model
     # sample logits
     # reset context
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if self.timings:
             self.timings.prepare()
@@ -399,7 +433,24 @@ class ModelRunner:
         if self.timings:
             self.timings.end_gpu("h2d")
             self.timings.start_gpu("forward")
-        logits = self.run_model(input_ids, is_prefill)
+        transfers = getattr(self, "layer_transfers", None)
+        active_transfers = [transfers[seq.seq_id] for seq in seqs if seq.seq_id in transfers] if transfers else []
+        hooks = []
+        if active_transfers:
+            for layer_id, layer in enumerate(self.model.model.layers):
+                def layer_ready(module, args, output, layer_id=layer_id):
+                    for transfer in active_transfers:
+                        transfer.on_layer(layer_id)
+                hooks.append(layer.register_forward_hook(layer_ready))
+        try:
+            logits = self.run_model(input_ids, is_prefill)
+        finally:
+            for hook in hooks:
+                hook.remove()
+            # postprocess may release the source blocks for a terminal first token.
+            # Socket sends only retain host slots after these D2H reads complete.
+            for transfer in active_transfers:
+                transfer.drain_copies()
         if self.timings:
             self.timings.end_gpu("forward")
         # only sample when rank == 0

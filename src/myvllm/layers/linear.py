@@ -3,6 +3,10 @@ import torch
 import torch.distributed as dist
 import os
 
+def _check_weight_shape(loaded_weights: torch.Tensor, expected_shape: tuple):
+    if tuple(loaded_weights.shape) != expected_shape:
+        raise ValueError(f"Shape mismatch: expected {expected_shape}, got {tuple(loaded_weights.shape)}")
+
 class LinearBase(nn.Module):
     """
     A base class for linear layers.
@@ -31,6 +35,13 @@ class LinearBase(nn.Module):
             self.bias.weight_loader = self.weight_loader 
         else:
             self.register_parameter('bias', None)
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse)
+        self.weight.weight_loader = self.weight_loader
+        if self.bias is not None:
+            self.bias.weight_loader = self.weight_loader
+        return self
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         raise NotImplementedError("Subclasses should implement this method.")
@@ -71,6 +82,7 @@ class ReplicatedLinear(LinearBase):
         super().__init__(input_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
+        _check_weight_shape(loaded_weights, tuple(param.shape))
         param.data.copy_(loaded_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -89,13 +101,15 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = True,
     ):
         tp_size = dist.get_world_size()
-        assert output_size % tp_size == 0, "Output size must be divisible by tensor parallel size."
+        if output_size % tp_size:
+            raise ValueError("Output size must be divisible by tensor parallel size.")
         super().__init__(input_size, output_size//tp_size, bias, tp_dim=0)
 
     # param: parameter after tensor parallelism
     # loaded_weights: the original full parameter to be loaded into param
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         param_data = param.data 
+        _check_weight_shape(loaded_weights, (param_data.size(0) * self.tp_size, *param_data.shape[1:]))
         # full_dim on the output column
         full_data_output_size = loaded_weights.size(0)
         # dim size after sharding
@@ -118,6 +132,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         bias: bool = True,
     ):
         self.output_sizes = output_sizes
+        if any(size % dist.get_world_size() for size in output_sizes):
+            raise ValueError("Each merged output size must be divisible by tensor parallel size.")
         super().__init__(input_size, sum(output_sizes), bias)
 
     # param: parameter to be reloaded after tensor parallelism
@@ -137,6 +153,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         ) which is also sharded by tp_size
         """
         param_data = param.data
+        _check_weight_shape(loaded_weights, (self.output_sizes[loaded_weight_id], *param_data.shape[1:]))
         # compute offset 
         offset = sum(self.output_sizes[:loaded_weight_id]) // self.tp_size
         # compute size
@@ -159,7 +176,11 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         bias: bool = False,
     ):
         self.tp_size = dist.get_world_size()
-        num_kv_heads = num_kv_heads or num_heads
+        num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        if num_heads <= 0 or num_kv_heads <= 0 or num_heads % self.tp_size or num_kv_heads % self.tp_size:
+            raise ValueError("Q and KV heads must be positive and divisible by tensor parallel size.")
+        if num_heads % num_kv_heads:
+            raise ValueError("Q heads must be divisible by KV heads.")
         self.head_size = head_size
         self.num_heads = num_heads // self.tp_size
         self.num_kv_heads = num_kv_heads // self.tp_size
@@ -188,6 +209,7 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         else:
             raise ValueError(f"Unknown load_weight_id: {load_weight_id}")
 
+        _check_weight_shape(loaded_weights, (shard_size * self.tp_size, *param_data.shape[1:]))
         param_data = param_data.narrow(0, offset, shard_size)
         # shard the original full weight
         loaded_weights_start_index = self.tp_rank * shard_size
@@ -204,11 +226,17 @@ class RowParallelLinear(LinearBase):
         bias: bool = True,
     ):
         tp_size = dist.get_world_size()
-        assert input_size % tp_size == 0, "Input size must be divisible by tensor parallel size."
+        if input_size % tp_size:
+            raise ValueError("Input size must be divisible by tensor parallel size.")
         super().__init__(input_size // tp_size, output_size, bias, tp_dim=1)
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         param_data = param.data 
+        if param is self.bias:
+            _check_weight_shape(loaded_weights, tuple(param_data.shape))
+            param_data.copy_(loaded_weights)
+            return
+        _check_weight_shape(loaded_weights, (param_data.size(0), param_data.size(1) * self.tp_size))
         # full_dim on the input row
         full_data_input_size = loaded_weights.size(1)
         # dim size after sharding
@@ -220,9 +248,11 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(slided_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        result = nn.functional.linear(x, self.weight, self.bias)
+        result = nn.functional.linear(x, self.weight, None)
         if self.tp_size > 1:
             dist.all_reduce(result, op=dist.ReduceOp.SUM)
+        if self.bias is not None:
+            result = result + self.bias
         return result
 
 
@@ -458,7 +488,7 @@ if __name__ == "__main__":
         row_tp.weight.weight_loader(row_tp.weight, w_full)
 
         if row_tp.bias is not None:
-            row_tp.bias.data.copy_(b_full / tp_size)
+            row_tp.bias.weight_loader(row_tp.bias, b_full)
 
         shard = in_features // tp_size
         start = tp_rank * shard

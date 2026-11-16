@@ -4,7 +4,7 @@ import torch.nn as nn
 
 # Qwen3Attention: 
 # qkv projection
-# if not qkv_bias: then rms_norm
+# q and k rms_norm
 # apply rotary embedding to q, k
 # attention
 # output projection
@@ -44,7 +44,6 @@ class Qwen3Attention(nn.Module):
         )
         self.q_size = head_dim * self.num_heads
         self.kv_size = head_dim * self.num_kv_heads
-        self.qkv_bias = qkv_bias
 
         # Q and K norms as used in Qwen3
         self.q_norm = LayerNorm(torch.ones(head_dim), eps=rms_norm_epsilon)
@@ -67,7 +66,7 @@ class Qwen3Attention(nn.Module):
         self.o_proj = RowParallelLinear(
             input_size=head_dim * self.total_num_heads,
             output_size=hidden_size,
-            bias=False,
+            bias=qkv_bias,
         )
 
     def forward(
@@ -106,9 +105,8 @@ class Qwen3Attention(nn.Module):
         # Apply Q and K norms - these are used in Qwen3 to stabilize attention
         # Applied to q and k because they participate in attention_weight computation
         # Removes possibility of large numbers that cause softmax instability
-        if self.qkv_bias is False:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
 
@@ -319,6 +317,13 @@ class Qwen3ForCausalLM(nn.Module):
         )
         if tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+
+    def _apply(self, fn, recurse=True):
+        tied = self.lm_head.weight is self.model.embed_tokens.weight
+        super()._apply(fn, recurse)
+        if tied:
+            self.lm_head.weight = self.model.embed_tokens.weight
+        return self
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.model(input_ids)

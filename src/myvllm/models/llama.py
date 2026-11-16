@@ -50,15 +50,15 @@ class LlamaAttn(nn.Module):
             is_llama3=True
         )
         self.attention = Attention(
-            num_heads=num_qo_heads,
+            num_heads=self.num_heads,
             head_dim=head_dim,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=self.num_kv_heads,
             block_size=block_size,
         )
         self.o_proj = RowParallelLinear(
             input_size= head_dim * num_qo_heads,
             output_size=hidden_size,
-            bias=False,
+            bias=has_attn_bias,
         )
 
     def forward(
@@ -290,6 +290,13 @@ class LlamaForCausalLM(nn.Module):
         )
         if tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+
+    def _apply(self, fn, recurse=True):
+        tied = self.lm_head.weight is self.model.embed_tokens.weight
+        super()._apply(fn, recurse)
+        if tied:
+            self.lm_head.weight = self.model.embed_tokens.weight
+        return self
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.model(input_ids)

@@ -30,6 +30,14 @@ def resolve_dtype(name: str) -> torch.dtype:
         raise ValueError(f"Unsupported dtype: {name}") from exc
 
 
+def resolve_kv_cache_dtype(name: str, model_dtype: torch.dtype) -> torch.dtype:
+    if name == "auto":
+        return model_dtype
+    if name == "float8_e4m3fn":
+        return torch.float8_e4m3fn
+    raise ValueError(f"Unsupported kv_cache_dtype: {name}")
+
+
 def load_config(path: str | Path) -> dict:
     with Path(path).expanduser().open(encoding="utf-8") as file_handle:
         config = json.load(file_handle)

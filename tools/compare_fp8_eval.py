@@ -1,18 +1,21 @@
 """Freeze and compare the pinned evalscope native FP8 quality artifacts."""
 
 import argparse
+from decimal import Decimal
+from fractions import Fraction
 import hashlib
 from importlib.metadata import distributions
 import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import sysconfig
 from urllib.parse import urlparse
 
-from prepare_fp8_eval import asset_tree, json_text, sha_file
+from prepare_fp8_eval import asset_tree, json_text, serving_source, sha_file, tool_hashes
 
 
 def digest(value):
@@ -36,6 +39,11 @@ def load_plan(path):
     root = path.parent
     if plan['version'] != 1 or plan['output_dir'] != str(root):
         raise ValueError('plan location or version does not match')
+    repo = Path(plan['repo_dir'])
+    if Path(__file__).resolve() != repo / 'tools/compare_fp8_eval.py' or tool_hashes(repo) != plan['tool_sha256']:
+        raise ValueError('quality tools differ from the prepared versions')
+    if serving_source(repo, plan['candidate_commit']) != plan['serving_source']:
+        raise ValueError('serving Python source differs from the prepared version')
     for name, expected in plan['files_sha256'].items():
         if Path(name).name != name or sha_file(root / name) != expected:
             raise ValueError(f'prepared file changed: {name}')
@@ -44,17 +52,28 @@ def load_plan(path):
         raise ValueError('server configurations must differ only in KV format')
     tasks = [load_json(root / f'eval-{variant}.json') for variant in ('baseline', 'candidate')]
     work_dirs = [task.pop('work_dir') for task in tasks]
-    if work_dirs != [str(root / 'baseline'), str(root / 'candidate')] or tasks[0] != tasks[1]:
-        raise ValueError('eval configurations must differ only in work directory')
+    aliases = [task.pop('model') for task in tasks]
+    run_id = plan['run_id']
+    if (not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id)
+            or plan['api_model_aliases'] != {
+                variant: f'Qwen3-14B-{run_id}-{variant}' for variant in ('baseline', 'candidate')}
+            or aliases != [plan['api_model_aliases'][variant] for variant in ('baseline', 'candidate')]
+            or work_dirs != [str(root / 'baseline'), str(root / 'candidate')] or tasks[0] != tasks[1]):
+        raise ValueError('eval configurations must differ only in work directory and planned model alias')
     task = tasks[0]
     gen = task['generation_config']
-    if (task['datasets'] != plan['tasks'] or task['use_cache'] is not None
+    if (task['model_id'] != 'Qwen3-14B' or task['datasets'] != plan['tasks'] or task['use_cache'] is not None
             or task['ignore_errors'] or task['analysis_report'] or task['judge_strategy'] != 'rule'
             or not task['no_timestamp'] or task['model_args']['max_retries'] != 0
             or gen != {'stream': False, 'temperature': 0, 'top_p': 1, 'max_tokens': plan['max_tokens'],
                        'timeout': gen['timeout'], 'retries': 1, 'max_retries': 0}):
         raise ValueError('eval configuration violates the fixed quality contract')
-    for asset in load_json(root / 'assets.json').values():
+    assets = load_json(root / 'assets.json')
+    if (plan['model_revision_status'] != 'UNVERIFIED_USER_DECLARATION'
+            or assets['model']['revision_status'] != plan['model_revision_status']
+            or assets['model']['revision'] != plan['model_revision']):
+        raise ValueError('model revision declaration does not match the asset manifest')
+    for asset in assets.values():
         if asset_tree(asset['path']) != asset['files']:
             raise ValueError(f"asset files changed: {asset['path']}")
     return plan, root, sha_file(path)
@@ -172,7 +191,7 @@ print(json.dumps([len(tokenize_request(tokenizer, {'messages': item}, True))
     env = os.environ.copy()
     env['CUDA_VISIBLE_DEVICES'] = ''
     env['PYTHONPATH'] = str(Path(plan['repo_dir']) / 'src')
-    result = subprocess.run([plan['server_python'], '-c', code, str(root / 'server-baseline.json')],
+    result = subprocess.run([plan['server_python'], '-P', '-c', code, str(root / 'server-baseline.json')],
                             input=json.dumps(messages, ensure_ascii=False), text=True, capture_output=True, env=env)
     if result.returncode:
         raise ValueError(f'serving tokenizer preflight failed: {result.stderr.strip()}')
@@ -201,7 +220,7 @@ def check_server(root, variant):
     task = load_json(root / f'eval-{variant}.json')
     url = urlparse(task['api_url'])
     if (arguments['config'] != str(root / f'server-{variant}.json')
-            or arguments['served_model_name'] != 'Qwen3-14B'
+            or arguments['served_model_name'] != task['model']
             or arguments['host'] != url.hostname or arguments['port'] != url.port):
         raise ValueError(f'{variant} server startup arguments do not match')
     return digest(matches[0])
@@ -220,6 +239,29 @@ def score_number(value):
     if not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
         raise ValueError(f'invalid accuracy: {value!r}')
     return float(value)
+
+
+def prediction_text(content):
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise ValueError('invalid native prediction content')
+    fields = {'text': ('text', str), 'reasoning': ('reasoning', str), 'image': ('image', str),
+              'audio': ('audio', str), 'video': ('video', str), 'data': ('data', dict)}
+    texts = []
+    for part in content:
+        if not isinstance(part, dict) or part.get('type') not in fields:
+            raise ValueError('invalid native prediction content')
+        field, field_type = fields[part['type']]
+        if not isinstance(part.get(field), field_type):
+            raise ValueError('invalid native prediction content')
+        if (part['type'] == 'audio' and part.get('format') not in ('wav', 'mp3')
+                or part['type'] == 'video' and part.get('format') not in ('mp4', 'mpeg', 'mov')
+                or part['type'] == 'image' and part.get('detail', 'auto') not in ('auto', 'low', 'high')):
+            raise ValueError('invalid native prediction content')
+        if part['type'] == 'text':
+            texts.append(part['text'])
+    return '\n'.join(texts)
 
 
 def close_report(actual, expected):
@@ -249,6 +291,7 @@ def check_metric(metric, by_subset):
 
 def read_run(plan, root, variant, cases):
     work = root / variant
+    alias = plan['api_model_aliases'][variant]
     expected = {sample_key(row): row for row in cases}
     grouped = {task: {} for task in plan['tasks']}
     native_hashes = {}
@@ -271,14 +314,14 @@ def read_run(plan, root, variant, cases):
                 choices = output['choices']
                 if output['error'] is not None or len(choices) != 1:
                     raise ValueError('failed or incomplete native prediction')
+                if prediction['model'] != alias or output['model'] != alias:
+                    raise ValueError('native prediction model does not match the planned alias')
                 reason = choices[0]['stop_reason']
                 if reason not in ('stop', 'max_tokens'):
                     raise ValueError(f'failed or unexpected prediction stop reason: {reason}')
                 content = choices[0]['message']['content']
-                if not isinstance(content, str):
-                    raise ValueError('native prediction is not text')
                 terminations[reason] = terminations.get(reason, 0) + 1
-                preds[index] = content
+                preds[index] = prediction_text(content)
             review_ids = set()
             for review in reviews:
                 index = review['index']
@@ -305,6 +348,8 @@ def read_run(plan, root, variant, cases):
                 if set(score['value']) != {metric_name}:
                     raise ValueError(f'unexpected native sample metric: {key}')
                 value = score_number(score['value'][metric_name])
+                if value not in (0, 1):
+                    raise ValueError(f'native sample accuracy is not binary: {key}')
                 grouped[task].setdefault(metric_name, {}).setdefault(subset, []).append(value)
                 actual_keys.add(key)
                 review_ids.add(index)
@@ -334,8 +379,10 @@ def read_run(plan, root, variant, cases):
         for name, by_subset in grouped[task].items():
             values = [value for subset_values in by_subset.values() for value in subset_values]
             all_scores.extend(values)
-            cell_results[name] = {'accuracy': sum(values) / len(values), 'count': len(values)}
+            cell_results[name] = {'accuracy': sum(values) / len(values), 'count': len(values),
+                                  'correct': int(sum(values))}
         results[task] = {'accuracy': sum(all_scores) / len(all_scores), 'count': len(all_scores),
+                         'correct': int(sum(all_scores)),
                          'cells': cell_results if task == 'needle_haystack' else {}}
     return {'tasks': results, 'native_sha256': native_hashes, 'termination_counts': terminations,
             'server_start_sha256': check_server(root, variant)}
@@ -372,25 +419,29 @@ def compare(plan, root, plan_sha, output):
     failed = False
     for task in plan['tasks']:
         before, after = baseline['tasks'][task], candidate['tasks'][task]
-        drop = before['accuracy'] - after['accuracy']
+        drop = Fraction(before['correct'], before['count']) - Fraction(after['correct'], after['count'])
         gate = plan['accuracy_drop_gates'][task]
-        passed = None if gate is None else drop <= gate
+        passed = None if gate is None else drop <= Fraction(Decimal(gate))
         failed |= passed is False
         cells = {}
         for name in before['cells']:
             old, new = before['cells'][name], after['cells'][name]
             if old['count'] != new['count']:
                 raise ValueError(f'needle cell count mismatch: {name}')
+            cell_drop = Fraction(old['correct'], old['count']) - Fraction(new['correct'], new['count'])
             cells[name] = {'baseline_accuracy': old['accuracy'], 'candidate_accuracy': new['accuracy'],
-                           'accuracy_drop': old['accuracy'] - new['accuracy'], 'count': old['count']}
+                           'accuracy_drop': float(cell_drop), 'count': old['count']}
         tasks[task] = {'baseline_accuracy': before['accuracy'], 'candidate_accuracy': after['accuracy'],
-                       'accuracy_drop': drop, 'count': before['count'], 'gate_fraction': gate,
+                       'accuracy_drop': float(drop), 'count': before['count'],
+                       'gate_fraction': None if gate is None else float(Decimal(gate)), 'gate_fraction_exact': gate,
                        'gate_passed': passed, 'status': 'capture_only' if passed is None else ('pass' if passed else 'fail'),
                        'cells': cells}
     result = {'accuracy_unit': 'fraction', 'accuracy_drop_unit': 'fraction (multiply by 100 for percentage points)',
               'needle_total': 'count-weighted accuracy across all planned context/depth samples',
               'plan_sha256': plan_sha, 'materialized_sha256': sha_file(root / 'materialized.json'),
               'asset_manifest_sha256': sha_file(root / 'assets.json'),
+              'model_revision': {'declared': plan['model_revision'], 'status': plan['model_revision_status']},
+              'formal_m7_acceptance': None,
               'baseline_freeze_sha256': sha_file(root / 'baseline-cases.json'),
               'server_log_sha256': {variant: sha_file(root / f'server-{variant}.log')
                                     for variant in ('baseline', 'candidate')},

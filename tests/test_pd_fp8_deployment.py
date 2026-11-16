@@ -40,9 +40,9 @@ def test_documented_generator_uses_candidate_with_stale_pythonpath(tmp_path):
     token_bytes = 2 * config["num_kv_heads"] * (config["head_dim"] + 4)
 
     lines = (root / "docs/m5_experiments_zh.md").read_text().splitlines()
-    bindings = [line for line in lines if line.startswith("export PYTHONPATH=")]
     dry_run = next(line for line in lines if line.startswith('"$M5_PYTHON" tools/prepare_pd.py')
                    and "--dry-run" in line)
+    bindings = [line for line in lines[:lines.index(dry_run)] if line.startswith("export PYTHONPATH=")]
     script = "\n".join([
         "set -euo pipefail",
         'cd "$M5_REPO"',

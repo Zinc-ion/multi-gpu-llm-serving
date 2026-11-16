@@ -101,7 +101,7 @@ FP8 相对于 BF16 的任务质量、显存与吞吐/延迟变化，以及目标
 
 `tools/prepare_fp8_eval.py` 生成一组固定的单实例 BF16 配置：baseline 使用 `kv_cache_dtype=auto`，candidate 的 KV cache 使用 `float8_e4m3fn`，其余服务配置相同。质量客户端独立使用 evalscope `1.5.1`，不修改 serving 或 vLLM 环境。以下流程是源码核对后的准备方案，尚未安装 evalscope 或执行真实数据集评测。
 
-先在服务器工作目录中准备已固定版本的 Qwen3-14B 模型及 tokenizer 快照、可由 evalscope 加载的本地 MATH-500 数据和 NIAH 英中语料；记录两份语料的来源和 revision。NIAH 目录须包含 `PaulGraham_Essays.txt` 和 `Journey_to_the_West.txt`。evalscope 1.5.1 的本地加载器会删除数学数据目录中的 `dataset_infos.json`，因此准备工具拒绝含该文件的语料目录，不改动语料。下面的路径和完整候选 commit 均由实际实验者填写：
+先在服务器工作目录中准备 Qwen3-14B 模型及 tokenizer 本地快照、可由 evalscope 加载的本地 MATH-500 数据和 NIAH 英中语料；记录模型和两份语料的来源及 revision。配置中的模型和 tokenizer revision 是使用者声明，当前工具没有独立来源或预期文件哈希证明本地快照属于该 revision。NIAH 目录须包含 `PaulGraham_Essays.txt` 和 `Journey_to_the_West.txt`。evalscope 1.5.1 的本地加载器会删除数学数据目录中的 `dataset_infos.json`，因此准备工具拒绝含该文件的语料目录，不改动语料。下面的路径和完整候选 commit 均由实际实验者填写：
 
 ```bash
 QUALITY_ROOT=/Data2/zincion/ai-infra/experiments/m7-quality/run-01
@@ -119,11 +119,13 @@ cd "$REPO"
   --candidate-commit <full-40-character-commit>
 ```
 
-输出目录必须是 `/Data2/zincion/ai-infra` 下的新目录。工具记录模型、tokenizer 和两份语料每个文件的 SHA-256、revision、服务与客户端配置及脚本的哈希；哈希模型权重会读取完整快照。使用非默认 `--workspace-root` 仅用于本地临时工作区模拟，服务器实验仍须使用默认根目录。可通过 `--math-gate`、`--needle-gate` 在准备时分别固定最大精度下降，单位均为 0–1 的比例；例如 `0.01` 表示一个百分点。省略时对应任务为 capture-only，`gate_passed=null`，不表示通过。门槛、配置和样本在评测前固定，不能在看到结果后修改门槛再作为验收。
+输出目录必须是 `/Data2/zincion/ai-infra` 下的新目录。工具记录模型、tokenizer 和两份语料每个文件的 SHA-256、revision、服务与客户端配置及脚本的哈希；哈希模型权重会读取完整快照。模型 revision 标记为 `UNVERIFIED_USER_DECLARATION`：文件哈希用于检查两次运行使用的内容相同，不证明其官方来源。准备时和后续检查均将实际 `src/**/*.py` 的路径与内容对照候选 commit 的 Git blob，并固定两个质量工具的实际 SHA-256；`src` 本身及其内部目录不能是符号链接，模型资产文件的符号链接仍按目标文件内容哈希；不要求用户的 `AGENTS.md`、`.codex` 等其他文件为干净状态。服务通过 `-P` 和固定 `PYTHONPATH` 加载已检查的 `src`。使用非默认 `--workspace-root` 仅用于本地临时工作区模拟，服务器实验仍须使用默认根目录。可通过 `--math-gate`、`--needle-gate` 在准备时分别固定最大精度下降，单位均为 0–1 的比例；例如 `0.01` 表示一个百分点。比较使用逐样本正确数和原始十进制门槛精确判定，恰好等于门槛视为通过。省略时对应任务为 capture-only，`gate_passed=null`，不表示通过。门槛、配置和样本在评测前固定，不能在看到结果后修改门槛再作为验收。
 
 默认是两任务相同的 `temperature=0`、`top_p=1`、`max_tokens=1024`，用于在本服务支持的采样契约下减少对比中的随机性；这不等同于数据集或模型推荐的完整采样方案，结果不能直接当成外部排行榜口径。NIAH 使用长度 1024、7680、14336 与深度 0%、50%、100% 的英中网格。长度上限加 1024 token 的 chat 预算和生成预算严格小于配置的 `max_model_length=17408`；准备后的 `materialize.sh` 还会用服务环境的 tokenizer 和实际 `tokenize_request` 对每个原生样本应用 chat template，逐条检查实际 prompt 加回复预算。输入不截断；命中 `max_tokens` 的回复数量会在比较结果中单独记录。
 
 NIAH 明确使用 `judge_strategy=rule`，即 evalscope 的归一化精确匹配；这不同于该数据集默认的 LLM judge，两种 KV 格式始终使用同一规则，不把待测模型作为 judge。math 使用原生 `mean_acc`。两边的 `use_cache` 均为 null、prediction/review/work_dir 完全分开；evalscope 的 `use_cache` 会恢复预测和 review，不能指向另一格式的结果。固定源码中 `generation_config.retries` 是总尝试次数，因此设为 1；SDK 的 `model_args.max_retries=0` 禁止 SDK 重试。配置也显式包含 `generation_config.max_retries=0`，但源码只读取 `retries`，不能依靠前者控制外层重试。不发送请求级 seed；数据生成 seed 位于 TaskConfig。
+
+每次准备固定一个新的 run ID，baseline 和 candidate 使用各自的服务模型别名作为 HTTP `model`；evalscope 的 `model_id` 仍为 `Qwen3-14B`，用于原生文件和报告。项目服务严格校验请求模型，因此 baseline 继续占用端口且 candidate 启动失败时，candidate 别名会被 baseline 拒绝。比较器同时核对原生 prediction 的模型和 HTTP 响应模型；这不能证明任意忽略请求模型或伪造响应的外部服务实际使用了哪个配置。
 
 在隔离客户端中安装固定版本并记录依赖，然后物化样本、先跑 baseline、保留 baseline 冻结文件，再运行 candidate。以下启动命令仅供已安排服务器 GPU 的实验使用：
 
@@ -145,6 +147,6 @@ bash "$QUALITY_ROOT/evaluate-candidate.sh"
 bash "$QUALITY_ROOT/compare.sh"
 ```
 
-`materialized.json` 保留原生输入、目标、subset、index、消息、实际 token 数和客户端 Python/包版本；baseline、candidate 与比较阶段都检查客户端环境是否改变。`baseline-cases.json` 在 candidate 前固定同一清单和 baseline 原始文件哈希。比较要求两个结果逐条匹配物化记录、预测与 review 配对、无失败及缺失，并核对 report 的命名指标、各 subset 和实际样本数；仅固定 seed 或共享语料不能证明请求相同。NIAH 的顶层 `Report.score` 仅对应第一个 context/depth 格子，工具按逐样本分数计算全网格 count-weighted accuracy，并保存每个格子的 baseline、candidate 和下降值。比较报告保留原生 report/prediction/review、配置、资产和输入指纹；有门槛且下降超过门槛时退出码非零。
+`materialized.json` 保留原生输入、目标、subset、index、消息、实际 token 数和客户端 Python/包版本；baseline、candidate 与比较阶段都检查客户端环境是否改变。`baseline-cases.json` 在 candidate 前固定同一清单和 baseline 原始文件哈希。服务启动前、评测后、冻结和比较时均检查上述源码与工具指纹；服务脚本使用 `exec`，没有在服务进程退出后运行额外检查。比较要求两个结果逐条匹配物化记录、预测与 review 配对、无失败及缺失，并核对 report 的命名指标、各 subset 和实际样本数；仅固定 seed 或共享语料不能证明请求相同。NIAH 的顶层 `Report.score` 仅对应第一个 context/depth 格子，工具按逐样本分数计算全网格 count-weighted accuracy，并保存每个格子的 baseline、candidate 和下降值。比较报告保留原生 report/prediction/review、配置、资产和输入指纹；有门槛且下降超过门槛时退出码非零。报告中的各任务门槛结果只表示数值比较；模型来源未经核验且 M7 其他验收项不在此工具范围，`formal_m7_acceptance` 为 null。
 
 该工具不能仅凭日志独立证明外部服务的运行状态或服务器验收。客户端依赖冻结、实际数据格式、端到端 evalscope 对接、BF16/FP8 质量和目标硬件均须在目标环境进一步验证；预设结果、模拟输入或 capture-only 不构成 M7 质量通过。

@@ -1,13 +1,17 @@
 """Prepare an isolated, reproducible evalscope 1.5.1 FP8 quality comparison."""
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shlex
+import subprocess
 from urllib.parse import urlparse
+import uuid
 
 
 ROOT = Path('/Data2/zincion/ai-infra')
@@ -42,6 +46,48 @@ def asset_tree(path):
     return files
 
 
+def serving_source(repo, commit):
+    def git(*args):
+        try:
+            return subprocess.check_output(['git', '-C', str(repo), *args], stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as exc:
+            raise ValueError(f'cannot inspect candidate Git source: {exc.stderr.decode().strip()}') from exc
+
+    if git('rev-parse', 'HEAD').decode().strip() != commit:
+        raise ValueError('repository HEAD does not match candidate commit')
+    algorithm = git('rev-parse', '--show-object-format').decode().strip()
+    blobs = {}
+    for entry in git('ls-tree', '-r', '-z', '--full-tree', commit, '--', 'src').split(b'\0'):
+        if entry:
+            metadata, path = entry.split(b'\t', 1)
+            _, kind, blob = metadata.split(b' ')
+            path = os.fsdecode(path)
+            if path.endswith('.py') and kind == b'blob':
+                blobs[path] = blob.decode()
+    src = repo / 'src'
+    if src.is_symlink():
+        raise ValueError(f'serving source directory symlink is not supported: {src}')
+    for path in src.rglob('*'):
+        if path.is_symlink() and path.is_dir():
+            raise ValueError(f'serving source directory symlink is not supported: {path}')
+    files = {str(path.relative_to(repo)): path for path in src.rglob('*.py') if path.is_file()}
+    if not blobs or files.keys() != blobs.keys():
+        raise ValueError('serving Python source file set differs from candidate commit')
+    result = {}
+    for name in sorted(files):
+        content = files[name].read_bytes()
+        blob = hashlib.new(algorithm, f'blob {len(content)}\0'.encode() + content).hexdigest()
+        if blob != blobs[name]:
+            raise ValueError(f'serving Python source differs from candidate Git blob: {name}')
+        result[name] = {'git_blob': blob, 'sha256': hashlib.sha256(content).hexdigest()}
+    return result
+
+
+def tool_hashes(repo):
+    return {name: sha_file(repo / 'tools' / name)
+            for name in ('prepare_fp8_eval.py', 'compare_fp8_eval.py')}
+
+
 def command(args):
     return ' '.join(shlex.quote(str(arg)) for arg in args)
 
@@ -62,8 +108,13 @@ def generate(args):
             or args.temperature != 0):
         raise ValueError('batch-size, max-tokens and timeout must be positive; temperature must be 0')
     for gate in (args.math_gate, args.needle_gate):
-        if gate is not None and (not math.isfinite(gate) or not 0 <= gate <= 1):
-            raise ValueError('accuracy-drop gates must be fractions between 0 and 1')
+        if gate is not None:
+            try:
+                value = Decimal(gate)
+            except InvalidOperation as exc:
+                raise ValueError('accuracy-drop gates must be fractions between 0 and 1') from exc
+            if not value.is_finite() or not 0 <= value <= 1:
+                raise ValueError('accuracy-drop gates must be fractions between 0 and 1')
     url = urlparse(args.api_url)
     if url.scheme != 'http' or url.hostname != '127.0.0.1' or url.path != '/v1' or not url.port:
         raise ValueError('api-url must be http://127.0.0.1:PORT/v1')
@@ -95,14 +146,19 @@ def generate(args):
         if not (needle / name).is_file():
             raise ValueError(f'needle corpus is missing {name}')
     assets = {
-        'model': {'path': str(model), 'revision': MODEL_REVISION, 'files': asset_tree(model)},
+        'model': {'path': str(model), 'revision': MODEL_REVISION,
+                  'revision_status': 'UNVERIFIED_USER_DECLARATION', 'files': asset_tree(model)},
         'math_500': {'path': str(math_data), 'revision': args.math_revision, 'files': asset_tree(math_data)},
         'needle_haystack': {'path': str(needle), 'revision': args.needle_revision, 'files': asset_tree(needle)},
     }
     config['model_name_or_path'] = str(model)
     config['cache_dir'] = str(output / 'cache/hf-hub')
     config.pop('timing_path', None)
-    repo = Path(args.repo_dir)
+    repo = Path(args.repo_dir).resolve()
+    if Path(__file__).resolve() != repo / 'tools/prepare_fp8_eval.py':
+        raise ValueError('prepare tool must run from the candidate repository')
+    source = serving_source(repo, args.candidate_commit)
+    tools = tool_hashes(repo)
     comparison = repo / 'tools/compare_fp8_eval.py'
     env = '#!/usr/bin/env bash\nset -euo pipefail\n'
     exports = {
@@ -128,11 +184,13 @@ def generate(args):
     prefix += f'test "$(git rev-parse HEAD)" = {shlex.quote(args.candidate_commit)}\n'
     plan_path = output / 'plan.json'
     client = output / 'client/bin/python'
+    run_id = uuid.uuid4().hex
+    aliases = {variant: f'Qwen3-14B-{run_id}-{variant}' for variant in ('baseline', 'candidate')}
     for variant, kv in (('baseline', 'auto'), ('candidate', 'float8_e4m3fn')):
         server_config = dict(config, kv_cache_dtype=kv)
         files[f'server-{variant}.json'] = json_text(server_config)
         task = {
-            'model': 'Qwen3-14B', 'model_id': 'Qwen3-14B', 'api_url': args.api_url, 'api_key': 'EMPTY',
+            'model': aliases[variant], 'model_id': 'Qwen3-14B', 'api_url': args.api_url, 'api_key': 'EMPTY',
             'model_args': {'max_retries': 0}, 'datasets': ['math_500', 'needle_haystack'],
             'dataset_args': {
                 'math_500': {'local_path': str(math_data), 'shuffle': False},
@@ -153,10 +211,10 @@ def generate(args):
         }
         files[f'eval-{variant}.json'] = json_text(task)
         validate = command([client, comparison, 'check', '--plan', plan_path, '--stage', variant])
-        server_cmd = [args.server_python, '-m', 'myvllm.server', '--config', output / f'server-{variant}.json',
-                      '--served-model-name', 'Qwen3-14B', '--host', '127.0.0.1', '--port', url.port]
+        server_cmd = [args.server_python, '-P', '-m', 'myvllm.server', '--config', output / f'server-{variant}.json',
+                      '--served-model-name', aliases[variant], '--host', '127.0.0.1', '--port', url.port]
         server = prefix + f'test ! -e {shlex.quote(str(output / f"server-{variant}.log"))}\n'
-        server += command([client, comparison, 'check', '--plan', plan_path, '--stage', 'assets']) + '\n'
+        server += "PYTHONPATH='' " + command([client, comparison, 'check', '--plan', plan_path, '--stage', 'assets']) + '\n'
         server += f'export PYTHONPATH={shlex.quote(str(repo / "src"))}\nexec ' + command(server_cmd)
         server += f' > {shlex.quote(str(output / f"server-{variant}.log"))} 2>&1\n'
         files[f'server-{variant}.sh'] = server
@@ -167,6 +225,7 @@ def generate(args):
         run = prefix + "export CUDA_VISIBLE_DEVICES='' PYTHONPATH=''\n" + validate + '\n'
         run += f'test ! -e {shlex.quote(str(output / variant))}\n'
         run += command([client, '-c', run_code]) + f' > {shlex.quote(str(output / f"eval-{variant}.log"))} 2>&1\n'
+        run += command([client, comparison, 'check', '--plan', plan_path, '--stage', 'assets']) + '\n'
         if variant == 'baseline':
             run += command([client, comparison, 'freeze', '--plan', plan_path]) + '\n'
         files[f'evaluate-{variant}.sh'] = run
@@ -178,7 +237,9 @@ def generate(args):
     plan = {
         'version': 1, 'evalscope_version': '1.5.1', 'evalscope_commit': EVALSCOPE_COMMIT,
         'candidate_commit': args.candidate_commit, 'output_dir': str(output), 'model_revision': MODEL_REVISION,
+        'model_revision_status': 'UNVERIFIED_USER_DECLARATION', 'run_id': run_id, 'api_model_aliases': aliases,
         'repo_dir': str(repo), 'server_python': args.server_python,
+        'serving_source': source, 'tool_sha256': tools,
         'tasks': ['math_500', 'needle_haystack'], 'math_count': 500,
         'math_subsets': [f'Level {i}' for i in range(1, 6)],
         'needle_subsets': ['english', 'chinese'],
@@ -207,8 +268,8 @@ def main():
     parser.add_argument('--timeout', type=float, default=600)
     parser.add_argument('--context-max', type=int, default=14336)
     parser.add_argument('--chat-budget', type=int, default=1024)
-    parser.add_argument('--math-gate', type=float, help='Maximum accuracy drop as a fraction; omit for capture-only')
-    parser.add_argument('--needle-gate', type=float, help='Maximum accuracy drop as a fraction; omit for capture-only')
+    parser.add_argument('--math-gate', help='Maximum accuracy drop as a decimal fraction; omit for capture-only')
+    parser.add_argument('--needle-gate', help='Maximum accuracy drop as a decimal fraction; omit for capture-only')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     try:

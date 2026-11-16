@@ -396,6 +396,7 @@ class DecodeCore(_Core):
         super().__init__(engine, max_open_requests, max_transfer_bytes)
         self._reserved_blocks = 0
         self._resident = 0
+        self._local_resident = 0
         self._resident_limit = min(self.scheduler.max_num_sequences,
                                    self.scheduler.max_num_batched_tokens)
 
@@ -416,6 +417,7 @@ class DecodeCore(_Core):
             del self._handles[handle.session_id]
             raise
         handle.local = True
+        self._local_resident += 1
         handle.sequence = seq
         handle.request_id = request_id
         handle.state = "queued"
@@ -670,10 +672,11 @@ class DecodeCore(_Core):
                 handle.state = "active"
 
         self.engine.step(on_tokens=publish)
-        for seq in self.scheduler.running:
-            handle = self._sequences[seq.seq_id]
-            if handle.local and handle.state == "queued":
-                handle.state = "prefill"
+        if self._local_resident:
+            for seq in self.scheduler.running:
+                handle = self._sequences[seq.seq_id]
+                if handle.local and handle.state == "queued":
+                    handle.state = "prefill"
         return events
 
     def _release(self, handle):
@@ -682,6 +685,8 @@ class DecodeCore(_Core):
             self._reserved_blocks -= handle._reserved_blocks
             handle._reserved_blocks = 0
             self._resident -= 1
+            if handle.local:
+                self._local_resident -= 1
 
     def _cancel(self, handle, state):
         if handle.state in ("finished", "cancelled", "expired", "failed"):
@@ -705,8 +710,6 @@ class DecodeCore(_Core):
         result = super().stats()
         result.update(reserved_blocks=self._reserved_blocks, resident_requests=self._resident,
                       resident_limit=self._resident_limit)
-        result["local_resident_requests"] = sum(
-            bool(handle._reserved_blocks) and handle.local for handle in self._handles.values()
-        )
+        result["local_resident_requests"] = self._local_resident
         result["remote_resident_requests"] = self._resident - result["local_resident_requests"]
         return result

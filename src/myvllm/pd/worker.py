@@ -5,6 +5,7 @@ import asyncio
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+import json
 import logging
 import queue
 import signal
@@ -25,6 +26,14 @@ from myvllm.utils.timing import write_record
 logger = logging.getLogger("myvllm.pd.worker")
 
 
+def _decode_endpoint(endpoint):
+    if (not isinstance(endpoint, (tuple, list)) or len(endpoint) != 2
+            or not isinstance(endpoint[0], str) or not endpoint[0]
+            or type(endpoint[1]) is not int or not 0 < endpoint[1] < 65536):
+        raise ValueError("Invalid decode endpoint")
+    return tuple(endpoint)
+
+
 @dataclass(eq=False)
 class _Connection:
     writer: object
@@ -40,6 +49,7 @@ class _Connection:
     sender: object = None
     data_writer: object = None
     data_target: object = None
+    decode_endpoint: object = None
 
 
 class _Owner:
@@ -54,6 +64,7 @@ class _Owner:
         self.decode_sessions = {}
         self.core = None
         self.engine = None
+        self.decode_step_samples = deque(maxlen=32)
 
     def submit(self, ctx, op, fields=None, payload=b""):
         future = Future()
@@ -73,6 +84,9 @@ class _Owner:
         if not path:
             return
         handle = ctx.handle
+        if handle and handle.local:
+            fields.setdefault("route", "local")
+            fields.setdefault("payload_bytes", 0)
         write_record(path, {
             "event": event, "role": self.worker.role, "time": time.time(),
             "monotonic_ns": time.monotonic_ns(),
@@ -95,6 +109,11 @@ class _Owner:
             "request_timeout": self.worker.request_timeout,
             "sampling_seed": self.core.sampling_seed,
             "decode_endpoint": self.worker.decode_endpoint,
+            "allowed_decode_endpoints": self.worker.allowed_decode_endpoints,
+            "enable_chunked_prefill": scheduler.enable_chunked_prefill,
+            "local_prefill_enabled": self.worker.role == "decode" and scheduler.enable_chunked_prefill,
+            "enforce_eager": self.engine.config.get("enforce_eager", False),
+            "world_size": self.engine.config["world_size"],
             "max_socket_connections": self.worker.max_socket_connections,
             "pipeline_frame_bytes": self.worker.pipeline_frame_bytes,
         }
@@ -103,7 +122,7 @@ class _Owner:
         transfers = [ctx.sender or ctx.handle._receiver for ctx in self.contexts.values()
                      if ctx.sender is not None or ctx.handle._receiver is not None]
         staging = [transfer.stats() for transfer in transfers]
-        return {**self.core.stats(), "queued_events": sum(len(c.events) for c in self.contexts.values()),
+        result = {**self.core.stats(), "queued_events": sum(len(c.events) for c in self.contexts.values()),
                 "pending_commands": self.commands.qsize(), "open_connections": len(self.contexts),
                 "pipeline_staging_bytes": sum(s["staging_bytes"] for s in staging),
                 "pipeline_pinned_bytes": sum(s["pinned_bytes"] for s in staging),
@@ -111,6 +130,15 @@ class _Owner:
                 "pipeline_slots": sum(s["slot_count"] for s in staging),
                 "pipeline_staging_limit_bytes": 2 * self.worker.max_connections * self.worker.pipeline_frame_bytes,
                 "pipeline_slot_limit": 2 * self.worker.max_connections if self.worker.pipeline_frame_bytes else 0}
+        if self.worker.role == "decode":
+            sample = max(self.decode_step_samples, default=None)
+            result.update(
+                decode_step_wall_ms=sample[0] if sample else None,
+                decode_step_sample_count=len(self.decode_step_samples),
+                decode_step_sample_source="core.step_wall_decode_including_mixed",
+                decode_step_sample_age_ms=(time.perf_counter() - sample[1]) * 1000 if sample else None,
+            )
+        return result
 
     def _close(self, ctx):
         if ctx.pending is not None:
@@ -154,16 +182,20 @@ class _Owner:
         ctx.deadline = deadline
         if op == "open_d" and self.worker.role == "decode":
             handle = self.core.open(deadline)
-        elif op in ("open_p", "prepare_p") and self.worker.role == "prefill":
+        elif ((op in ("open_p", "prepare_p") and self.worker.role == "prefill")
+              or (op == "open_local" and self.worker.role == "decode")):
             try:
                 params = SamplingParams(**fields["sampling"])
             except (TypeError, AttributeError) as exc:
                 raise ValueError("Invalid sampling parameters") from exc
             if op == "prepare_p" and not self.worker.pipeline_frame_bytes:
                 raise ValueError("Pipeline is disabled on this worker")
-            method = self.core.prepare if op == "prepare_p" else self.core.open
-            handle = method(fields["session_id"], fields["request_id"],
-                            fields["token_ids"], params, deadline)
+            if op == "open_local":
+                handle = self.core.open_local(fields["request_id"], fields["token_ids"], params, deadline)
+            else:
+                method = self.core.prepare if op == "prepare_p" else self.core.open
+                handle = method(fields["session_id"], fields["request_id"],
+                                fields["token_ids"], params, deadline)
             limit = params.max_model_length or self.core.scheduler.max_model_length
             ctx.event_limit = min(params.max_tokens, limit - len(fields["token_ids"]))
         else:
@@ -172,8 +204,9 @@ class _Owner:
         self.contexts[handle] = ctx
         if op == "open_d":
             self.decode_sessions[handle.session_id] = ctx
-        if op in ("open_p", "prepare_p"):
-            self._record("pd_claim_done", ctx, claim_ms=ctx.claim_ms)
+        if op in ("open_p", "prepare_p", "open_local"):
+            if op != "open_local":
+                self._record("pd_claim_done", ctx, claim_ms=ctx.claim_ms)
             self._record("pd_admitted", ctx, queue_ms=(time.monotonic() - ctx.accepted) * 1000,
                          prompt_tokens=len(fields["token_ids"]))
         return {"session_id": handle.session_id, "transaction_id": handle.transaction_id,
@@ -227,7 +260,7 @@ class _Owner:
             target.data_writer = ctx.writer
             ctx.data_target = target
             result = target
-        elif op in ("open_p", "open_d", "prepare_p"):
+        elif op in ("open_p", "open_d", "prepare_p", "open_local"):
             result = self._open(ctx, op, fields)
         else:
             handle = ctx.handle
@@ -239,7 +272,7 @@ class _Owner:
                 if ctx.events:
                     result = ctx.events.popleft()
                 elif ((self.worker.role == "prefill" and handle.state not in ("queued", "prefill"))
-                      or (self.worker.role == "decode" and handle.state != "active")):
+                      or (self.worker.role == "decode" and handle.state not in ("queued", "prefill", "active"))):
                     raise ValueError("No more token events")
                 else:
                     ctx.pending = future
@@ -255,7 +288,7 @@ class _Owner:
                             "request_id": handle.request_id, "role": "prefill"}
                 scales = self.engine.model_runner.kv_cache_scales if "kv_cache" in self.core.spec else None
                 ctx.sender = LayerSender(self.engine.model_runner.kv_cache, handle.sequence,
-                                         self.worker.decode_endpoint, self.worker.pipeline_frame_bytes,
+                                         ctx.decode_endpoint, self.worker.pipeline_frame_bytes,
                                          identity, handle.deadline, self.worker.config.get("timing_path"), scales)
                 result = True
             elif op == "start" and self.worker.role == "prefill":
@@ -357,7 +390,11 @@ class _Owner:
             self.worker.loop.call_soon_threadsafe(ctx.writer.close)
 
     def _step(self):
+        started = time.perf_counter()
         events = self.core.step()
+        finished = time.perf_counter()
+        if self.worker.role == "decode" and any(event.completion_tokens > 1 for event in events):
+            self.decode_step_samples.append(((finished - started) * 1000, finished))
         for event in events:
             ctx = self.contexts[event.handle]
             item = {"token": event.token, "finished": event.finished,
@@ -463,19 +500,26 @@ class _Owner:
 class PDWorker:
     def __init__(self, role, config, *, max_connections, max_transfer_bytes,
                  request_timeout, max_header_bytes=DEFAULT_HEADER_LIMIT,
-                 decode_endpoint=None, engine_factory=LLMEngine, pipeline_frame_bytes=0):
+                 decode_endpoint=None, allowed_decode_endpoints=None,
+                 engine_factory=LLMEngine, pipeline_frame_bytes=0):
         if role not in ("prefill", "decode"):
             raise ValueError("role must be prefill or decode")
         if config["world_size"] != 1:
             raise ValueError("PD workers require world_size == 1")
         if role == "prefill":
-            if (not isinstance(decode_endpoint, (tuple, list)) or len(decode_endpoint) != 2
-                    or not isinstance(decode_endpoint[0], str) or not decode_endpoint[0]
-                    or type(decode_endpoint[1]) is not int or not 0 < decode_endpoint[1] < 65536):
-                raise ValueError("prefill requires a fixed decode_endpoint")
-            decode_endpoint = tuple(decode_endpoint)
-        elif decode_endpoint is not None:
-            raise ValueError("decode workers do not have a decode_endpoint")
+            decode_endpoint = _decode_endpoint(decode_endpoint)
+            if allowed_decode_endpoints is None:
+                allowed_decode_endpoints = (decode_endpoint,)
+            elif not isinstance(allowed_decode_endpoints, (tuple, list)) or not allowed_decode_endpoints:
+                raise ValueError("allowed_decode_endpoints must be a nonempty list")
+            else:
+                allowed_decode_endpoints = tuple(_decode_endpoint(endpoint) for endpoint in allowed_decode_endpoints)
+                if len(set(allowed_decode_endpoints)) != len(allowed_decode_endpoints):
+                    raise ValueError("allowed_decode_endpoints must be unique")
+                if decode_endpoint not in allowed_decode_endpoints:
+                    raise ValueError("decode_endpoint must belong to allowed_decode_endpoints")
+        elif decode_endpoint is not None or allowed_decode_endpoints is not None:
+            raise ValueError("decode workers do not have decode endpoints")
         for name, value in (("max_connections", max_connections),
                             ("max_transfer_bytes", max_transfer_bytes),
                             ("max_header_bytes", max_header_bytes)):
@@ -494,6 +538,7 @@ class PDWorker:
         self.max_transfer_bytes = max_transfer_bytes
         self.max_header_bytes = max_header_bytes
         self.decode_endpoint = decode_endpoint
+        self.allowed_decode_endpoints = allowed_decode_endpoints
         self.pipeline_frame_bytes = pipeline_frame_bytes
         self.max_socket_connections = max_connections * (
             (3 if pipeline_frame_bytes else 2) if role == "decode" else 1) + 1
@@ -544,9 +589,9 @@ class PDWorker:
                 result.add_done_callback(lambda item: item.exception() if not item.cancelled() else None)
             await asyncio.gather(disconnect, return_exceptions=True)
 
-    async def _claim(self, session_id, deadline):
+    async def _claim(self, session_id, deadline, decode_endpoint):
         try:
-            reader, writer = await asyncio.open_connection(*self.decode_endpoint)
+            reader, writer = await asyncio.open_connection(*decode_endpoint)
             completed = False
             try:
                 await write_frame(writer, {"op": "claim", "session_id": session_id})
@@ -559,8 +604,8 @@ class PDWorker:
         except (OSError, asyncio.IncompleteReadError) as exc:
             raise ProtocolError("Decode session claim failed") from exc
 
-    async def _claim_connected(self, reader, session_id, deadline):
-        claim = asyncio.create_task(self._claim(session_id, deadline))
+    async def _claim_connected(self, reader, session_id, deadline, decode_endpoint):
+        claim = asyncio.create_task(self._claim(session_id, deadline, decode_endpoint))
         disconnect = asyncio.create_task(reader.read(1))
         try:
             done, _ = await asyncio.wait((claim, disconnect), return_when=asyncio.FIRST_COMPLETED)
@@ -635,6 +680,7 @@ class PDWorker:
                         "claim": {"op", "session_id"},
                         "open_p": {"op", "lifetime", "session_id", "request_id", "token_ids", "sampling"},
                         "prepare_p": {"op", "lifetime", "session_id", "request_id", "token_ids", "sampling"},
+                        "open_local": {"op", "lifetime", "request_id", "token_ids", "sampling"},
                         "reserve": {"op", "metadata"}, "restore": {"op"},
                         "reserve_early": {"op", "metadata"}, "commit_early": {"op", "metadata"},
                         "describe_early": {"op"}, "start": {"op"}, "wait_pipeline": {"op"},
@@ -642,7 +688,10 @@ class PDWorker:
                         "next": {"op"}, "describe": {"op"}, "export": {"op"},
                         "acknowledge": {"op"}, "activate": {"op"}, "cancel": {"op"}, "close": {"op"},
                     }
-                    if not isinstance(op, str) or op not in expected_fields or set(header) != expected_fields[op]:
+                    fields = expected_fields.get(op) if isinstance(op, str) else None
+                    if (fields is None or
+                            (set(header) != fields and
+                             not (op in ("open_p", "prepare_p") and set(header) == fields | {"decode_endpoint"}))):
                         raise ProtocolError("Invalid operation or control fields")
                     if op == "restore":
                         if expected_payload is None or size != expected_payload:
@@ -651,7 +700,7 @@ class PDWorker:
                         raise ProtocolError("Unexpected body")
                     if op in ("info", "stats", "claim") and ctx.handle is not None:
                         raise ProtocolError("Status requires a separate connection")
-                    if op in ("open_p", "open_d", "prepare_p"):
+                    if op in ("open_p", "open_d", "prepare_p", "open_local"):
                         if session or self.sessions >= self.max_connections:
                             raise ProtocolError("PD connection capacity exhausted")
                         session = True
@@ -662,8 +711,12 @@ class PDWorker:
                         deadline = ctx.accepted + lifetime
                         timeout.reschedule(deadline)
                         if op in ("open_p", "prepare_p") and self.role == "prefill":
+                            endpoint = _decode_endpoint(header["decode_endpoint"]) if "decode_endpoint" in header else self.decode_endpoint
+                            if endpoint not in self.allowed_decode_endpoints:
+                                raise ProtocolError("Decode endpoint is not allowed")
+                            ctx.decode_endpoint = endpoint
                             started = time.perf_counter()
-                            await self._claim_connected(reader, header["session_id"], deadline)
+                            await self._claim_connected(reader, header["session_id"], deadline, endpoint)
                             ctx.claim_ms = (time.perf_counter() - started) * 1000
                     body = await read_body(reader, size)
                     try:
@@ -683,7 +736,7 @@ class PDWorker:
                     finally:
                         body = None
                         future = None
-                    if op in ("open_p", "open_d", "prepare_p"):
+                    if op in ("open_p", "open_d", "prepare_p", "open_local"):
                         timeout.reschedule(ctx.deadline)
                     elif op == "reserve":
                         expected_payload = header["metadata"]["kv"]["nbytes"]
@@ -759,7 +812,8 @@ async def _serve(args):
     worker = PDWorker(args.role, config, max_connections=args.max_connections,
                       max_transfer_bytes=args.max_transfer_bytes,
                       request_timeout=args.request_timeout, max_header_bytes=args.max_header_bytes,
-                      decode_endpoint=decode_endpoint, pipeline_frame_bytes=args.pipeline_frame_bytes)
+                      decode_endpoint=decode_endpoint, allowed_decode_endpoints=args.allowed_decode_endpoints,
+                      pipeline_frame_bytes=args.pipeline_frame_bytes)
     address = await worker.start(args.host, args.port)
     logger.info("PD %s listening on %s:%s", args.role, *address)
     stopped = asyncio.Event()
@@ -788,6 +842,7 @@ def main():
     parser.add_argument("--max-header-bytes", type=int, default=DEFAULT_HEADER_LIMIT)
     parser.add_argument("--decode-host")
     parser.add_argument("--decode-port", type=int)
+    parser.add_argument("--allowed-decode-endpoints", type=json.loads)
     parser.add_argument("--pipeline-frame-bytes", type=int, default=0)
     logging.basicConfig(level=logging.INFO)
     asyncio.run(_serve(parser.parse_args()))

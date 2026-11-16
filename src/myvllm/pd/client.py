@@ -155,16 +155,23 @@ class PDClient:
         return await PDClient._open(endpoint, "open_d", lifetime)
 
     @staticmethod
-    async def open_p(endpoint, session_id, request_id, token_ids, params, *, lifetime):
+    async def open_p(endpoint, session_id, request_id, token_ids, params, *, lifetime, decode_endpoint=None):
+        selected = {} if decode_endpoint is None else {"decode_endpoint": decode_endpoint}
         return await PDClient._open(endpoint, "open_p", lifetime, session_id=session_id,
                                     request_id=request_id, token_ids=token_ids,
-                                    sampling=asdict(params))
+                                    sampling=asdict(params), **selected)
 
     @staticmethod
-    async def prepare_p(endpoint, session_id, request_id, token_ids, params, *, lifetime):
+    async def prepare_p(endpoint, session_id, request_id, token_ids, params, *, lifetime, decode_endpoint=None):
+        selected = {} if decode_endpoint is None else {"decode_endpoint": decode_endpoint}
         return await PDClient._open(endpoint, "prepare_p", lifetime, session_id=session_id,
                                     request_id=request_id, token_ids=token_ids,
-                                    sampling=asdict(params))
+                                    sampling=asdict(params), **selected)
+
+    @staticmethod
+    async def open_local(endpoint, request_id, token_ids, params, *, lifetime):
+        return await PDClient._open(endpoint, "open_local", lifetime, request_id=request_id,
+                                    token_ids=token_ids, sampling=asdict(params))
 
     @staticmethod
     async def start_pipeline(prefill, decode):

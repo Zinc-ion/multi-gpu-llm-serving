@@ -49,6 +49,7 @@ class _Handle:
         self._receiver = None
         self._reserved_bytes = 0
         self._reserved_blocks = 0
+        self.local = False
 
 
 class _Core:
@@ -94,6 +95,31 @@ class _Core:
         handle._reserved_bytes = 0
         handle._payload = None
 
+    def _validate_request(self, request_id, prompt_token_ids, params):
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("request_id must be a nonempty string")
+        if not isinstance(prompt_token_ids, list) or not prompt_token_ids:
+            raise ValueError("prompt_token_ids must be a nonempty list")
+        vocab_size = self.spec["architecture"]["vocab_size"]
+        if any(type(token) is not int or not 0 <= token < vocab_size for token in prompt_token_ids):
+            raise ValueError("Invalid prompt token")
+        if not isinstance(params, SamplingParams):
+            raise ValueError("params must be SamplingParams")
+        if not finite_number(params.temperature) or params.temperature < 0:
+            raise ValueError("Invalid temperature")
+        if type(params.max_tokens) is not int or params.max_tokens <= 0:
+            raise ValueError("max_tokens must be a positive integer")
+        if type(params.ignore_eos) is not bool:
+            raise ValueError("ignore_eos must be boolean")
+        limit = params.max_model_length
+        if limit is None:
+            limit = self.scheduler.max_model_length
+        if type(limit) is not int or not 0 < limit <= self.scheduler.max_model_length:
+            raise ValueError("Invalid max_model_length")
+        if len(prompt_token_ids) >= limit:
+            raise ValueError("Prompt must leave room for completion")
+        return limit
+
     def expire(self, now=None):
         if now is None:
             now = time.monotonic()
@@ -135,6 +161,7 @@ class _Core:
             "reserved_transfer_bytes": self._reserved_bytes,
             "free_blocks": len(self.manager.free_block_ids),
             "used_blocks": len(self.manager.used_block_ids),
+            "total_blocks": len(self.manager.blocks),
         }
 
     def _event(self, handle, seq, token):
@@ -159,28 +186,7 @@ class PrefillCore(_Core):
     def _open_request(self, session_id, request_id, prompt_token_ids, params, deadline, early):
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("session_id must be a nonempty string")
-        if not isinstance(request_id, str) or not request_id:
-            raise ValueError("request_id must be a nonempty string")
-        if not isinstance(prompt_token_ids, list) or not prompt_token_ids:
-            raise ValueError("prompt_token_ids must be a nonempty list")
-        vocab_size = self.spec["architecture"]["vocab_size"]
-        if any(type(token) is not int or not 0 <= token < vocab_size for token in prompt_token_ids):
-            raise ValueError("Invalid prompt token")
-        if not isinstance(params, SamplingParams):
-            raise ValueError("params must be SamplingParams")
-        if not finite_number(params.temperature) or params.temperature < 0:
-            raise ValueError("Invalid temperature")
-        if type(params.max_tokens) is not int or params.max_tokens <= 0:
-            raise ValueError("max_tokens must be a positive integer")
-        if type(params.ignore_eos) is not bool:
-            raise ValueError("ignore_eos must be boolean")
-        limit = params.max_model_length
-        if limit is None:
-            limit = self.scheduler.max_model_length
-        if type(limit) is not int or not 0 < limit <= self.scheduler.max_model_length:
-            raise ValueError("Invalid max_model_length")
-        if len(prompt_token_ids) >= limit:
-            raise ValueError("Prompt must leave room for completion")
+        limit = self._validate_request(request_id, prompt_token_ids, params)
 
         existing = self._handles.get(session_id)
         if existing is not None:
@@ -365,6 +371,11 @@ class PrefillCore(_Core):
         )
         pending = [h for h in self._handles.values()
                    if h.state in ("prepared", "ready", "queued", "prefill", "held", "exported")]
+        result["admitted_requests"] = len(pending)
+        result["pending_prefill_tokens"] = sum(
+            max(0, h.sequence.num_prompt_tokens - h.sequence.num_cached_tokens)
+            for h in pending if h.state not in ("held", "exported")
+        )
         result["reserved_prompt_blocks"] = (
             sum((h.sequence.num_prompt_tokens + self.manager.block_size - 1) // self.manager.block_size
                 for h in pending)
@@ -390,6 +401,27 @@ class DecodeCore(_Core):
 
     def open(self, deadline=None):
         return self._open(uuid.uuid4().hex, deadline)
+
+    def open_local(self, request_id, prompt_token_ids, params, deadline=None):
+        if not self.scheduler.enable_chunked_prefill:
+            raise ValueError("Local prefill requires enable_chunked_prefill")
+        limit = self._validate_request(request_id, prompt_token_ids, params)
+        handle = self._open(uuid.uuid4().hex, deadline)
+        try:
+            self._reserve_capacity(handle, min(len(prompt_token_ids) + params.max_tokens, limit), 0)
+            seq = Sequence(prompt_token_ids, self.manager.block_size, params)
+            self.scheduler.add_sequence(seq)
+        except ValueError:
+            self._release(handle)
+            del self._handles[handle.session_id]
+            raise
+        handle.local = True
+        handle.sequence = seq
+        handle.request_id = request_id
+        handle.state = "queued"
+        self._sequences[seq.seq_id] = handle
+        self.engine.request_ids[seq.seq_id] = request_id
+        return handle
 
     def reserve(self, handle, metadata):
         self._check(handle)
@@ -417,6 +449,12 @@ class DecodeCore(_Core):
         nbytes = metadata["kv"]["nbytes"]
         tokens = min(metadata["prompt_length"] + metadata["sampling"]["max_tokens"],
                      metadata["sampling"]["max_model_length"])
+        self._reserve_capacity(handle, tokens, nbytes)
+        handle._metadata = deepcopy(metadata)
+        handle.transaction_id = metadata["transaction_id"]
+        handle.request_id = metadata["request_id"]
+
+    def _reserve_capacity(self, handle, tokens, nbytes):
         blocks = (tokens + self.manager.block_size - 1) // self.manager.block_size
         if self._resident >= self._resident_limit:
             raise CapacityError("D resident sequence capacity exhausted")
@@ -424,9 +462,6 @@ class DecodeCore(_Core):
             raise CapacityError("D KV block capacity exhausted")
         if self._reserved_bytes + nbytes > self.max_transfer_bytes:
             raise CapacityError("D transfer capacity exhausted")
-        handle._metadata = deepcopy(metadata)
-        handle.transaction_id = metadata["transaction_id"]
-        handle.request_id = metadata["request_id"]
         handle._reserved_bytes = nbytes
         handle._reserved_blocks = blocks
         self._reserved_bytes += nbytes
@@ -631,8 +666,14 @@ class DecodeCore(_Core):
                 self.engine.request_ids.pop(seq.seq_id, None)
                 self._release(handle)
                 handle.state = "finished"
+            elif handle.local:
+                handle.state = "active"
 
         self.engine.step(on_tokens=publish)
+        for seq in self.scheduler.running:
+            handle = self._sequences[seq.seq_id]
+            if handle.local and handle.state == "queued":
+                handle.state = "prefill"
         return events
 
     def _release(self, handle):
@@ -649,7 +690,7 @@ class DecodeCore(_Core):
             handle._receiver.close()
             handle._receiver = None
         seq = handle.sequence
-        if handle.state == "active":
+        if handle.state in ("queued", "prefill", "active"):
             self.scheduler.cancel(seq.seq_id)
             self._sequences.pop(seq.seq_id, None)
             self.engine.request_ids.pop(seq.seq_id, None)
@@ -664,4 +705,8 @@ class DecodeCore(_Core):
         result = super().stats()
         result.update(reserved_blocks=self._reserved_blocks, resident_requests=self._resident,
                       resident_limit=self._resident_limit)
+        result["local_resident_requests"] = sum(
+            bool(handle._reserved_blocks) and handle.local for handle in self._handles.values()
+        )
+        result["remote_resident_requests"] = self._resident - result["local_resident_requests"]
         return result

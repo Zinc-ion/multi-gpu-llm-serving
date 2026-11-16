@@ -17,7 +17,7 @@ import uvicorn
 from myvllm.engine.llm_engine import LLMEngine
 from myvllm.server import create_app
 from test_fp8_eval_tools import (
-    COMPARE, REPO, cases, compare, fixture_runs, inputs, mutate_jsonl, native_run, prepared, run, write_json,
+    COMPARE, REPO, cases, compare, fixture_runs, inputs, mutate_jsonl, native_run, prepared, run, sha, write_json,
 )
 from test_server import tokenizer
 
@@ -304,3 +304,138 @@ def test_model_revision_is_unverified_even_when_numeric_gates_pass(inputs):
                                       'status': 'UNVERIFIED_USER_DECLARATION'}
     assert all(task['gate_passed'] for task in data['tasks'].values())
     assert data['formal_m7_acceptance'] is None
+
+
+def linked_server_package(repo, tmp_path):
+    target = tmp_path / 'linked-server'
+    target.mkdir()
+    (target / '__init__.py').write_text('def tokenize_request(tokenizer, body, chat):\n    return [777]\n')
+    (target / '__main__.py').write_text("print('linked-server-entrypoint')\n")
+    link = repo / 'src/myvllm/server'
+    link.symlink_to(target, target_is_directory=True)
+    return link, target
+
+
+def test_linked_server_shadows_actual_import_and_prepare_rejects_it(inputs, copied_repo, tmp_path):
+    repo, _ = copied_repo
+    env = dict(os.environ, PYTHONPATH=str(repo / 'src'), CUDA_VISIBLE_DEVICES='', PYTHONDONTWRITEBYTECODE='1')
+    code = '''
+import json
+from myvllm import server
+class Tokenizer:
+    def apply_chat_template(self, messages, **kwargs): return 'hello'
+    def encode(self, prompt): return [42]
+print(json.dumps({'module': server.__file__, 'tokens': server.tokenize_request(Tokenizer(), {'messages': []}, True)}))
+'''
+
+    def probe(*args):
+        result = subprocess.run([sys.executable, '-P', *args], cwd=repo, env=env, text=True, capture_output=True)
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    before = json.loads(probe('-c', code))
+    assert before == {'module': str(repo / 'src/myvllm/server.py'), 'tokens': [42]}
+    assert '--config' in probe('-m', 'myvllm.server', '--help')
+    files_before = {str(path.relative_to(repo)): sha(path)
+                    for path in (repo / 'src').rglob('*.py') if path.is_file()}
+    link, _ = linked_server_package(repo, tmp_path)
+    after = json.loads(probe('-c', code))
+    assert after == {'module': str(link / '__init__.py'), 'tokens': [777]}
+    assert probe('-m', 'myvllm.server', '--help').strip() == 'linked-server-entrypoint'
+    assert {str(path.relative_to(repo)): sha(path)
+            for path in (repo / 'src').rglob('*.py') if path.is_file()} == files_before
+    result = run(*inputs[2])
+    assert result.returncode == 2 and 'serving source directory symlink' in result.stderr
+    assert not inputs[1].exists()
+
+
+def test_link_after_prepare_blocks_freeze_and_all_acceptance_checks(inputs, copied_repo, tmp_path):
+    repo, compare_tool = copied_repo
+    _, output = prepared(inputs)
+    rows = cases(output)
+    native_run(output, rows, 'baseline')
+    plan = output / 'plan.json'
+    for stage in ('assets', 'baseline'):
+        result = run(compare_tool, 'check', '--plan', plan, '--stage', stage)
+        assert result.returncode == 0, result.stderr
+    link, target = linked_server_package(repo, tmp_path)
+    for args in (('check', '--stage', 'assets'), ('check', '--stage', 'baseline'),
+                 ('check', '--stage', 'candidate'), ('freeze',),
+                 ('compare', '--output', str(output / 'comparison-linked.json'))):
+        result = run(compare_tool, args[0], '--plan', plan, *args[1:])
+        assert result.returncode == 2 and 'serving source directory symlink' in result.stderr
+    assert not (output / 'baseline-cases.json').exists()
+    assert not (output / 'comparison-linked.json').exists()
+
+    link.unlink()
+    result = run(compare_tool, 'freeze', '--plan', plan)
+    assert result.returncode == 0, result.stderr
+    native_run(output, rows, 'candidate')
+    result = run(compare_tool, 'check', '--plan', plan, '--stage', 'candidate')
+    assert result.returncode == 0, result.stderr
+    result = run(compare_tool, 'compare', '--plan', plan, '--output', output / 'comparison-before-link.json')
+    assert result.returncode == 0, result.stderr
+    link.symlink_to(target, target_is_directory=True)
+    for args in (('check', '--stage', 'assets'), ('check', '--stage', 'baseline'),
+                 ('check', '--stage', 'candidate'), ('freeze',),
+                 ('compare', '--output', str(output / 'comparison-linked.json'))):
+        result = run(compare_tool, args[0], '--plan', plan, *args[1:])
+        assert result.returncode == 2 and 'serving source directory symlink' in result.stderr
+    assert not (output / 'comparison-linked.json').exists()
+
+
+@pytest.mark.parametrize('location', ['root', 'empty_subdirectory'])
+def test_prepare_rejects_source_directory_symlinks(inputs, copied_repo, tmp_path, location):
+    repo, _ = copied_repo
+    source = repo / 'src'
+    if location == 'root':
+        target = repo / 'source-original'
+        source.rename(target)
+        source.symlink_to(target, target_is_directory=True)
+    else:
+        target = tmp_path / 'empty-directory'
+        target.mkdir()
+        (source / 'myvllm/engine/empty-link').symlink_to(target, target_is_directory=True)
+    result = run(*inputs[2])
+    assert result.returncode == 2 and 'serving source directory symlink' in result.stderr
+    assert not inputs[1].exists()
+
+
+def test_source_file_symlink_still_requires_matching_git_blob(inputs, copied_repo, tmp_path):
+    repo, compare_tool = copied_repo
+    source = repo / 'src/myvllm/server.py'
+    target = tmp_path / 'server-source.py'
+    shutil.copyfile(source, target)
+    source.unlink()
+    source.symlink_to(target)
+    _, output = prepared(inputs)
+    result = run(compare_tool, 'check', '--plan', output / 'plan.json', '--stage', 'assets')
+    assert result.returncode == 0, result.stderr
+    target.write_text(target.read_text() + '\n# changed target\n')
+    result = run(compare_tool, 'check', '--plan', output / 'plan.json', '--stage', 'assets')
+    assert result.returncode == 2 and 'candidate Git blob' in result.stderr
+
+
+def test_model_asset_file_symlinks_remain_supported(inputs, copied_repo):
+    _, compare_tool = copied_repo
+    blobs = inputs[0] / 'model-blobs'
+    blobs.mkdir()
+    for asset in (inputs[0] / 'model').iterdir():
+        target = blobs / asset.name
+        asset.rename(target)
+        asset.symlink_to(Path('..') / blobs.name / asset.name)
+    _, output = prepared(inputs)
+    assets = json.loads((output / 'assets.json').read_text())
+    assert assets['model']['files'] == {path.name: sha(path) for path in blobs.iterdir()}
+    result = run(compare_tool, 'check', '--plan', output / 'plan.json', '--stage', 'assets')
+    assert result.returncode == 0, result.stderr
+    rows = cases(output)
+    native_run(output, rows, 'baseline')
+    result = run(compare_tool, 'freeze', '--plan', output / 'plan.json')
+    assert result.returncode == 0, result.stderr
+    native_run(output, rows, 'candidate')
+    result = run(compare_tool, 'compare', '--plan', output / 'plan.json', '--output', output / 'comparison.json')
+    assert result.returncode == 0, result.stderr
+    (blobs / 'model.safetensors').write_bytes(b'changed fixture weights')
+    result = run(compare_tool, 'check', '--plan', output / 'plan.json', '--stage', 'assets')
+    assert result.returncode == 2 and 'asset files changed' in result.stderr

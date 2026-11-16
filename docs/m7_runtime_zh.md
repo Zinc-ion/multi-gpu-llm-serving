@@ -119,7 +119,7 @@ cd "$REPO"
   --candidate-commit <full-40-character-commit>
 ```
 
-输出目录必须是 `/Data2/zincion/ai-infra` 下的新目录。工具记录模型、tokenizer 和两份语料每个文件的 SHA-256、revision、服务与客户端配置及脚本的哈希；哈希模型权重会读取完整快照。模型 revision 标记为 `UNVERIFIED_USER_DECLARATION`：文件哈希用于检查两次运行使用的内容相同，不证明其官方来源。准备时和后续检查均将实际 `src/**/*.py` 的路径与内容对照候选 commit 的 Git blob，并固定两个质量工具的实际 SHA-256；不要求用户的 `AGENTS.md`、`.codex` 等其他文件为干净状态。服务通过 `-P` 和固定 `PYTHONPATH` 加载已检查的 `src`。使用非默认 `--workspace-root` 仅用于本地临时工作区模拟，服务器实验仍须使用默认根目录。可通过 `--math-gate`、`--needle-gate` 在准备时分别固定最大精度下降，单位均为 0–1 的比例；例如 `0.01` 表示一个百分点。比较使用逐样本正确数和原始十进制门槛精确判定，恰好等于门槛视为通过。省略时对应任务为 capture-only，`gate_passed=null`，不表示通过。门槛、配置和样本在评测前固定，不能在看到结果后修改门槛再作为验收。
+输出目录必须是 `/Data2/zincion/ai-infra` 下的新目录。工具记录模型、tokenizer 和两份语料每个文件的 SHA-256、revision、服务与客户端配置及脚本的哈希；哈希模型权重会读取完整快照。模型 revision 标记为 `UNVERIFIED_USER_DECLARATION`：文件哈希用于检查两次运行使用的内容相同，不证明其官方来源。准备时和后续检查均将实际 `src/**/*.py` 的路径与内容对照候选 commit 的 Git blob，并固定两个质量工具的实际 SHA-256；`src` 本身及其内部目录不能是符号链接，模型资产文件的符号链接仍按目标文件内容哈希；不要求用户的 `AGENTS.md`、`.codex` 等其他文件为干净状态。服务通过 `-P` 和固定 `PYTHONPATH` 加载已检查的 `src`。使用非默认 `--workspace-root` 仅用于本地临时工作区模拟，服务器实验仍须使用默认根目录。可通过 `--math-gate`、`--needle-gate` 在准备时分别固定最大精度下降，单位均为 0–1 的比例；例如 `0.01` 表示一个百分点。比较使用逐样本正确数和原始十进制门槛精确判定，恰好等于门槛视为通过。省略时对应任务为 capture-only，`gate_passed=null`，不表示通过。门槛、配置和样本在评测前固定，不能在看到结果后修改门槛再作为验收。
 
 默认是两任务相同的 `temperature=0`、`top_p=1`、`max_tokens=1024`，用于在本服务支持的采样契约下减少对比中的随机性；这不等同于数据集或模型推荐的完整采样方案，结果不能直接当成外部排行榜口径。NIAH 使用长度 1024、7680、14336 与深度 0%、50%、100% 的英中网格。长度上限加 1024 token 的 chat 预算和生成预算严格小于配置的 `max_model_length=17408`；准备后的 `materialize.sh` 还会用服务环境的 tokenizer 和实际 `tokenize_request` 对每个原生样本应用 chat template，逐条检查实际 prompt 加回复预算。输入不截断；命中 `max_tokens` 的回复数量会在比较结果中单独记录。
 

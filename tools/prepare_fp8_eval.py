@@ -64,7 +64,13 @@ def serving_source(repo, commit):
             path = os.fsdecode(path)
             if path.endswith('.py') and kind == b'blob':
                 blobs[path] = blob.decode()
-    files = {str(path.relative_to(repo)): path for path in (repo / 'src').rglob('*.py') if path.is_file()}
+    src = repo / 'src'
+    if src.is_symlink():
+        raise ValueError(f'serving source directory symlink is not supported: {src}')
+    for path in src.rglob('*'):
+        if path.is_symlink() and path.is_dir():
+            raise ValueError(f'serving source directory symlink is not supported: {path}')
+    files = {str(path.relative_to(repo)): path for path in src.rglob('*.py') if path.is_file()}
     if not blobs or files.keys() != blobs.keys():
         raise ValueError('serving Python source file set differs from candidate commit')
     result = {}

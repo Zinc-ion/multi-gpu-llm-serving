@@ -1,0 +1,213 @@
+{
+  "ranks": [
+    {
+      "file": "docs/results/l40s-20261118/profile/rank-0.json.gz",
+      "gpu_event_count": 6356,
+      "gpu_span_ms": 1475.0229467773438,
+      "gpu_busy_union_ms": 1456.2038159179688,
+      "uncovered_gpu_span_ms": 18.819130859375,
+      "categories": {
+        "memory": {
+          "events": 66,
+          "duration_sum_ms": 0.046841796875,
+          "busy_union_ms": 0.046841796875
+        },
+        "elementwise": {
+          "events": 3115,
+          "duration_sum_ms": 43.2682705078125,
+          "busy_union_ms": 43.2682705078125
+        },
+        "communication": {
+          "events": 656,
+          "duration_sum_ms": 980.0230244140625,
+          "busy_union_ms": 980.0230244140625
+        },
+        "compute": {
+          "events": 1608,
+          "duration_sum_ms": 431.4159921875,
+          "busy_union_ms": 431.4159921875
+        },
+        "other": {
+          "events": 911,
+          "duration_sum_ms": 1.44968701171875,
+          "busy_union_ms": 1.44968701171875
+        }
+      },
+      "top_kernels_by_summed_duration": [
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "duration_sum_ms": 959.8304579999996
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8::Params)",
+          "duration_sum_ms": 139.84038599999994
+        },
+        {
+          "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, false, true, true, false, 7, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>)",
+          "duration_sum_ms": 81.90993199999996
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_s16816gemm_bf16_128x256_32x3_tn_align8>(cutlass_80_tensorop_s16816gemm_bf16_128x256_32x3_tn_align8::Params)",
+          "duration_sum_ms": 60.81200799999999
+        },
+        {
+          "name": "paged_attention_decode_kernel",
+          "duration_sum_ms": 43.63937000000003
+        },
+        {
+          "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, float, float, float, false, true, true, false, 7, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float>)",
+          "duration_sum_ms": 34.107189000000005
+        },
+        {
+          "name": "paged_attention_prefill_kernel",
+          "duration_sum_ms": 33.014607
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_s16816gemm_bf16_256x128_32x3_tn_align8>(cutlass_80_tensorop_s16816gemm_bf16_256x128_32x3_tn_align8::Params)",
+          "duration_sum_ms": 18.205265000000004
+        },
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "duration_sum_ms": 16.781321
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul>)",
+          "duration_sum_ms": 11.320188000000082
+        },
+        {
+          "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, float, float, float, false, true, true, false, 6, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float>)",
+          "duration_sum_ms": 11.185969000000014
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)",
+          "duration_sum_ms": 11.145461000000061
+        }
+      ],
+      "host_scopes": {
+        "mini.prefill": {
+          "calls": 1,
+          "host_scope_sum_ms": 616.4239520000001
+        },
+        "mini.decode": {
+          "calls": 7,
+          "host_scope_sum_ms": 859.200767
+        }
+      },
+      "compile_inner_events": 0,
+      "host_cuda_runtime_sum_ms": 793.3712909999999,
+      "host_sync_calls_sum_ms": 760.868995,
+      "limits": [
+        "category inferred from kernel names; unresolved kernels remain other",
+        "category duration sums can overlap; they are not additive wall-time fractions",
+        "NCCL kernel time includes execution and possible peer waits",
+        "uncovered GPU intervals can include host dispatch and synchronization; not pure removable wait",
+        "host scopes include launches and blocking work; host and GPU times overlap"
+      ]
+    },
+    {
+      "file": "docs/results/l40s-20261118/profile/rank-1.json.gz",
+      "gpu_event_count": 6268,
+      "gpu_span_ms": 1472.0908110351563,
+      "gpu_busy_union_ms": 794.1505913085938,
+      "uncovered_gpu_span_ms": 677.9402197265625,
+      "categories": {
+        "memory": {
+          "events": 42,
+          "duration_sum_ms": 0.0275185546875,
+          "busy_union_ms": 0.0275185546875
+        },
+        "elementwise": {
+          "events": 3075,
+          "duration_sum_ms": 42.5481650390625,
+          "busy_union_ms": 42.5481650390625
+        },
+        "communication": {
+          "events": 656,
+          "duration_sum_ms": 318.36267236328126,
+          "busy_union_ms": 318.36267236328126
+        },
+        "compute": {
+          "events": 1608,
+          "duration_sum_ms": 431.7887329101562,
+          "busy_union_ms": 431.7887329101562
+        },
+        "other": {
+          "events": 887,
+          "duration_sum_ms": 1.42350244140625,
+          "busy_union_ms": 1.42350244140625
+        }
+      },
+      "top_kernels_by_summed_duration": [
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "duration_sum_ms": 316.22452499999855
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8::Params)",
+          "duration_sum_ms": 139.49022199999996
+        },
+        {
+          "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, false, true, true, false, 7, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>)",
+          "duration_sum_ms": 81.86956300000008
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_s16816gemm_bf16_128x256_32x3_tn_align8>(cutlass_80_tensorop_s16816gemm_bf16_128x256_32x3_tn_align8::Params)",
+          "duration_sum_ms": 60.679100000000005
+        },
+        {
+          "name": "paged_attention_decode_kernel",
+          "duration_sum_ms": 43.66463199999998
+        },
+        {
+          "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, float, float, float, false, true, true, false, 7, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float>)",
+          "duration_sum_ms": 34.097678
+        },
+        {
+          "name": "paged_attention_prefill_kernel",
+          "duration_sum_ms": 33.866920000000015
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_s16816gemm_bf16_256x128_32x3_tn_align8>(cutlass_80_tensorop_s16816gemm_bf16_256x128_32x3_tn_align8::Params)",
+          "duration_sum_ms": 18.264118
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul>)",
+          "duration_sum_ms": 11.512324000000113
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul>)",
+          "duration_sum_ms": 11.204294000000031
+        },
+        {
+          "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, float, float, float, false, true, true, false, 6, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float>)",
+          "duration_sum_ms": 11.160884000000001
+        },
+        {
+          "name": "triton_poi_fused_mul_silu_split_0",
+          "duration_sum_ms": 10.850838000000024
+        }
+      ],
+      "host_scopes": {
+        "mini.prefill": {
+          "calls": 1,
+          "host_scope_sum_ms": 110.301922
+        },
+        "mini.decode": {
+          "calls": 7,
+          "host_scope_sum_ms": 849.395074
+        }
+      },
+      "compile_inner_events": 0,
+      "host_cuda_runtime_sum_ms": 44.634929,
+      "host_sync_calls_sum_ms": 1.323606,
+      "limits": [
+        "category inferred from kernel names; unresolved kernels remain other",
+        "category duration sums can overlap; they are not additive wall-time fractions",
+        "NCCL kernel time includes execution and possible peer waits",
+        "uncovered GPU intervals can include host dispatch and synchronization; not pure removable wait",
+        "host scopes include launches and blocking work; host and GPU times overlap"
+      ]
+    }
+  ],
+  "aggregation": "per trace; never add different rank times as elapsed request time"
+}

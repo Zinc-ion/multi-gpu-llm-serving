@@ -1,0 +1,180 @@
+{
+  "baseline_metadata": {
+    "commit": "65906d255fe1177fa8a5a4f9b1bce734db02e53d",
+    "config": {
+      "model_name_or_path": "/root/data/zincion/ai-infra/l40s-20261117/models/Qwen3-14B",
+      "model_type": "Qwen3-14B",
+      "model_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+      "tokenizer_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+      "cache_dir": "/root/data/zincion/ai-infra/l40s-20261117/cache/hf-hub",
+      "dtype": "bfloat16",
+      "seed": 0,
+      "max_num_sequences": 4,
+      "max_num_batched_tokens": 4352,
+      "max_cached_blocks": 80,
+      "block_size": 256,
+      "world_size": 1,
+      "enforce_eager": true,
+      "vocab_size": 151936,
+      "hidden_size": 5120,
+      "num_heads": 40,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 17408,
+      "num_layers": 40,
+      "tie_word_embeddings": false,
+      "base": 1000000,
+      "rms_norm_epsilon": 1e-06,
+      "qkv_bias": false,
+      "scale": 1,
+      "max_position": 40960,
+      "ffn_bias": false,
+      "max_model_length": 4352,
+      "gpu_memory_utilization": 0.9,
+      "eos": [
+        151645,
+        151643
+      ],
+      "sampling": {
+        "temperature": 0,
+        "max_tokens": 128,
+        "ignore_eos": true
+      },
+      "prompts": [
+        "<|im_start|>user\n请用一句话介绍你自己。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+      ],
+      "enable_chunked_prefill": false,
+      "fp8_prefill_compute_dtype": "float32",
+      "kv_cache_dtype": "auto",
+      "tp_command_timeout_s": 120
+    },
+    "torch": "2.9.1+cu128",
+    "gpu": "NVIDIA L40S",
+    "working_tree_dirty": false
+  },
+  "candidate_metadata": {
+    "commit": "65906d255fe1177fa8a5a4f9b1bce734db02e53d",
+    "config": {
+      "model_name_or_path": "/root/data/zincion/ai-infra/l40s-20261117/models/Qwen3-14B",
+      "model_type": "Qwen3-14B",
+      "model_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+      "tokenizer_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+      "cache_dir": "/root/data/zincion/ai-infra/l40s-20261117/cache/hf-hub",
+      "dtype": "bfloat16",
+      "seed": 0,
+      "max_num_sequences": 4,
+      "max_num_batched_tokens": 4352,
+      "max_cached_blocks": 80,
+      "block_size": 256,
+      "world_size": 2,
+      "enforce_eager": true,
+      "vocab_size": 151936,
+      "hidden_size": 5120,
+      "num_heads": 40,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 17408,
+      "num_layers": 40,
+      "tie_word_embeddings": false,
+      "base": 1000000,
+      "rms_norm_epsilon": 1e-06,
+      "qkv_bias": false,
+      "scale": 1,
+      "max_position": 40960,
+      "ffn_bias": false,
+      "max_model_length": 4352,
+      "gpu_memory_utilization": 0.9,
+      "eos": [
+        151645,
+        151643
+      ],
+      "sampling": {
+        "temperature": 0,
+        "max_tokens": 128,
+        "ignore_eos": true
+      },
+      "prompts": [
+        "<|im_start|>user\n请用一句话介绍你自己。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+      ],
+      "enable_chunked_prefill": false,
+      "fp8_prefill_compute_dtype": "float32",
+      "kv_cache_dtype": "auto",
+      "tp_command_timeout_s": 120
+    },
+    "torch": "2.9.1+cu128",
+    "gpu": "NVIDIA L40S",
+    "working_tree_dirty": true
+  },
+  "tokens_identical": true,
+  "logits_gate": null,
+  "cases": [
+    {
+      "name": "chat-0",
+      "tokens_identical": true,
+      "baseline_output_tokens": 16,
+      "candidate_output_tokens": 16,
+      "first_divergence": null,
+      "same_prefix_logit_positions": 16,
+      "max_abs_error": 0.5,
+      "mean_abs_error": 0.042360540479421616,
+      "top1_agreement": 1.0
+    },
+    {
+      "name": "chat-1",
+      "tokens_identical": true,
+      "baseline_output_tokens": 16,
+      "candidate_output_tokens": 16,
+      "first_divergence": null,
+      "same_prefix_logit_positions": 16,
+      "max_abs_error": 0.375,
+      "mean_abs_error": 0.032638512551784515,
+      "top1_agreement": 1.0
+    },
+    {
+      "name": "tokens-255",
+      "tokens_identical": true,
+      "baseline_output_tokens": 16,
+      "candidate_output_tokens": 16,
+      "first_divergence": null,
+      "same_prefix_logit_positions": 16,
+      "max_abs_error": 4.1015625,
+      "mean_abs_error": 0.1337302327156067,
+      "top1_agreement": 1.0
+    },
+    {
+      "name": "tokens-256",
+      "tokens_identical": true,
+      "baseline_output_tokens": 16,
+      "candidate_output_tokens": 16,
+      "first_divergence": null,
+      "same_prefix_logit_positions": 16,
+      "max_abs_error": 9.671875,
+      "mean_abs_error": 0.21873097121715546,
+      "top1_agreement": 1.0
+    },
+    {
+      "name": "tokens-257",
+      "tokens_identical": true,
+      "baseline_output_tokens": 16,
+      "candidate_output_tokens": 16,
+      "first_divergence": null,
+      "same_prefix_logit_positions": 16,
+      "max_abs_error": 5.25,
+      "mean_abs_error": 0.14844191074371338,
+      "top1_agreement": 1.0
+    },
+    {
+      "name": "tokens-4096",
+      "tokens_identical": true,
+      "baseline_output_tokens": 16,
+      "candidate_output_tokens": 16,
+      "first_divergence": null,
+      "same_prefix_logit_positions": 16,
+      "max_abs_error": 0.5,
+      "mean_abs_error": 0.048875756561756134,
+      "top1_agreement": 1.0
+    }
+  ],
+  "baseline": "/root/data/zincion/ai-infra/l40s-20261117/runs/acceptance-20261118/tp1-bf16.pt",
+  "candidate": "/root/data/zincion/ai-infra/l40s-20261117/runs/acceptance-20261118/tp2-bf16-fixed.pt"
+}

@@ -1,0 +1,19 @@
+{
+  "pairs": [
+    {
+      "prefill": [
+        "127.0.0.1",
+        19100
+      ],
+      "decode": [
+        "127.0.0.1",
+        19200
+      ]
+    }
+  ],
+  "max_active_requests": 4,
+  "max_payload_bytes": 1073741824,
+  "max_staging_bytes": 3221225472,
+  "max_request_bytes": 2097152,
+  "request_timeout": 600
+}

@@ -1,0 +1,132 @@
+{
+  "vllm_version": "0.15.0",
+  "reference": "unmodified installed vllm/benchmarks/serve.py::calculate_metrics",
+  "scope": "CPU recomputation of saved request records; no HTTP/GPU rerun; not a full official CLI benchmark run",
+  "fields": [
+    "completed",
+    "failed",
+    "output_lengths",
+    "output_throughput",
+    "total_token_throughput",
+    "ttft_mean_p50_p95_p99_ms",
+    "tpot_mean_p50_p95_p99_ms"
+  ],
+  "comparison": {
+    "relative_tolerance": 1e-12,
+    "absolute_tolerance": 1e-09
+  },
+  "checks": [
+    {
+      "label": "bf16-four-pd-c1",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 1.4210854715202004e-14,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-four-pd-c4",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 6.366462912410498e-12,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-four-pd-fixed-c1",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 1.4210854715202004e-14,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-four-pd-fixed-c4",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 7.275957614183426e-12,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-pd-c1",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 1.4210854715202004e-14,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-pd-c4",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 6.366462912410498e-12,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-tp1-c1",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 7.105427357601002e-15,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-tp1-c4",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 1.4210854715202004e-14,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-tp1-final32-c4",
+      "requests": 32,
+      "official_completed": 32,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 0.0,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-tp2-final32-c4",
+      "requests": 32,
+      "official_completed": 32,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 1.4210854715202004e-14,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-tp2-fixed-c1",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 1.4210854715202004e-14,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "bf16-tp2-fixed-c4",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 1.4210854715202004e-14,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "fp8-kv-tp1-c1",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 7.105427357601002e-15,
+      "all_checked_fields_match": true
+    },
+    {
+      "label": "fp8-kv-tp1-c4",
+      "requests": 8,
+      "official_completed": 8,
+      "official_failed": 0,
+      "max_absolute_statistic_difference": 1.1368683772161603e-13,
+      "all_checked_fields_match": true
+    }
+  ]
+}

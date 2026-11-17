@@ -1,0 +1,187 @@
+{
+  "metadata": {
+    "commit": "65906d255fe1177fa8a5a4f9b1bce734db02e53d",
+    "config": {
+      "model_name_or_path": "/root/data/zincion/ai-infra/l40s-20261117/models/Qwen3-14B",
+      "model_type": "Qwen3-14B",
+      "model_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+      "tokenizer_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+      "cache_dir": "/root/data/zincion/ai-infra/l40s-20261117/cache/hf-hub",
+      "dtype": "bfloat16",
+      "seed": 0,
+      "max_num_sequences": 4,
+      "max_num_batched_tokens": 4352,
+      "max_cached_blocks": 80,
+      "block_size": 256,
+      "world_size": 1,
+      "enforce_eager": true,
+      "vocab_size": 151936,
+      "hidden_size": 5120,
+      "num_heads": 40,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 17408,
+      "num_layers": 40,
+      "tie_word_embeddings": false,
+      "base": 1000000,
+      "rms_norm_epsilon": 1e-06,
+      "qkv_bias": false,
+      "scale": 1,
+      "max_position": 40960,
+      "ffn_bias": false,
+      "max_model_length": 4352,
+      "gpu_memory_utilization": 0.9,
+      "eos": [
+        151645,
+        151643
+      ],
+      "sampling": {
+        "temperature": 0,
+        "max_tokens": 128,
+        "ignore_eos": true
+      },
+      "prompts": [
+        "<|im_start|>user\n\u8bf7\u7528\u4e00\u53e5\u8bdd\u4ecb\u7ecd\u4f60\u81ea\u5df1\u3002<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+      ],
+      "enable_chunked_prefill": false,
+      "fp8_prefill_compute_dtype": "float32",
+      "kv_cache_dtype": "auto",
+      "tp_command_timeout_s": 120
+    },
+    "torch": "2.9.1+cu128",
+    "gpu": "NVIDIA L40S",
+    "working_tree_dirty": false
+  },
+  "attention": "sdpa",
+  "sdpa_backend": "flash",
+  "expand_kv": false,
+  "custom_metadata": {
+    "commit": "65906d255fe1177fa8a5a4f9b1bce734db02e53d",
+    "config": {
+      "model_name_or_path": "/root/data/zincion/ai-infra/l40s-20261117/models/Qwen3-14B",
+      "model_type": "Qwen3-14B",
+      "model_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+      "tokenizer_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+      "cache_dir": "/root/data/zincion/ai-infra/l40s-20261117/cache/hf-hub",
+      "dtype": "bfloat16",
+      "seed": 0,
+      "max_num_sequences": 4,
+      "max_num_batched_tokens": 4352,
+      "max_cached_blocks": 80,
+      "block_size": 256,
+      "world_size": 1,
+      "enforce_eager": true,
+      "vocab_size": 151936,
+      "hidden_size": 5120,
+      "num_heads": 40,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 17408,
+      "num_layers": 40,
+      "tie_word_embeddings": false,
+      "base": 1000000,
+      "rms_norm_epsilon": 1e-06,
+      "qkv_bias": false,
+      "scale": 1,
+      "max_position": 40960,
+      "ffn_bias": false,
+      "max_model_length": 4352,
+      "gpu_memory_utilization": 0.9,
+      "eos": [
+        151645,
+        151643
+      ],
+      "sampling": {
+        "temperature": 0,
+        "max_tokens": 128,
+        "ignore_eos": true
+      },
+      "prompts": [
+        "<|im_start|>user\n\u8bf7\u7528\u4e00\u53e5\u8bdd\u4ecb\u7ecd\u4f60\u81ea\u5df1\u3002<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+      ],
+      "enable_chunked_prefill": false,
+      "fp8_prefill_compute_dtype": "float32",
+      "kv_cache_dtype": "auto",
+      "tp_command_timeout_s": 120
+    },
+    "torch": "2.9.1+cu128",
+    "gpu": "NVIDIA L40S",
+    "working_tree_dirty": false
+  },
+  "results": [
+    {
+      "name": "chat-0",
+      "prompt_tokens": 21,
+      "completion_tokens": 16,
+      "greedy_equal": true,
+      "first_difference": null,
+      "hf_top1_top2_margin": null,
+      "max_abs_error": 0.5625,
+      "mean_abs_error": 0.04664306342601776,
+      "top1_agreement": 1.0,
+      "raw_reference": "/root/data/zincion/ai-infra/l40s-20261117/runs/acceptance-20261118/tp1-hf-reference.json.chat-0.pt"
+    },
+    {
+      "name": "chat-1",
+      "prompt_tokens": 24,
+      "completion_tokens": 16,
+      "greedy_equal": true,
+      "first_difference": null,
+      "hf_top1_top2_margin": null,
+      "max_abs_error": 0.5,
+      "mean_abs_error": 0.035916123539209366,
+      "top1_agreement": 0.9375,
+      "raw_reference": "/root/data/zincion/ai-infra/l40s-20261117/runs/acceptance-20261118/tp1-hf-reference.json.chat-1.pt"
+    },
+    {
+      "name": "tokens-255",
+      "prompt_tokens": 255,
+      "completion_tokens": 16,
+      "greedy_equal": true,
+      "first_difference": null,
+      "hf_top1_top2_margin": null,
+      "max_abs_error": 5.197265625,
+      "mean_abs_error": 0.16557972133159637,
+      "top1_agreement": 1.0,
+      "raw_reference": "/root/data/zincion/ai-infra/l40s-20261117/runs/acceptance-20261118/tp1-hf-reference.json.tokens-255.pt"
+    },
+    {
+      "name": "tokens-256",
+      "prompt_tokens": 256,
+      "completion_tokens": 16,
+      "greedy_equal": true,
+      "first_difference": null,
+      "hf_top1_top2_margin": null,
+      "max_abs_error": 5.1015625,
+      "mean_abs_error": 0.16862909495830536,
+      "top1_agreement": 1.0,
+      "raw_reference": "/root/data/zincion/ai-infra/l40s-20261117/runs/acceptance-20261118/tp1-hf-reference.json.tokens-256.pt"
+    },
+    {
+      "name": "tokens-257",
+      "prompt_tokens": 257,
+      "completion_tokens": 16,
+      "greedy_equal": true,
+      "first_difference": null,
+      "hf_top1_top2_margin": null,
+      "max_abs_error": 5.53125,
+      "mean_abs_error": 0.14540624618530273,
+      "top1_agreement": 1.0,
+      "raw_reference": "/root/data/zincion/ai-infra/l40s-20261117/runs/acceptance-20261118/tp1-hf-reference.json.tokens-257.pt"
+    },
+    {
+      "name": "tokens-4096",
+      "prompt_tokens": 4096,
+      "completion_tokens": 16,
+      "greedy_equal": true,
+      "first_difference": null,
+      "hf_top1_top2_margin": null,
+      "max_abs_error": 0.5,
+      "mean_abs_error": 0.0551774762570858,
+      "top1_agreement": 1.0,
+      "raw_reference": "/root/data/zincion/ai-infra/l40s-20261117/runs/acceptance-20261118/tp1-hf-reference.json.tokens-4096.pt"
+    }
+  ],
+  "status": "complete",
+  "acceptance_threshold": "pending user decision; measurements are not a pass/fail gate"
+}

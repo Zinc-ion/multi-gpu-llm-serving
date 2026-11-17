@@ -236,8 +236,8 @@ def tokenize_request(tokenizer, body, chat):
 
 
 def create_app(config, model_name=None, engine_factory=LLMEngine, pd_worker=None):
-    if config["world_size"] != 1:
-        raise ValueError("HTTP serving requires world_size == 1")
+    if config["world_size"] not in (1, 2):
+        raise ValueError("HTTP serving requires world_size 1 or 2")
     model_name = model_name or config["model_name_or_path"]
     worker = pd_worker if pd_worker is not None else EngineThread(config, engine_factory)
 

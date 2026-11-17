@@ -1,0 +1,11 @@
+{
+  "bf16-tp1": "completed",
+  "fp8-kv-tp1": "completed",
+  "bf16-pd": "completed",
+  "bf16-tp2": "RuntimeError: pid 12693 exited 1",
+  "bf16-four-pd": "completed",
+  "bf16-tp2-fixed": "completed",
+  "bf16-four-pd-fixed": "completed",
+  "bf16-tp1-final32": "completed",
+  "bf16-tp2-final32": "completed"
+}

@@ -1,0 +1,35 @@
+{
+  "source": {
+    "dataset": "random",
+    "input_length": 4096
+  },
+  "seed": 7,
+  "requests": 8,
+  "filtered_before_selection": 0,
+  "max_model_length": 4352,
+  "model_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+  "tokenizer_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+  "output_length": "fixed",
+  "length_filter": {
+    "after_chat_template": true,
+    "sharegpt_raw_limits": null
+  },
+  "sha256": "db9e865f51309668a6034359c9235288e301f4289cbdf9f97b2636054f15e066",
+  "commit": "c22beef66b018feeac9a11fe7f95921e2303d5b4",
+  "command": "tools/prepare_workloads.py --config /root/data/zincion/ai-infra/l40s-20261117/acceptance-ready/configs/tp1-bf16.json --dataset random --input-length 4096 --output-tokens 128 --num-requests 8 --cache-dir /root/data/zincion/ai-infra/l40s-20261117/cache/hf-datasets --output /root/data/zincion/ai-infra/l40s-20261117/acceptance-ready/workloads/4k-128.jsonl",
+  "bench_parameters": {
+    "dataset_name": "custom",
+    "dataset_path": "/root/data/zincion/ai-infra/l40s-20261117/acceptance-ready/workloads/4k-128.jsonl",
+    "custom_output_len": -1,
+    "skip_chat_template": true,
+    "disable_shuffle": true,
+    "num_prompts": 8,
+    "seed": 7,
+    "temperature": 0,
+    "ignore_eos": true,
+    "percentile_metrics": "ttft,tpot,itl,e2el",
+    "metric_percentiles": "50,90,99",
+    "save_result": true,
+    "save_detailed": true
+  }
+}

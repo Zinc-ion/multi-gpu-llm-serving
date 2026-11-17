@@ -1,0 +1,1 @@
+pid, gpu_uuid, used_gpu_memory [MiB]

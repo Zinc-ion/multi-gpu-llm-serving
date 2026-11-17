@@ -152,7 +152,7 @@ done
 
 `tools/prepare_fp8_eval.py` 生成一组固定的单实例 BF16 配置：baseline 使用 `kv_cache_dtype=auto`，candidate 的 KV cache 使用 `float8_e4m3fn`，其余服务配置相同。质量客户端独立使用 evalscope `1.5.1`，不修改 serving 或 vLLM 环境。以下流程是源码核对后的准备方案，尚未安装 evalscope 或执行真实数据集评测。
 
-先在服务器工作目录中准备 Qwen3-14B 模型及 tokenizer 本地快照、可由 evalscope 加载的本地 MATH-500 数据和 NIAH 英中语料；记录模型和两份语料的来源及 revision。配置中的模型和 tokenizer revision 是使用者声明，当前工具没有独立来源或预期文件哈希证明本地快照属于该 revision。NIAH 目录须包含 `PaulGraham_Essays.txt` 和 `Journey_to_the_West.txt`。evalscope 1.5.1 的本地加载器会删除数学数据目录中的 `dataset_infos.json`，因此准备工具拒绝含该文件的语料目录，不改动语料。下面的路径和完整候选 commit 均由实际实验者填写：
+以下完整质量工具的路径与服务器限制沿用学校内网环境；当前 L40S 租机使用 [数据盘任务目录](server_hardware_l40s_2026-11-17.md)，本轮不要求运行这套旧评测。先在服务器工作目录中准备 Qwen3-14B 模型及 tokenizer 本地快照、可由 evalscope 加载的本地 MATH-500 数据和 NIAH 英中语料；记录模型和两份语料的来源及 revision。配置中的模型和 tokenizer revision 是使用者声明，当前工具没有独立来源或预期文件哈希证明本地快照属于该 revision。NIAH 目录须包含 `PaulGraham_Essays.txt` 和 `Journey_to_the_West.txt`。evalscope 1.5.1 的本地加载器会删除数学数据目录中的 `dataset_infos.json`，因此准备工具拒绝含该文件的语料目录，不改动语料。下面的路径和完整候选 commit 均由实际实验者填写：
 
 ```bash
 QUALITY_ROOT=/Data2/zincion/ai-infra/experiments/m7-quality/run-01

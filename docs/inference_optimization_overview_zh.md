@@ -87,14 +87,14 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 
 ## 已准备环境与开卡顺序
 
-远端任务目录为 `/Data2/zincion/ai-infra/l40s-20261117`，所有新增文件均在服务器允许的 `/Data2/zincion/ai-infra` 内。环境、Qwen3-14B 本地模型和 BF16/FP8 KV 短请求配置已准备；最后检查为无卡模式，尚未在该机器执行 GPU 推理。
+当前 L40S 租机的任务目录为 `/root/data/zincion/ai-infra/l40s-20261117`，模型、环境、缓存、日志和临时文件均存放在实际挂载于 `/root/data` 的 150 GiB 数据盘中。旧 `/Data2/...` 任务路径仅保留兼容链接；学校内网服务器的目录限制只适用于旧机器，详见 [租机记录](server_hardware_l40s_2026-11-17.md) 与 [学校服务器记录](server_hardware_2026-11-09.md)。环境、Qwen3-14B 本地模型和 BF16/FP8 KV 短请求配置已准备；最后检查为无卡模式，尚未在该机器执行 GPU 推理。
 
 Python 3.11.16、torch 2.9.1+cu128、Triton 3.5.1、Transformers 4.57.3 已安装。模型读取检查为 8 分片、443 个 BF16 张量、29,536,614,400 字节权重。无卡单 CPU 配额下，原 CPU 专项 14 passed/7 个启动超时；只将 TP fixture 启动通信预算改为运行时默认 30 秒的补充检查为 21 passed。补充结果不替代原 5 秒用例，也不代表 GPU 验收；证据在远端 `runs/pytest-cpu*.log`、`runs/model-ready.json`。
 
 开卡后从现有环境和短请求开始，以下为**待执行命令**：
 
 ```bash
-source /Data2/zincion/ai-infra/l40s-20261117/env.sh
+source /root/data/zincion/ai-infra/l40s-20261117/env.sh
 cd "$PROJECT_ROOT/repo"
 python -c 'import torch; print(torch.__version__, torch.version.cuda); print(torch.cuda.device_count())'
 CUDA_VISIBLE_DEVICES=0 python main.py --config "$PROJECT_ROOT/configs/single-bf16.json"

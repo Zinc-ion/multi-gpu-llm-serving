@@ -52,7 +52,7 @@ CPU buffer 测试用设备执行替身验证真实 capture/replay 准备逻辑�
 
 ## 服务器验收顺序
 
-所有新文件、缓存、日志及临时配置都放在 `/Data2/zincion/ai-infra` 下；先确认获准使用的 GPU 空闲，不影响其他进程。
+本节和下文命令沿用学校内网服务器环境，该机器的新文件、缓存、日志及临时配置都放在 `/Data2/zincion/ai-infra` 下。当前 L40S 租机的目录与入口见 [租机记录](server_hardware_l40s_2026-11-17.md)，不直接套用旧路径；先确认获准使用的 GPU 空闲，不影响其他进程。
 
 1. 在保存的 M2 commit 上补齐独立 B0 验收，再运行 M3，避免用变更后的 kernel 反填 B0。
 2. 运行 GPU 回归测试，并在同一固定 prompt 集上用 `tools/compare_hf.py custom` 分别捕获 M2、M3 whole-prefill 和 M3 chunked 输出。比较 greedy token，按预先确认的阈值核对 logits，不能为了通过事后放宽。

@@ -38,7 +38,7 @@ GPU 入口使用 `tests/tp_engine_helpers.py` 创建真实 tokenizer/checkpoint�
 
 ## 目标服务器复现模板
 
-以下命令在服务器项目根目录执行，**尚未运行**。先固定经审核的候选 commit，并确认指定的两张 GPU 获准使用且空闲。所有新增文件、缓存和日志位于 `/Data2/zincion/ai-infra` 下；`M4_DATA` 每轮使用新目录。示例依赖 M2 已保存的配置及捕获文件；如果路径不同，应先定位同一模型 revision、精度和输入，不重新生成假数据。
+以下命令沿用学校内网服务器环境，在服务器项目根目录执行，**尚未运行**。先固定经审核的候选 commit，并确认指定的两张 GPU 获准使用且空闲。该旧机器的新增文件、缓存和日志位于 `/Data2/zincion/ai-infra` 下；当前 L40S 租机的目录与入口见 [租机记录](server_hardware_l40s_2026-11-17.md)。`M4_DATA` 每轮使用新目录。示例依赖 M2 已保存的配置及捕获文件；如果路径不同，应先定位同一模型 revision、精度和输入，不重新生成假数据。
 
 ```bash
 export M4_WORKSPACE=/Data2/zincion/ai-infra

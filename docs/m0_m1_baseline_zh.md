@@ -9,7 +9,7 @@
 - 原 M0/M1 阶段记录的验证环境：PyTorch `2.9.1+cu128`、Transformers `4.57.3`
 - 原 M0/M1 阶段记录的工作容器可见 1 张 CUDA GPU；五张 RTX 4090 的远端拓扑以 `server_hardware_2026-11-09.md` 为准
 - 许可证：仓库根目录 `LICENSE` 保留 Apache-2.0
-- 模型和实验数据目录：远端服务器使用 `/Data2/zincion`
+- 模型和实验数据目录：历史学校内网服务器使用 `/Data2/zincion`；当前 L40S 租机使用 `/root/data` 数据盘，见 [租机记录](server_hardware_l40s_2026-11-17.md)
 
 M0/M1 改动以最小 diff 方式叠加在上游基线之上，保留上游注释、格式和函数结构；配置、KV 生命周期修复和新增测试属于项目改造。
 

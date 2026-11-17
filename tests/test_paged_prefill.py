@@ -16,7 +16,9 @@ from myvllm.utils import reset_context
 
 
 def reference_prefill(q, k_cache, v_cache, cu_q, cu_k, tables,
-                      max_q, scale, heads, kv_heads, dim, block_size):
+                      max_q, scale, heads, kv_heads, dim, block_size,
+                      k_scale_cache=None, v_scale_cache=None, fp8_prefill_compute_dtype="float32"):
+    assert k_scale_cache is None and v_scale_cache is None, "reference_prefill only supports non-FP8 caches"
     outputs = []
     for i in range(len(cu_q) - 1):
         start, end = int(cu_q[i]), int(cu_q[i + 1])

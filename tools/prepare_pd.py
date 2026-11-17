@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import shlex
 
-from myvllm.config import resolve_dtype, resolve_kv_cache_dtype
+from myvllm.config import resolve_dtype, resolve_fp8_prefill_compute_dtype, resolve_kv_cache_dtype
 from myvllm.pd.protocol import cache_token_byte_counts
 
 
@@ -75,6 +75,8 @@ def generate(args):
         if set(seeds) & {seed ^ 0x80000000 for seed in seeds}:
             raise ValueError("base-seed produces a P/D seed collision on a load edge")
     config = json.loads(Path(args.base_config).read_text(encoding="utf-8"))
+    config["fp8_prefill_compute_dtype"] = resolve_fp8_prefill_compute_dtype(
+        config.get("fp8_prefill_compute_dtype", "float32"))
     if (config["world_size"] != 1 or config["dtype"] != "bfloat16"
             or config["model_revision"] != "40c069824f4251a91eefaf281ebe4c544efd3e18"
             or config["tokenizer_revision"] != config["model_revision"]):
@@ -192,6 +194,7 @@ def generate(args):
                                       + command(["numactl", "--cpunodebind=0", "--membind=0", *cmd]) + "\n")
     manifest = {"candidate_commit": args.candidate_commit, "candidate_tag": args.candidate_tag,
                 "topology": args.topology, "physical_gpu_pairs": topology,
+                "fp8_prefill_compute_dtype": config["fp8_prefill_compute_dtype"],
                 "model_revision": config["model_revision"], "model_path": args.model_path,
                 "numa": {"gpu_nodes": {str(gpu): 0 if gpu in (0, 1, 2) else 1
                                        for pair in topology for gpu in pair},

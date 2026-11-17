@@ -333,6 +333,7 @@ def paged_attention_prefill_kernel(
     num_heads: tl.constexpr, num_kv_heads: tl.constexpr, head_dim: tl.constexpr,
     block_size: tl.constexpr, max_num_blocks: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, FP8_CACHE: tl.constexpr,
+    FP8_PREFILL_QUERY: tl.constexpr,
 ):
     start_m, head_idx, seq_idx = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     kv_head_idx = head_idx // (num_heads // num_kv_heads)
@@ -345,7 +346,7 @@ def paged_attention_prefill_kernel(
     offs_d = tl.arange(0, head_dim)
     q_ptrs = Q + (q_start + offs_m[:, None]) * num_heads * head_dim + head_idx * head_dim + offs_d[None, :]
     q = tl.load(q_ptrs, mask=(offs_m < q_len)[:, None], other=0.0)
-    if FP8_CACHE:
+    if FP8_CACHE and not FP8_PREFILL_QUERY:
         q = q.to(tl.float32)
     acc = tl.zeros([BLOCK_M, head_dim], tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
@@ -369,6 +370,9 @@ def paged_attention_prefill_kernel(
             scale_offsets = (physical_block * block_size + offs_n % block_size) * num_kv_heads + kv_head_idx
             k_scale = tl.load(K_scale + scale_offsets, mask=valid, other=1.0)
             k = k.to(tl.float32) * k_scale[None, :]
+            if FP8_PREFILL_QUERY:
+                # vLLM f176443446f659dbab5315e056e605d8984fd976: dequantize before casting to Q dtype.
+                k = k.to(q.dtype)
         scores = tl.dot(q, k, input_precision="ieee") * scale
         scores = tl.where(valid[None, :] & (offs_n[None, :] <= positions[:, None]), scores, -1e10)
         m_new = tl.maximum(m_i, tl.max(scores, 1))
@@ -378,6 +382,8 @@ def paged_attention_prefill_kernel(
         if FP8_CACHE:
             v_scale = tl.load(V_scale + scale_offsets, mask=valid, other=1.0)
             v = v.to(tl.float32) * v_scale[:, None]
+            if FP8_PREFILL_QUERY:
+                v = v.to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision="ieee")
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_new
@@ -388,7 +394,7 @@ def paged_attention_prefill_kernel(
 def paged_attention_prefill(
     q, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k, block_tables,
     max_seqlen_q, scale, num_heads, num_kv_heads, head_dim, block_size,
-    k_scale_cache=None, v_scale_cache=None,
+    k_scale_cache=None, v_scale_cache=None, fp8_prefill_compute_dtype="float32",
 ):
     """Packed suffix queries read their entire causal prefix through block tables."""
     q = q.contiguous()
@@ -402,6 +408,7 @@ def paged_attention_prefill(
         scale, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
         block_size=block_size, max_num_blocks=block_tables.shape[1],
         BLOCK_M=tile_size, BLOCK_N=tile_size, FP8_CACHE=k_scale_cache is not None,
+        FP8_PREFILL_QUERY=k_scale_cache is not None and fp8_prefill_compute_dtype == "query",
     )
     return output
 
@@ -614,6 +621,7 @@ class Attention(nn.Module):
         self.block_size = block_size
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale_cache = self.v_scale_cache = None
+        self.fp8_prefill_compute_dtype = "float32"
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
@@ -649,6 +657,7 @@ class Attention(nn.Module):
                     q, k_cache, v_cache, cu_seqlens, context.cu_seqlens_k,
                     context.block_tables, context.max_seqlen_q, scale,
                     self.num_heads, self.num_kv_heads, self.head_dim, self.block_size, *cache_scales,
+                    fp8_prefill_compute_dtype=self.fp8_prefill_compute_dtype,
                 )
             else:
                 o = flash_attention_prefill(q, k, v, cu_seqlens, scale,

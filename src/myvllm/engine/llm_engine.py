@@ -12,6 +12,7 @@ from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.engine.scheduler import Scheduler
 from myvllm.engine.model_runner import ModelRunner
 from myvllm.engine.ipc import CommandSignal, CommandSizeError, CommandSlot, stop_workers, validate_timeout
+from myvllm.config import resolve_fp8_prefill_compute_dtype
 from myvllm.sampling_parameters import SamplingParams
 from transformers import AutoTokenizer
 
@@ -71,6 +72,8 @@ class LLMEngine:
     _worker_kill_timeout_s = 10
 
     def __init__(self, config: dict):
+        config["fp8_prefill_compute_dtype"] = resolve_fp8_prefill_compute_dtype(
+            config.get("fp8_prefill_compute_dtype", "float32"))
         validate_timeout(config.get("tp_command_timeout_s", 30), "tp_command_timeout_s")
         self.config = config
         self.request_ids = {}

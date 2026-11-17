@@ -66,6 +66,13 @@ def _validate_worker_role(info, role, *, legacy_fixed=False):
         raise ValueError(f"Incompatible {role} worker role or world size")
 
 
+def _validate_fp8_prefill_mode(info, expected):
+    if info["model"].get("kv_cache", {}).get("dtype") == "float8_e4m3fn":
+        mode = info.get("fp8_prefill_compute_dtype", "float32")
+        if mode not in ("float32", "query") or mode != expected:
+            raise ValueError("Incompatible FP8 prefill compute dtype")
+
+
 def _validate_load_worker(info, role, request_timeout, max_payload_bytes):
     _validate_worker_role(info, role)
     if info["request_timeout"] < request_timeout:
@@ -81,6 +88,7 @@ def _validate_load_worker(info, role, request_timeout, max_payload_bytes):
 def _validate_load_edge(pi, di, pipeline_min_tokens):
     if pi["model"] != di["model"] or pi["max_model_length"] != di["max_model_length"]:
         raise ValueError("Incompatible model or length on allowed edge")
+    _validate_fp8_prefill_mode(pi, di.get("fp8_prefill_compute_dtype", "float32"))
     if pi["sampling_seed"] == di["sampling_seed"]:
         raise ValueError("P/D sampling seed collision on allowed edge")
     if pipeline_min_tokens and (
@@ -228,6 +236,7 @@ class PDGateway:
             pi, di = await asyncio.gather(PDClient.info(pe), PDClient.info(de))
             for info, role in ((pi, "prefill"), (di, "decode")):
                 _validate_worker_role(info, role, legacy_fixed=True)
+                _validate_fp8_prefill_mode(info, self.config.get("fp8_prefill_compute_dtype", "float32"))
                 if (info["role"] != role or info["model"] != spec
                         or info["max_model_length"] != self.config["max_model_length"]):
                     raise ValueError(f"Incompatible {role} worker model or length")
@@ -260,6 +269,7 @@ class PDGateway:
             info = self.infos[endpoint]
             role = "prefill" if endpoint in self.p_bookings else "decode"
             _validate_load_worker(info, role, self.request_timeout, self.max_payload_bytes)
+            _validate_fp8_prefill_mode(info, self.config.get("fp8_prefill_compute_dtype", "float32"))
             if info["model"] != spec or info["max_model_length"] != self.config["max_model_length"]:
                 raise ValueError(f"Incompatible {role} worker model or length")
         for pe in self.prefills:
@@ -369,7 +379,8 @@ class PDGateway:
                     "session_id": "0" * 32, "request_id": pending.request_id,
                     "token_ids": pending.token_ids, "sampling": sampling, "decode_endpoint": de,
                 })
-                pheader = max(popen, pmeta)
+                p_response_limit = (DEFAULT_HEADER_LIMIT if "fp8_prefill_compute_dtype" in self.infos[pe]
+                                    else min(self.infos[pe]["max_header_bytes"], DEFAULT_HEADER_LIMIT))
                 can_transfer = (pbytes + transfer_bytes <= self.infos[pe]["max_transfer_bytes"]
                                 and dbytes + transfer_bytes <= self.infos[de]["max_transfer_bytes"]
                                 and transfer_bytes <= self.infos[pe].get("max_payload_bytes",
@@ -379,7 +390,8 @@ class PDGateway:
                                 and transfer_bytes <= self.max_payload_bytes
                                 and pconnections + 1 <= self.infos[pe]["max_connections"]
                                 and pcapacity
-                                and pheader <= min(self.infos[pe]["max_header_bytes"], DEFAULT_HEADER_LIMIT)
+                                and popen <= min(self.infos[pe]["max_header_bytes"], DEFAULT_HEADER_LIMIT)
+                                and pmeta <= p_response_limit
                                 and dmeta <= min(self.infos[de]["max_header_bytes"], DEFAULT_HEADER_LIMIT))
                 decodes.append((de, dstats, dtime, dscore, can_transfer, dconnections, dbytes))
             if decodes:

@@ -21,7 +21,11 @@ FP8 模式下，`ModelRunner.kv_cache` 的 dtype 为 `torch.float8_e4m3fn`，布
 
 FP32 转 E4M3FN 时，先将向零舍入的 FP16 中间值按被丢弃的 FP32 位设为奇数，再执行 FP8 最近偶数舍入，避免 SM89 上两次舍入导致的边界错误。`amax` 归约与 clamp 显式传播 NaN；含 NaN 的 head 得到 NaN scale，含 Inf 而无 NaN 的 head 得到 Inf scale，其数据遵循相同的除法和转换规则。
 
-Triton store 将对应 token/head 的数据及 scale 直接写入池；除法保留 FP32 subnormal。运行时 whole/chunked paged prefill 和 decode 均按 block table 读取 FP8 数据及相同物理位置的 scale，按需反量化。FP8 prefill 在 FP32 中做反量化及 attention 中间计算，decode 同样使用 FP32 中间值；输出仍使用 query 的 dtype。cache 分配前的模型 warmup 沿用原有的无 cache prefill 路径。不存在逐步整池反量化或整池复制。
+Triton store 将对应 token/head 的数据及 scale 直接写入池；除法保留 FP32 subnormal。运行时 whole/chunked paged prefill 和 decode 均按 block table 读取 FP8 数据及相同物理位置的 scale，按需反量化。FP8 prefill 默认在 FP32 中做反量化及 attention 中间计算；独立 decode kernel 使用 FP32 中间值，输出仍使用 query 的 dtype。cache 分配前的模型 warmup 沿用原有的无 cache prefill 路径。不存在逐步整池反量化或整池复制。
+
+可选配置 `fp8_prefill_compute_dtype` 只接受 `float32`（省略时的原路径）和 `query`。`query` 保留 Q 的 dtype；K/V 仍用原 token/head scale 在 FP32 反量化，再转成 Q dtype，softmax 和累加器使用 FP32，概率在与 V 相乘前转为 V dtype。这是有不同舍入的实验路径，不保证与 `float32` 结果一致；例如反量化值超出 FP16 范围时，转换可能产生 Inf 并进一步产生 NaN。该选项作用于整个 paged prefill batch，包含与 prefill 混排的 decode 行；独立 decode kernel 的计算未改变。单 token prompt 尾 chunk 若单独调度为 decode 则走独立 decode kernel，若与其他 prefill 混排则走 paged prefill。普通非 FP8 cache、量化与 data/scale 传输格式不变。同一 K/V 输入的存储字节不变，但完整模型后续层可能因前层舍入差异产生不同输入及 cache 内容，也可能改变 argmax 和输出质量。配置在 engine 入口校验，并在初始化时传给各 Attention 层。
+
+此机制借鉴 Apache-2.0 许可的 vLLM v0.15.0，commit `f176443446f659dbab5315e056e605d8984fd976`，`vllm/v1/attention/ops/triton_unified_attention.py` 的 FP8 K/V 反量化后转换 Q dtype 路径（源码 SHA256 `0dde242db3cd2bb4559b95d977cd169c8c704d15737bbd553919a2335f65f87a`）。本项目保留自己的 token/head scale 和缓存布局，不使用该源码的 layer scale。
 
 CUDA Graph 捕获和重放复用相同的 data/scale 池地址。slot 为 `-1` 的 padding 不写 cache，长度为零的 decode padding 不读取有效 KV；真实 batch 的 block 分配、释放和重用仍由原有 Scheduler 管理。
 
@@ -51,13 +55,15 @@ PYTHONPATH="$PWD/src" uv run --no-sync python tools/capacity_report.py \
 
 ## FP8 PD 交接
 
-M5 整块交接与 M6 逐层交接均可传输 FP8 KV；P、D 仍使用各自的 TP=1 引擎和物理 block table，经主存和 TCP 传递原始 data 与对应 scale，D 不重算 prompt 或重新量化。启动网关时核对模型与 cache 格式；D 在预留前核对版本、模型、字节序、形状和字节数。不匹配会被拒绝。
+M5 整块交接与 M6 逐层交接均可传输 FP8 KV；P、D 仍使用各自的 TP=1 引擎和物理 block table，经主存和 TCP 传递原始 data 与对应 scale，D 不重算 prompt 或重新量化。启动网关时核对模型、cache 格式和 FP8 prefill 计算模式；D 在整块和早期预留前核对版本、模型及计算模式、字节序、形状和字节数。不匹配会被拒绝。worker info 缺少模式字段时按旧版 `float32` 解释；同一 FP8 部署中 P、D 和本地 prefill 使用同一模式。
 
 `auto` 的 model spec 和整块版本 2、早期版本 3 保持原格式。FP8 的 model spec 另有：
 
 ```json
 {"kv_cache": {"dtype": "float8_e4m3fn", "scale_dtype": "float32", "scale_granularity": "token_head"}}
 ```
+
+上述形状用于默认 `float32`，与旧版相同；`query` 在 `kv_cache` 中额外包含 `"fp8_prefill_compute_dtype": "query"`。这是参与模型身份匹配的计算策略标记，不改变 cache 存储布局、data 或 scale 字节。缺少该标记表示原 `float32` 策略；旧版的严格模型匹配也会拒绝带 `query` 标记的 metadata。
 
 FP8 整块 metadata 为版本 4，早期 metadata 为版本 5，逐层完成后的 `commit_early` 校验对应版本 4。`kv` 的 `shape` 为 `[2, layers, blocks, block_size, local_kv_heads, head_dim]`，`scale_shape` 为去掉最后一维的形状；`dtype`、`scale_dtype`、`byte_order`、`data_nbytes`、`scale_nbytes` 和总 `nbytes` 均参与校验。每个 payload 先按 C 顺序放置所有 FP8 data 字节，再按 C 顺序放置所有原生字节序 FP32 scale 字节。两段紧邻，没有额外 wire padding；即使 `head_dim` 为奇数，也通过 uint8 字节视图复制 scale，不依赖未对齐的 FP32 主存视图。
 
@@ -96,6 +102,49 @@ CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH="$PWD/src"
 ```
 
 FP8 相对于 BF16 的任务质量、显存与吞吐/延迟变化，以及目标 4090、14B 和长上下文表现均待后续固定工作负载和质量门槛后实测。
+
+`query` 的独立算子参考、配置及 P/D 边界测试位于 `tests/test_fp8_prefill_compute.py`。CPU Triton interpreter 覆盖 FP32/FP16 query 和 BF16 的原 `float32` 路径；Triton 3.5.1 interpreter 的 BF16 `tl.dot` 结果异常，不能据此验收 BF16 query。SM89 离线编译只验证代码生成。下面的真实 GPU 测试须由主 agent 安排设备，并设置 `PROFILE_PYTHON` 为 serving 环境的 Python 绝对路径；测试包含算子、tiny whole/chunked、eager/graph 及 bulk/pipeline/local 路径，不代替 14B 或目标服务器验收：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 RUN_FP8_PREFILL_GPU=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  PYTHONPATH="$PWD/src:$PWD/tests:$PWD" \
+  "$PROFILE_PYTHON" -m pytest -q -s -p no:cacheprovider tests/test_fp8_prefill_compute.py
+```
+
+以下是同一 4K 输入和 chunk 1024 的单卡探索性 profile：`PROFILE_BASE` 为本地 14B 配置，`PROFILE_PROMPTS` 为 `compare_hf.py prepare` 物化的含 `tokens-4096` case 的 manifest，`PROFILE_DIR` 是服务器工作目录下尚不存在的目录。两个 case 的 token ID 完全相同，第一个预热实际 paged prefill，第二个供记录；每种模式单独启动一次，原始配置、step timing、结果和 Nsight trace 分开保存。运行前需核对模型路径、设备、空间与源码候选，并由主 agent 排程；完整 forward 事件不等于单一 attention kernel 时间。
+
+```bash
+export PROFILE_BASE PROFILE_PROMPTS PROFILE_DIR PROFILE_PYTHON
+mkdir "$PROFILE_DIR"
+mkdir -p "$PROFILE_DIR/tmp"
+export TMPDIR="$PROFILE_DIR/tmp" XDG_CACHE_HOME="$PROFILE_DIR/cache/xdg" XDG_CONFIG_HOME="$PROFILE_DIR/cache/config"
+export HF_HOME="$PROFILE_DIR/cache/huggingface" HF_HUB_CACHE="$PROFILE_DIR/cache/hf-hub"
+export TRITON_CACHE_DIR="$PROFILE_DIR/cache/triton" TORCHINDUCTOR_CACHE_DIR="$PROFILE_DIR/cache/torchinductor"
+export CUDA_CACHE_PATH="$PROFILE_DIR/cache/cuda" PYTHONPYCACHEPREFIX="$PROFILE_DIR/cache/pycache"
+"$PROFILE_PYTHON" - <<'PY'
+import json, os
+from pathlib import Path
+out = Path(os.environ["PROFILE_DIR"])
+base = json.loads(Path(os.environ["PROFILE_BASE"]).read_text())
+prompts = json.loads(Path(os.environ["PROFILE_PROMPTS"]).read_text())
+case = next(c for c in prompts["cases"] if c["name"] == "tokens-4096")
+assert len(case["input_ids"]) == 4096
+prompts["cases"] = [{**case, "name": name} for name in ("warm-4k", "profile-4k")]
+(out / "prompts.json").write_text(json.dumps(prompts, ensure_ascii=False, indent=2) + "\n")
+for mode in ("float32", "query"):
+    config = {**base, "kv_cache_dtype": "float8_e4m3fn", "fp8_prefill_compute_dtype": mode,
+              "enable_chunked_prefill": True, "max_num_batched_tokens": 1024,
+              "timing_path": str(out / f"{mode}.timing.jsonl")}
+    (out / f"{mode}.json").write_text(json.dumps(config, indent=2) + "\n")
+PY
+for mode in float32 query; do
+  CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH="$PWD/src" \
+    nsys profile --trace=cuda,nvtx,osrt --force-overwrite=false -o "$PROFILE_DIR/$mode" \
+    "$PROFILE_PYTHON" tools/compare_hf.py custom --config "$PROFILE_DIR/$mode.json" \
+    --prompts "$PROFILE_DIR/prompts.json" --max-tokens 1 --output "$PROFILE_DIR/$mode.pt" \
+    >"$PROFILE_DIR/$mode.log" 2>&1
+done
+```
 
 ## FP8 任务质量准备与比较
 

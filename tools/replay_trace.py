@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -462,11 +463,14 @@ async def replay_rows(manifest, rows, directory, session, endpoints, model, igno
     counts = {"success": 0, "failed": 0, "not_executed": 0}
     stop_reason = skip_reason
     batch_expired = False
+    all_dispatched = True
 
     with results_path.open("wb") as results:
         written = set()
 
         def write_result(result):
+            nonlocal all_dispatched
+            all_dispatched = all_dispatched and result["dispatch_offset_s"] is not None
             written.add(result["ordinal"])
             counts[result["status"]] += 1
             results.write(json_bytes(result))
@@ -482,13 +486,14 @@ async def replay_rows(manifest, rows, directory, session, endpoints, model, igno
                 "http_status": None, "finish_reason": None, "usage": None, "done": False,
                 "response_id": None, "raw_path": None, "error_class": None, "error": None,
                 "raw_bytes": 0, "received_body_bytes": 0, "raw_truncated": False, "content_encoding": None,
+                "raw_sha256": None, "content_type": None,
             }
 
         async def request(row):
             nonlocal batch_expired
             result = initial(row)
             raw_path = raw_dir / f"{row['ordinal']:08d}.sse"
-            result["raw_path"] = str(raw_path.relative_to(directory))
+            raw_hash = hashlib.sha256()
             parser = SSEDecoder()
             stream = CompletionStream(row["prompt_tokens"], row["output_tokens"], model)
             body = {"model": model, "prompt": row["prompt"], "max_tokens": row["output_tokens"],
@@ -497,6 +502,7 @@ async def replay_rows(manifest, rows, directory, session, endpoints, model, igno
             try:
                 with raw_path.open("wb") as raw:
                     dispatch = time.monotonic()
+                    result["raw_path"] = str(raw_path.relative_to(directory))
                     result["dispatch_offset_s"] = dispatch - start
                     result["queue_delay_s"] = result["dispatch_offset_s"] - row["offset_s"]
                     async with asyncio.timeout_at(min(batch_deadline, dispatch + request_timeout)):
@@ -508,6 +514,7 @@ async def replay_rows(manifest, rows, directory, session, endpoints, model, igno
                             result["http_status"] = response.status
                             encoding = ",".join(response.headers.getall("Content-Encoding", ["identity"])).strip().lower()
                             result["content_encoding"] = encoding
+                            result["content_type"] = response.content_type
                             is_sse = response.content_type == "text/event-stream"
                             parse_sse = response.status == 200 and is_sse and encoding == "identity"
                             while True:
@@ -522,6 +529,7 @@ async def replay_rows(manifest, rows, directory, session, endpoints, model, igno
                                 prefix = chunk[:remaining]
                                 raw.write(prefix)
                                 raw.flush()
+                                raw_hash.update(prefix)
                                 result["raw_bytes"] += len(prefix)
                                 result["raw_truncated"] = len(prefix) < len(chunk)
                                 if parse_sse:
@@ -553,6 +561,8 @@ async def replay_rows(manifest, rows, directory, session, endpoints, model, igno
                 result.update(status="failed", error_class=type(exc).__name__, error=str(exc))
                 raise
             finally:
+                if result["dispatch_offset_s"] is not None:
+                    result["raw_sha256"] = raw_hash.hexdigest()
                 result.update(choice_times_s=stream.choice_times, finish_offset_s=stream.finish_time_s,
                               finish_reason=stream.finish_reason, usage=stream.usage, done=stream.done,
                               response_id=stream.identity, completed_offset_s=time.monotonic() - start)
@@ -605,7 +615,7 @@ async def replay_rows(manifest, rows, directory, session, endpoints, model, igno
     return {"plan_sha256": manifest["plan_sha256"], "results_path": str(results_path),
             "results_sha256": file_sha256(results_path), "counts": counts,
             "start_monotonic": start, "end_offset_s": time.monotonic() - start,
-            "stop_reason": stop_reason}
+            "stop_reason": stop_reason}, all_dispatched
 
 
 async def replay(args):
@@ -677,20 +687,20 @@ async def replay(args):
     connector = aiohttp.TCPConnector(limit=args.concurrency, limit_per_host=args.concurrency)
     async with aiohttp.ClientSession(connector=connector, trust_env=False) as session:
         if warm_manifest:
-            warm = await replay_rows(warm_manifest, warm_rows, output / "warmup", session, args.endpoint,
-                                     args.model, args.ignore_eos == "true", args.concurrency,
-                                     args.request_timeout_s, deadline, args.max_raw_bytes, contract)
+            warm, _ = await replay_rows(warm_manifest, warm_rows, output / "warmup", session, args.endpoint,
+                                        args.model, args.ignore_eos == "true", args.concurrency,
+                                        args.request_timeout_s, deadline, args.max_raw_bytes, contract)
             metadata["warmup"] = warm
             run_metadata(output / "run.json", metadata)
         else:
             warm = None
         skip_reason = "warmup_failed" if warm and (
             warm["counts"]["failed"] or warm["counts"]["not_executed"] or warm["stop_reason"]) else None
-        result = await replay_rows(manifest, rows, output / "formal", session, args.endpoint,
-                                   args.model, args.ignore_eos == "true", args.concurrency,
-                                   args.request_timeout_s, deadline, args.max_raw_bytes, contract, skip_reason)
+        result, all_dispatched = await replay_rows(manifest, rows, output / "formal", session, args.endpoint,
+                                                   args.model, args.ignore_eos == "true", args.concurrency,
+                                                   args.request_timeout_s, deadline, args.max_raw_bytes, contract, skip_reason)
     metadata["formal"] = result
-    metadata["state"] = ("complete" if not result["counts"]["not_executed"]
+    metadata["state"] = ("complete" if all_dispatched and not result["counts"]["not_executed"]
                          and not (warm and (warm["counts"]["failed"] or warm["counts"]["not_executed"]))
                          and result["stop_reason"] is None else "incomplete")
     metadata["elapsed_s"] = time.monotonic() - batch_start

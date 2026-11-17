@@ -8,6 +8,8 @@
 </p>
 
 # miniVLLM
+本仓库在上游基础上开发 Qwen3-14B 的 TP2、bulk Prefill/Decode 分离和 FP8 KV 原型。当前功能状态、L40S 正确性与性能数据见 [实测报告](docs/l40s_acceptance_2026-11-18_zh.md)，架构与支持范围见 [项目说明](docs/inference_optimization_overview_zh.md)，简历和讲解材料见 [面试材料](docs/project_interview_zh.md)。原 TP2 BF16 greedy 分歧已在原 tiny 用例及六组 14B 输入上修复；四卡 TP2＋PD 组合仍有一个固定输入的输出分歧，通用 logits 误差门槛仍待建立。FP8 仅量化 KV，权重和 activation 保持 BF16。
+
 自定义实现的vLLM推理引擎，基于Nano-vLLM。添加了注意力机制的基准测试，以及Pageattention、FlashAttention的代码实现。
 
 提供了预填充阶段的FlashAttention以及解码阶段的Pageattention的基准测试。

@@ -67,7 +67,7 @@ uv run python -m myvllm.server \
   --host 127.0.0.1 --port 8000
 ```
 
-只支持 `world_size == 1`。只有一个推理线程创建和调用 ModelRunner、Scheduler；HTTP 层在线程池中应用 chat template 并分词，再通过线程安全队列提交 token IDs、采样参数、取消及关闭命令，通过事件循环的线程安全回调接收 token。空闲时阻塞等待命令。这样避免多个推理调用同时改写模块级 `utils/context.py`，也避免在 model step 之间执行长输入分词。线程池与推理线程仍共享 CPU/GIL，真实负载中的剩余影响需实测。
+M2 阶段只支持 `world_size == 1`；2026-11-18 已开放并实测 TP2，见 [当前报告](l40s_acceptance_2026-11-18_zh.md)。只有一个推理线程创建和调用 ModelRunner、Scheduler；HTTP 层在线程池中应用 chat template 并分词，再通过线程安全队列提交 token IDs、采样参数、取消及关闭命令，通过事件循环的线程安全回调接收 token。空闲时阻塞等待命令。这样避免多个推理调用同时改写模块级 `utils/context.py`，也避免在 model step 之间执行长输入分词。线程池与推理线程仍共享 CPU/GIL，真实负载中的剩余影响需实测。
 
 接口为 `POST /v1/completions` 和 `POST /v1/chat/completions`，支持 SSE 和普通 JSON 响应。普通 JSON chat 是为 EvalScope 1.5.1 的 OpenAI 适配器提供的：该 tag 的 `evalscope/api/model/generate_config.py::GenerateConfig.stream` 默认为 `None`，`evalscope/models/openai_compatible.py::OpenAICompatibleAPI.generate` 调用 `client.chat.completions.create`；这属于源码及 SDK 契约核对，未安装 EvalScope 或执行其数据集评测。没有实现 `/v1/models`，bench 必须显式传 `--model`。
 

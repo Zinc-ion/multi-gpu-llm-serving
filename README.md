@@ -9,6 +9,14 @@
 
 # miniVLLM
 
+This fork develops Qwen3-14B TP2 execution, bulk prefill/decode disaggregation,
+and FP8 KV storage. See the [L40S measurements](docs/l40s_acceptance_2026-11-18_zh.md)
+and [support matrix](docs/inference_optimization_overview_zh.md) for tested scope.
+The original BF16 TP2 greedy mismatch is fixed for the original tiny test and
+six Qwen3-14B inputs; the four-GPU TP2+PD combination still diverges on one fixed
+input, and a general logits error gate remains pending. FP8 applies
+to KV, with BF16 weights and activations.
+
 A custom implementation of vLLM inference engine with attention mechanism benchmarks, based on Nano-vLLM but with self-contained paged attention and flash attention implementation. 
 
 Benchmarking on flash attention in prefilling time and paged attention in decoding time are provided.

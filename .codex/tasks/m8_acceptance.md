@@ -16,7 +16,7 @@
 
 ## 2. 正确性和交接
 
-- 原 tiny TP2 BF16 `[32,33,62]` 对 HF/TP1 `[32,33,41]` 仍是已知失败；复现并定位，保留原输入、seed、dtype 和判定。旧 tiny logits 容差不是 14B 门槛；数值近似与 greedy 分歧分别记录。
+- 原 tiny TP2 BF16 `[32,33,62]` 对 HF/TP1 `[32,33,41]` 是修复前失败；2026-11-18 以 Row 部分积精度修复后原 GPU FP32/BF16 两项通过，14B 六组 greedy 与同前缀 top1 一致，见 [实测报告](../../docs/l40s_acceptance_2026-11-18_zh.md)。保留原输入、seed、dtype、容差与失败记录，不能将旧 tiny 容差当作 14B 门槛，或将少量输出一致称为所有 logits 等价。
 - 目标模型 BF16 TP2 对可信 TP1，用相同输入和采样，记录最大/平均 logits 误差、同前缀 top1、首个 token 分歧及 top1/top2 margin。不能用换 seed 或不断放宽容差掩盖异常。可信框架只需用于必要正确性参考。
 - PD 覆盖有效 KV 长度、分页边界/尾块、请求映射、独立 D block table、接管位置、少量并发交错、EOS/输出上限、完成与取消回收。P 生成首 token；prompt 长 N 时交接 `[0,N)`，D 在位置 N 处理首 token 并生成第二个；首 token 即结束时不做交接。无重复/遗漏 token，不用 D 重算 prompt 冒充恢复。
 - 同格式 P→D 比较有效 KV；FP8 同时核对原始 data 和 scale 字节，尾块按有效/填充契约处理。若验证 TP2 P bulk，另核对全局 KV head 汇总顺序；TP>1 D、TP2 pipeline 当前入口拒绝，不写成支持。
@@ -33,7 +33,7 @@
 每行必记：
 
 - 请求数、成功数、失败数及原因，预热数量、实际输入/输出 token、并发、GPU 数和部署方式。
-- 平均 TTFT、平均逐请求 TPOT；说明成功且可计时样本数量。单 token TPOT 为不适用，不把 chunk ITL 当成逐 token 间隔。
+- TTFT、逐请求 TPOT 的 mean、p50、p95、p99；说明成功且可计时样本数量与分位数插值方法。单 token TPOT 为不适用，不把 chunk ITL 当成逐 token 间隔。优先从已有逐请求数据补统计，最终有效配置适当增加样本，不另建大型测试工程。
 - 成功请求输出 token 总数/正式墙钟时长；成功请求输入＋输出 token 总数/相同墙钟时长。说明批次起止、完成尾巴，排除预热。
 - 权重字节、KV data＋scale/实际池、总运行显存；注明 PyTorch allocated/reserved/peak 或 nvidia-smi 设备采样与间隔，多进程/卡的汇总方法。预分配容量不等于实际用量，KV 节省不等于总显存减半或加速。
 - PD 必要时记客户端首二 token 间隔和内部 export/restore/handoff 口径；跨进程绝对时钟不直接相减。

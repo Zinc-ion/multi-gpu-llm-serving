@@ -1,0 +1,1780 @@
+[
+  {
+    "label": "bf16-four-pd-c1",
+    "concurrency": 1,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 501.74817349761724,
+    "mean_tpot_ms": 107.66797966697789,
+    "tpot_samples": 8,
+    "wall_seconds": 113.41256786510348,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 9.028981701727961,
+    "input_plus_output_tokens_per_s": 297.95639615702277,
+    "gpu_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "source": "bf16-four-pd-c1.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 501.74817349761724,
+      "p50": 500.722860917449,
+      "p95": 513.1060747429729,
+      "p99": 516.771578155458
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 107.66797966697789,
+      "p50": 107.89234031314456,
+      "p95": 109.13449934148414,
+      "p99": 109.23686937553677
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "506bf52681c5-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "506bf52681c5-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "506bf52681c5-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "506bf52681c5-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "506bf52681c5-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "506bf52681c5-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "506bf52681c5-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "506bf52681c5-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 6844.250419177115,
+      "p50": 6827.09321193397,
+      "p95": 7155.946693383157,
+      "p99": 7163.24105989188
+    },
+    "mean_first_two_sse_choice_gap_ms": 6844.250419177115,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 17985,
+      "1": 17969,
+      "2": 32755,
+      "3": 32755
+    },
+    "simultaneous_selected_devices_max_mib": 101464,
+    "memory_samples": 487,
+    "memory_sample_mean_interval_s": 0.2930933634133496,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "strict greedy check failed; diagnostic timing only"
+  },
+  {
+    "label": "bf16-four-pd-c4",
+    "concurrency": 4,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 2093.0967829190195,
+    "mean_tpot_ms": 165.4394920878699,
+    "tpot_samples": 8,
+    "wall_seconds": 49.734754387289286,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 20.58922402684477,
+    "input_plus_output_tokens_per_s": 679.4443928858775,
+    "gpu_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "source": "bf16-four-pd-c4.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 2093.0967829190195,
+      "p50": 771.8675564974546,
+      "p95": 7288.553021289411,
+      "p99": 9490.776978321372
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 165.4394920878699,
+      "p50": 156.9064422327233,
+      "p95": 206.371252106752,
+      "p99": 212.05277283301973
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "dcf00c7c0150-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "dcf00c7c0150-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "dcf00c7c0150-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "dcf00c7c0150-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "dcf00c7c0150-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "dcf00c7c0150-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "dcf00c7c0150-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "dcf00c7c0150-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 11183.61483933404,
+      "p50": 10400.032320991158,
+      "p95": 14849.217052571476,
+      "p99": 14956.33792784065
+    },
+    "mean_first_two_sse_choice_gap_ms": 11183.61483933404,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 17985,
+      "1": 17969,
+      "2": 32755,
+      "3": 32755
+    },
+    "simultaneous_selected_devices_max_mib": 101464,
+    "memory_samples": 263,
+    "memory_sample_mean_interval_s": 0.2941957334667899,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "strict greedy check failed; diagnostic timing only"
+  },
+  {
+    "label": "bf16-four-pd-fixed-c1",
+    "concurrency": 1,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 667.1674628742039,
+    "mean_tpot_ms": 111.20655688669856,
+    "tpot_samples": 8,
+    "wall_seconds": 118.33193201199174,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 8.653623604288216,
+    "input_plus_output_tokens_per_s": 285.5695789415111,
+    "gpu_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "source": "bf16-four-pd-fixed-c1.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 667.1674628742039,
+      "p50": 667.5506103783846,
+      "p95": 670.6266677007079,
+      "p99": 671.4197422191501
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 111.20655688669855,
+      "p50": 107.42144926091817,
+      "p95": 125.22729531106518,
+      "p99": 130.35460047189176
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "46be39089aa9-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "46be39089aa9-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "46be39089aa9-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "46be39089aa9-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "46be39089aa9-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "46be39089aa9-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "46be39089aa9-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "46be39089aa9-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 7310.815097764134,
+      "p50": 6861.802918836474,
+      "p95": 8949.287171661854,
+      "p99": 9542.803793251514
+    },
+    "mean_first_two_sse_choice_gap_ms": 7310.815097764134,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 17957,
+      "1": 17941,
+      "2": 32755,
+      "3": 32755
+    },
+    "simultaneous_selected_devices_max_mib": 101408,
+    "memory_samples": 522,
+    "memory_sample_mean_interval_s": 0.28891966614207243,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "strict greedy check failed; diagnostic timing only"
+  },
+  {
+    "label": "bf16-four-pd-fixed-c4",
+    "concurrency": 4,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 2562.329047359526,
+    "mean_tpot_ms": 160.8002324089936,
+    "tpot_samples": 8,
+    "wall_seconds": 49.67958838492632,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 20.612087041983223,
+    "input_plus_output_tokens_per_s": 680.1988723854463,
+    "gpu_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "source": "bf16-four-pd-fixed-c4.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 2562.329047359526,
+      "p50": 1623.263007029891,
+      "p95": 7647.226620279255,
+      "p99": 9676.606098525224
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 160.8002324089936,
+      "p50": 153.899161438421,
+      "p95": 196.82517753635335,
+      "p99": 207.2333411678789
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "9e9032fc2584-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "9e9032fc2584-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "9e9032fc2584-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "9e9032fc2584-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "9e9032fc2584-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "9e9032fc2584-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "9e9032fc2584-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "9e9032fc2584-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 10795.58321274817,
+      "p50": 10332.768008112907,
+      "p95": 14348.173019476235,
+      "p99": 14494.058101810515
+    },
+    "mean_first_two_sse_choice_gap_ms": 10795.58321274817,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 17957,
+      "1": 17941,
+      "2": 32755,
+      "3": 32755
+    },
+    "simultaneous_selected_devices_max_mib": 101408,
+    "memory_samples": 272,
+    "memory_sample_mean_interval_s": 0.2883985915059753,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "strict greedy check failed; diagnostic timing only"
+  },
+  {
+    "label": "bf16-pd-c1",
+    "concurrency": 1,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 660.4667529463768,
+    "mean_tpot_ms": 112.49967739279346,
+    "tpot_samples": 8,
+    "wall_seconds": 119.59285325556993,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 8.562384558312292,
+    "input_plus_output_tokens_per_s": 282.55869042430567,
+    "gpu_ids": [
+      0,
+      1
+    ],
+    "source": "bf16-pd-c1.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 660.4667529463768,
+      "p50": 660.8475241810083,
+      "p95": 667.965754121542,
+      "p99": 669.624495357275
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 112.49967739279346,
+      "p50": 113.34180812842733,
+      "p95": 119.54863651354951,
+      "p99": 121.07780561731087
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "6b6178d1efed-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "6b6178d1efed-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "6b6178d1efed-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "6b6178d1efed-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "6b6178d1efed-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "6b6178d1efed-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "6b6178d1efed-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "6b6178d1efed-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 7416.774383280426,
+      "p50": 7221.135130152106,
+      "p95": 8356.655354239047,
+      "p99": 8528.084303922951
+    },
+    "mean_first_two_sse_choice_gap_ms": 7416.774383280426,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 33555,
+      "1": 32755
+    },
+    "simultaneous_selected_devices_max_mib": 66310,
+    "memory_samples": 512,
+    "memory_sample_mean_interval_s": 0.2907475569666365,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "limited fixed-input checks; not a full quality evaluation"
+  },
+  {
+    "label": "bf16-pd-c4",
+    "concurrency": 4,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 2502.2714878432453,
+    "mean_tpot_ms": 209.53800729072586,
+    "tpot_samples": 8,
+    "wall_seconds": 58.969177681952715,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 17.365003892760594,
+    "input_plus_output_tokens_per_s": 573.0451284610996,
+    "gpu_ids": [
+      0,
+      1
+    ],
+    "source": "bf16-pd-c4.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 2502.2714878432453,
+      "p50": 1626.9062999635935,
+      "p95": 7359.443292953077,
+      "p99": 9539.724549837409
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 209.5380072907259,
+      "p50": 208.92336501145928,
+      "p95": 239.57090698270582,
+      "p99": 240.93395064929575
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "0a3f68dfb5c4-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "0a3f68dfb5c4-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "0a3f68dfb5c4-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "0a3f68dfb5c4-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "0a3f68dfb5c4-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "0a3f68dfb5c4-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "0a3f68dfb5c4-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "0a3f68dfb5c4-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 14806.145710870624,
+      "p50": 14650.172414258122,
+      "p95": 20622.615144215524,
+      "p99": 22020.63313435763
+    },
+    "mean_first_two_sse_choice_gap_ms": 14806.145710870624,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 33555,
+      "1": 32755
+    },
+    "simultaneous_selected_devices_max_mib": 66310,
+    "memory_samples": 303,
+    "memory_sample_mean_interval_s": 0.29289086932772834,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "limited fixed-input checks; not a full quality evaluation"
+  },
+  {
+    "label": "bf16-tp1-c1",
+    "concurrency": 1,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 647.445292212069,
+    "mean_tpot_ms": 48.59395305017435,
+    "tpot_samples": 8,
+    "wall_seconds": 54.56082656979561,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 18.76804411476562,
+    "input_plus_output_tokens_per_s": 619.3454557872653,
+    "gpu_ids": [
+      0
+    ],
+    "source": "bf16-tp1-c1.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 647.445292212069,
+      "p50": 648.4101731330156,
+      "p95": 652.2569425404072,
+      "p99": 652.6386810839176
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 48.59395305017435,
+      "p50": 48.55806037314295,
+      "p95": 48.80554146448693,
+      "p99": 48.813381567304056
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "b83facab3063-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "b83facab3063-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "b83facab3063-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "b83facab3063-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "b83facab3063-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "b83facab3063-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "b83facab3063-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "b83facab3063-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 49.99986058101058,
+      "p50": 49.91565831005573,
+      "p95": 51.04680862277746,
+      "p99": 51.52174334973097
+    },
+    "mean_first_two_sse_choice_gap_ms": 49.99986058101058,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 33535
+    },
+    "simultaneous_selected_devices_max_mib": 33535,
+    "memory_samples": 249,
+    "memory_sample_mean_interval_s": 0.28196771989666647,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "limited fixed-input checks; not a full quality evaluation"
+  },
+  {
+    "label": "bf16-tp1-c4",
+    "concurrency": 4,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 1628.2969820313156,
+    "mean_tpot_ms": 67.04142723071176,
+    "tpot_samples": 8,
+    "wall_seconds": 20.28974397480488,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 50.46884777213398,
+    "input_plus_output_tokens_per_s": 1665.4719764804213,
+    "gpu_ids": [
+      0
+    ],
+    "source": "bf16-tp1-c4.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 1628.2969820313156,
+      "p50": 1629.0473360568285,
+      "p95": 2599.885938875377,
+      "p99": 2604.9224015697837
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 67.04142723071176,
+      "p50": 67.07878715879335,
+      "p95": 79.45794506570486,
+      "p99": 80.87856838787636
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "3e2398b3d5f4-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "3e2398b3d5f4-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "3e2398b3d5f4-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "3e2398b3d5f4-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "3e2398b3d5f4-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "3e2398b3d5f4-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "3e2398b3d5f4-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "3e2398b3d5f4-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 1852.4808124639094,
+      "p50": 1856.7434959113598,
+      "p95": 3416.9665621593595,
+      "p99": 3597.995806671679
+    },
+    "mean_first_two_sse_choice_gap_ms": 1852.4808124639094,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 33535
+    },
+    "simultaneous_selected_devices_max_mib": 33535,
+    "memory_samples": 120,
+    "memory_sample_mean_interval_s": 0.28421119634969894,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "limited fixed-input checks; not a full quality evaluation"
+  },
+  {
+    "label": "bf16-tp1-final32-c4",
+    "concurrency": 4,
+    "requests": 32,
+    "successful": 32,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 1617.2725528012961,
+    "mean_tpot_ms": 61.2845301323783,
+    "tpot_samples": 32,
+    "wall_seconds": 75.21285519003868,
+    "successful_input_tokens": 131072,
+    "successful_output_tokens": 4096,
+    "output_tokens_per_s": 54.45877555971949,
+    "input_plus_output_tokens_per_s": 1797.1395934707432,
+    "gpu_ids": [
+      0
+    ],
+    "source": "bf16-tp1-final32-c4.json",
+    "ttft_ms": {
+      "samples": 32,
+      "mean": 1617.2725528012961,
+      "p50": 1610.9933704137802,
+      "p95": 2595.5772444605827,
+      "p99": 2601.1514199897647
+    },
+    "tpot_ms": {
+      "samples": 32,
+      "mean": 61.28453013237829,
+      "p50": 61.82149190485008,
+      "p95": 68.83952630551781,
+      "p99": 69.81943598031764
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "608fb5494c2b-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-8",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-9",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-10",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-11",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-12",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-13",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-14",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-15",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-16",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-17",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-18",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-19",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-20",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-21",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-22",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-23",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-24",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-25",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-26",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-27",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-28",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-29",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-30",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "608fb5494c2b-31",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 32,
+      "mean": 1040.6915314961225,
+      "p50": 1095.5574791878462,
+      "p95": 2001.4054741710424,
+      "p99": 2103.036790601909
+    },
+    "mean_first_two_sse_choice_gap_ms": 1040.6915314961225,
+    "first_two_gap_samples": 32,
+    "device_memory_sampled_max_mib": {
+      "0": 33535
+    },
+    "simultaneous_selected_devices_max_mib": 33535,
+    "memory_samples": 324,
+    "memory_sample_mean_interval_s": 0.2803129431425418,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "limited fixed-input checks; not a full quality evaluation"
+  },
+  {
+    "label": "bf16-tp2-final32-c4",
+    "concurrency": 4,
+    "requests": 32,
+    "successful": 32,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 1573.4214797848836,
+    "mean_tpot_ms": 72.45042792972411,
+    "tpot_samples": 32,
+    "wall_seconds": 86.2051712013781,
+    "successful_input_tokens": 131072,
+    "successful_output_tokens": 4096,
+    "output_tokens_per_s": 47.51455095926449,
+    "input_plus_output_tokens_per_s": 1567.9801816557283,
+    "gpu_ids": [
+      0,
+      1
+    ],
+    "source": "bf16-tp2-final32-c4.json",
+    "ttft_ms": {
+      "samples": 32,
+      "mean": 1573.4214797848836,
+      "p50": 1572.7103650569916,
+      "p95": 2500.137229450047,
+      "p99": 2504.3539917469025
+    },
+    "tpot_ms": {
+      "samples": 32,
+      "mean": 72.45042792972411,
+      "p50": 73.86766538375946,
+      "p95": 79.9597442179449,
+      "p99": 84.20352145530812
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "1c514d1da100-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-8",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-9",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-10",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-11",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-12",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-13",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-14",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-15",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-16",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-17",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-18",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-19",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-20",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-21",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-22",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-23",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-24",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-25",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-26",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-27",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-28",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-29",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-30",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "1c514d1da100-31",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 32,
+      "mean": 1039.3737440463156,
+      "p50": 1109.9812425673008,
+      "p95": 1943.353409692645,
+      "p99": 2074.3042090907697
+    },
+    "mean_first_two_sse_choice_gap_ms": 1039.3737440463156,
+    "first_two_gap_samples": 32,
+    "device_memory_sampled_max_mib": {
+      "0": 17957,
+      "1": 17939
+    },
+    "simultaneous_selected_devices_max_mib": 35896,
+    "memory_samples": 372,
+    "memory_sample_mean_interval_s": 0.28410858420951346,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "limited fixed-input checks; not a full quality evaluation"
+  },
+  {
+    "label": "bf16-tp2-fixed-c1",
+    "concurrency": 1,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 644.2874702624977,
+    "mean_tpot_ms": 63.338212866893436,
+    "tpot_samples": 8,
+    "wall_seconds": 69.51482671871781,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 14.730670395590213,
+    "input_plus_output_tokens_per_s": 486.112123054477,
+    "gpu_ids": [
+      0,
+      1
+    ],
+    "source": "bf16-tp2-fixed-c1.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 644.2874702624977,
+      "p50": 644.0150439739227,
+      "p95": 646.3221926242113,
+      "p99": 646.9852898269892
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 63.338212866893436,
+      "p50": 62.84536457965224,
+      "p95": 65.63117940301501,
+      "p99": 65.7131170516643
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "cdb1631b3c3a-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "cdb1631b3c3a-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "cdb1631b3c3a-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "cdb1631b3c3a-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "cdb1631b3c3a-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "cdb1631b3c3a-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "cdb1631b3c3a-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "cdb1631b3c3a-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 86.51096047833562,
+      "p50": 86.4042341709137,
+      "p95": 88.51363062858582,
+      "p99": 89.0726512670517
+    },
+    "mean_first_two_sse_choice_gap_ms": 86.51096047833562,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 17957,
+      "1": 17939
+    },
+    "simultaneous_selected_devices_max_mib": 35896,
+    "memory_samples": 305,
+    "memory_sample_mean_interval_s": 0.2932314098886165,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "limited fixed-input checks; not a full quality evaluation"
+  },
+  {
+    "label": "bf16-tp2-fixed-c4",
+    "concurrency": 4,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 1574.2136691696942,
+    "mean_tpot_ms": 75.12407018033068,
+    "tpot_samples": 8,
+    "wall_seconds": 22.23473482578993,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 46.05406846643697,
+    "input_plus_output_tokens_per_s": 1519.7842593924202,
+    "gpu_ids": [
+      0,
+      1
+    ],
+    "source": "bf16-tp2-fixed-c4.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 1574.2136691696942,
+      "p50": 1573.9237740635872,
+      "p95": 2500.9099090471864,
+      "p99": 2501.889976747334
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 75.12407018033069,
+      "p50": 75.12344092893318,
+      "p95": 82.51569097582984,
+      "p99": 82.70322037523422
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "f89dcd7ca2e4-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "f89dcd7ca2e4-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "f89dcd7ca2e4-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "f89dcd7ca2e4-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "f89dcd7ca2e4-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "f89dcd7ca2e4-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "f89dcd7ca2e4-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "f89dcd7ca2e4-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 1113.7627884745598,
+      "p50": 1113.859511911869,
+      "p95": 2069.5083243772388,
+      "p99": 2121.923696063459
+    },
+    "mean_first_two_sse_choice_gap_ms": 1113.7627884745598,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 17957,
+      "1": 17939
+    },
+    "simultaneous_selected_devices_max_mib": 35896,
+    "memory_samples": 139,
+    "memory_sample_mean_interval_s": 0.2872053504368101,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "limited fixed-input checks; not a full quality evaluation"
+  },
+  {
+    "label": "fp8-kv-tp1-c1",
+    "concurrency": 1,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 25417.13070543483,
+    "mean_tpot_ms": 50.34155263675479,
+    "tpot_samples": 8,
+    "wall_seconds": 254.49340783059597,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 4.023679861608154,
+    "input_plus_output_tokens_per_s": 132.7814354330691,
+    "gpu_ids": [
+      0
+    ],
+    "source": "fp8-kv-tp1-c1.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 25417.13070543483,
+      "p50": 25413.29009272158,
+      "p95": 25439.907358400524,
+      "p99": 25445.087445043027
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 50.3415526367548,
+      "p50": 50.367814525375216,
+      "p95": 50.64133772054525,
+      "p99": 50.690407335875534
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "d85d4f1ac50e-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "d85d4f1ac50e-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "d85d4f1ac50e-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "d85d4f1ac50e-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "d85d4f1ac50e-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "d85d4f1ac50e-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "d85d4f1ac50e-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "d85d4f1ac50e-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 54.23593008890748,
+      "p50": 54.412756115198135,
+      "p95": 55.72809800505638,
+      "p99": 55.733017176389694
+    },
+    "mean_first_two_sse_choice_gap_ms": 54.23593008890748,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 32811
+    },
+    "simultaneous_selected_devices_max_mib": 32811,
+    "memory_samples": 1138,
+    "memory_sample_mean_interval_s": 0.28113690677869707,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "limited fixed-input checks; not a full quality evaluation"
+  },
+  {
+    "label": "fp8-kv-tp1-c4",
+    "concurrency": 4,
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "warmups": 2,
+    "mean_ttft_ms": 63499.64710557833,
+    "mean_tpot_ms": 355.10279268290344,
+    "tpot_samples": 8,
+    "wall_seconds": 217.2001537308097,
+    "successful_input_tokens": 32768,
+    "successful_output_tokens": 1024,
+    "output_tokens_per_s": 4.714545466064034,
+    "input_plus_output_tokens_per_s": 155.58000038011312,
+    "gpu_ids": [
+      0
+    ],
+    "source": "fp8-kv-tp1-c4.json",
+    "ttft_ms": {
+      "samples": 8,
+      "mean": 63499.64710557833,
+      "p50": 63504.005478695035,
+      "p95": 101574.07474908978,
+      "p99": 101579.0228940919
+    },
+    "tpot_ms": {
+      "samples": 8,
+      "mean": 355.1027926829035,
+      "p50": 355.0713351216373,
+      "p95": 655.196587619643,
+      "p99": 655.6597041535213
+    },
+    "percentile_method": "linear interpolation at (n-1)*q; empirical short-sample percentiles",
+    "request_lengths": [
+      {
+        "request_id": "559e12cab12d-0",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "559e12cab12d-1",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "559e12cab12d-2",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "559e12cab12d-3",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "559e12cab12d-4",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "559e12cab12d-5",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "559e12cab12d-6",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      },
+      {
+        "request_id": "559e12cab12d-7",
+        "success": true,
+        "input_tokens": 4096,
+        "output_tokens": 128
+      }
+    ],
+    "length_source": "input: tokenizer-verified materialized prompt; output: streamed server usage",
+    "failure_reasons": {},
+    "first_two_sse_choice_gap_ms": {
+      "samples": 8,
+      "mean": 38227.61469800025,
+      "p50": 38223.311295732856,
+      "p95": 76338.65154124796,
+      "p99": 76392.22653873265
+    },
+    "mean_first_two_sse_choice_gap_ms": 38227.61469800025,
+    "first_two_gap_samples": 8,
+    "device_memory_sampled_max_mib": {
+      "0": 32811
+    },
+    "simultaneous_selected_devices_max_mib": 32811,
+    "memory_samples": 1004,
+    "memory_sample_mean_interval_s": 0.2800701829314172,
+    "memory_scope": "nvidia-smi device used memory; after startup, including this batch's warmups and requests; sampled maximum, not exact peak",
+    "correctness_status": "limited fixed-input checks; not a full quality evaluation"
+  }
+]

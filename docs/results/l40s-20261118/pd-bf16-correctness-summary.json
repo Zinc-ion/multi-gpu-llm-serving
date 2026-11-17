@@ -1,0 +1,266 @@
+[
+  {
+    "status": "capture_only",
+    "freeze": null,
+    "tokens_identical": true,
+    "all_finite": true,
+    "greedy_matches_logits": true,
+    "gate_passed": null,
+    "cases": [
+      {
+        "name": "chat-0",
+        "tokens_identical": true,
+        "greedy_matches_logits": true,
+        "finite": true,
+        "first_divergence": null,
+        "same_prefix_logit_positions": 4,
+        "reference_tokens": 4,
+        "candidate_tokens": 4,
+        "max_abs_error": 0.28125,
+        "mean_abs_error": 0.03045041690931264,
+        "gate_failed_elements": null,
+        "gate_passed": null
+      }
+    ],
+    "kv": {
+      "prefill_to_restored_decode": {
+        "data_bytes": 3440640,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 21
+      },
+      "reference_to_prefill": {
+        "data_bytes": 3440640,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 21
+      }
+    }
+  },
+  {
+    "status": "capture_only",
+    "freeze": null,
+    "tokens_identical": true,
+    "all_finite": true,
+    "greedy_matches_logits": true,
+    "gate_passed": null,
+    "cases": [
+      {
+        "name": "chat-1",
+        "tokens_identical": true,
+        "greedy_matches_logits": true,
+        "finite": true,
+        "first_divergence": null,
+        "same_prefix_logit_positions": 4,
+        "reference_tokens": 4,
+        "candidate_tokens": 4,
+        "max_abs_error": 0.25,
+        "mean_abs_error": 0.019359687334805312,
+        "gate_failed_elements": null,
+        "gate_passed": null
+      }
+    ],
+    "kv": {
+      "prefill_to_restored_decode": {
+        "data_bytes": 3932160,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 24
+      },
+      "reference_to_prefill": {
+        "data_bytes": 3932160,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 24
+      }
+    }
+  },
+  {
+    "status": "capture_only",
+    "freeze": null,
+    "tokens_identical": true,
+    "all_finite": true,
+    "greedy_matches_logits": true,
+    "gate_passed": null,
+    "cases": [
+      {
+        "name": "tokens-255",
+        "tokens_identical": true,
+        "greedy_matches_logits": true,
+        "finite": true,
+        "first_divergence": null,
+        "same_prefix_logit_positions": 4,
+        "reference_tokens": 4,
+        "candidate_tokens": 4,
+        "max_abs_error": 0.25,
+        "mean_abs_error": 0.02241433988862358,
+        "gate_failed_elements": null,
+        "gate_passed": null
+      }
+    ],
+    "kv": {
+      "prefill_to_restored_decode": {
+        "data_bytes": 41779200,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 255
+      },
+      "reference_to_prefill": {
+        "data_bytes": 41779200,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 255
+      }
+    }
+  },
+  {
+    "status": "capture_only",
+    "freeze": null,
+    "tokens_identical": true,
+    "all_finite": true,
+    "greedy_matches_logits": true,
+    "gate_passed": null,
+    "cases": [
+      {
+        "name": "tokens-256",
+        "tokens_identical": true,
+        "greedy_matches_logits": true,
+        "finite": true,
+        "first_divergence": null,
+        "same_prefix_logit_positions": 4,
+        "reference_tokens": 4,
+        "candidate_tokens": 4,
+        "max_abs_error": 0.908203125,
+        "mean_abs_error": 0.056032641381833455,
+        "gate_failed_elements": null,
+        "gate_passed": null
+      }
+    ],
+    "kv": {
+      "prefill_to_restored_decode": {
+        "data_bytes": 41943040,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 256
+      },
+      "reference_to_prefill": {
+        "data_bytes": 41943040,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 256
+      }
+    }
+  },
+  {
+    "status": "capture_only",
+    "freeze": null,
+    "tokens_identical": true,
+    "all_finite": true,
+    "greedy_matches_logits": true,
+    "gate_passed": null,
+    "cases": [
+      {
+        "name": "tokens-257",
+        "tokens_identical": true,
+        "greedy_matches_logits": true,
+        "finite": true,
+        "first_divergence": null,
+        "same_prefix_logit_positions": 4,
+        "reference_tokens": 4,
+        "candidate_tokens": 4,
+        "max_abs_error": 0.25,
+        "mean_abs_error": 0.02283069668824156,
+        "gate_failed_elements": null,
+        "gate_passed": null
+      }
+    ],
+    "kv": {
+      "prefill_to_restored_decode": {
+        "data_bytes": 42106880,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 257
+      },
+      "reference_to_prefill": {
+        "data_bytes": 42106880,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 257
+      }
+    }
+  },
+  {
+    "status": "capture_only",
+    "freeze": null,
+    "tokens_identical": true,
+    "all_finite": true,
+    "greedy_matches_logits": true,
+    "gate_passed": null,
+    "cases": [
+      {
+        "name": "tokens-4096",
+        "tokens_identical": true,
+        "greedy_matches_logits": true,
+        "finite": true,
+        "first_divergence": null,
+        "same_prefix_logit_positions": 4,
+        "reference_tokens": 4,
+        "candidate_tokens": 4,
+        "max_abs_error": 0.25,
+        "mean_abs_error": 0.009276843257876083,
+        "gate_failed_elements": null,
+        "gate_passed": null
+      }
+    ],
+    "kv": {
+      "prefill_to_restored_decode": {
+        "data_bytes": 671088640,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 4096
+      },
+      "reference_to_prefill": {
+        "data_bytes": 671088640,
+        "data_different_bytes": 0,
+        "dtype": "torch.bfloat16",
+        "equal": true,
+        "scale_bytes": 0,
+        "scale_different_bytes": 0,
+        "valid_tokens": 4096
+      }
+    }
+  }
+]

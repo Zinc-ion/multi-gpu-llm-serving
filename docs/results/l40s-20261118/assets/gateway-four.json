@@ -1,0 +1,36 @@
+{
+  "pairs": [
+    {
+      "prefill": [
+        "127.0.0.1",
+        19100
+      ],
+      "decode": [
+        "127.0.0.1",
+        19200
+      ]
+    },
+    {
+      "prefill": [
+        "127.0.0.1",
+        19100
+      ],
+      "decode": [
+        "127.0.0.1",
+        19201
+      ]
+    }
+  ],
+  "max_active_requests": 4,
+  "max_payload_bytes": 1073741824,
+  "max_staging_bytes": 3221225472,
+  "max_request_bytes": 2097152,
+  "request_timeout": 600,
+  "routing_mode": "load",
+  "poll_interval_s": 0.05,
+  "poll_timeout_s": 2,
+  "max_sample_age_s": 5,
+  "elastic": {
+    "enabled": false
+  }
+}

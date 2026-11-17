@@ -1,0 +1,185 @@
+{
+  "scope": "original seed/prompt/dtype; layer0 o_proj first prefill, fresh instrumented real runs",
+  "input_shards_exact": true,
+  "weight_shards_exact": true,
+  "full_bf16_replay_vs_observed_tp1": {
+    "equal": true,
+    "different_elements": 0,
+    "max_abs_error": 0.0,
+    "mean_abs_error": 0.0
+  },
+  "split_bf16_replay_vs_observed_tp2": {
+    "equal": true,
+    "different_elements": 0,
+    "max_abs_error": 0.0,
+    "mean_abs_error": 0.0
+  },
+  "split_bf16_vs_full_bf16": {
+    "equal": false,
+    "different_elements": 113,
+    "max_abs_error": 0.000244140625,
+    "mean_abs_error": 2.1083280444145203e-05
+  },
+  "observed_tp2_vs_tp1": {
+    "equal": false,
+    "different_elements": 113,
+    "max_abs_error": 0.000244140625,
+    "mean_abs_error": 2.1083280444145203e-05
+  },
+  "difference_pattern_equal": true,
+  "fp32_full_vs_split_before_cast": {
+    "equal": false,
+    "different_elements": 73,
+    "max_abs_error": 7.450580596923828e-09,
+    "mean_abs_error": 3.637978807091713e-10
+  },
+  "fp32_full_vs_split_after_bf16_cast": {
+    "equal": true,
+    "different_elements": 0,
+    "max_abs_error": 0.0,
+    "mean_abs_error": 0.0
+  },
+  "outputs": {
+    "tp1": {
+      "tokens": [
+        32,
+        33,
+        41
+      ],
+      "top3": [
+        {
+          "ids": [
+            32,
+            0,
+            21
+          ],
+          "values": [
+            0.388671875,
+            0.25,
+            0.25
+          ]
+        },
+        {
+          "ids": [
+            33,
+            18,
+            19
+          ],
+          "values": [
+            0.404296875,
+            0.36328125,
+            0.302734375
+          ]
+        },
+        {
+          "ids": [
+            41,
+            62,
+            49
+          ],
+          "values": [
+            0.34765625,
+            0.34765625,
+            0.306640625
+          ]
+        }
+      ]
+    },
+    "tp2": {
+      "tokens": [
+        32,
+        33,
+        62
+      ],
+      "top3": [
+        {
+          "ids": [
+            32,
+            21,
+            0
+          ],
+          "values": [
+            0.38671875,
+            0.25,
+            0.2490234375
+          ]
+        },
+        {
+          "ids": [
+            33,
+            18,
+            19
+          ],
+          "values": [
+            0.404296875,
+            0.36328125,
+            0.302734375
+          ]
+        },
+        {
+          "ids": [
+            62,
+            41,
+            49
+          ],
+          "values": [
+            0.349609375,
+            0.34765625,
+            0.306640625
+          ]
+        }
+      ]
+    },
+    "tp2-fp32-row": {
+      "tokens": [
+        32,
+        33,
+        41
+      ],
+      "top3": [
+        {
+          "ids": [
+            32,
+            0,
+            21
+          ],
+          "values": [
+            0.388671875,
+            0.25,
+            0.25
+          ]
+        },
+        {
+          "ids": [
+            33,
+            18,
+            19
+          ],
+          "values": [
+            0.404296875,
+            0.36328125,
+            0.302734375
+          ]
+        },
+        {
+          "ids": [
+            41,
+            62,
+            49
+          ],
+          "values": [
+            0.34765625,
+            0.34765625,
+            0.306640625
+          ]
+        }
+      ]
+    }
+  },
+  "limits": [
+    "hooks copy tensors and perturb timing; not performance data",
+    "FP32-row lane is a diagnostic intervention, not a production fix or replacement acceptance",
+    "first-boundary replay does not prove every later numerical difference has the same cause",
+    "original strict GPU test failure remains recorded"
+  ]
+}

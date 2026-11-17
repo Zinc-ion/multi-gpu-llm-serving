@@ -1,12 +1,15 @@
 # M4：张量并行加载与验证
 
-M4 修复上游并行层和 checkpoint 加载，不将上游已有的张量并行层、NCCL 进程组和模型实现归为新增。CPU 两进程 Gloo 与 tiny Transformers checkpoint 的验证不能替代真实 CUDA/NCCL、Qwen3-14B 或服务器验收；通信时间、峰值显存与 14B 的 logits 门槛仍需服务器实测。
+M4 修复上游并行层和 checkpoint 加载，不将上游已有的张量并行层、NCCL 进程组和模型实现归为新增。CPU 两进程 Gloo 与 tiny Transformers checkpoint 的验证不能替代真实 CUDA/NCCL、Qwen3-14B 或服务器验收；本页区分历史 CPU/tiny 结果与当前 L40S 结果，14B 通用 logits 门槛仍未建立。
+
+2026-11-18 的当前结果：原 tiny BF16 greedy 失败已修复，原 GPU FP32/BF16 两项通过；14B 六组各 16 token 与 TP1 一致，同前缀 top1 为 96/96。下文的 2026-11-16 失败与诊断流程保留为历史证据，不能再视为修复后的当前失败；14B 通用 logits 门槛仍未建立。
 
 ## 加载与分片契约
 
 - checkpoint 的 Q/K/V 和 gate/up 分离张量分别调用目标并行层的 `weight_loader`；weight 和 bias 均适用。普通参数也调用自定义 loader，没有自定义 loader 时才按完整 shape 直接复制。
 - Q 和 KV 头数均需为正且分别能被 TP 大小整除，Q 头数还必须能被 KV 头数整除；不支持 KV 头复制。Merged Linear 的每一部分、Column Linear 的输出维、Row Linear 的输入维都必须分别能被 TP 大小整除。构造时拒绝不符合条件的模型。
 - embedding/head 按词表切分。词表大小不能整除 TP 时，尾部仅内部补零，rank 0 的 logits 截回原词表大小；实际 checkpoint shape 必须精确匹配原词表。Row Linear 的 bias 在 all-reduce 后添加一次。
+- 当前 CUDA BF16 TP>1 的 Row Linear 使用 BF16 输入/权重的 `torch.mm(..., out_dtype=torch.float32)` 保留部分积，经 FP32 all-reduce 后一次转回 BF16，再加 bias。CPU、TP1、FP32 路径保持原语义；此 API 在实际 PyTorch 2.9.1+cu128 验证，不增加低版本静默回退。归约 payload 比原 BF16 加倍，不能称通信加速。
 - tied embedding/head 保持同一个 Parameter。checkpoint 可只包含共享权重的一份；若同时包含两份，内容必须一致。untied head 必须有自己的权重。模型设备转换后仍保持共享关系与参数 loader。
 - 返回的 `loaded_params` 包含完成加载的模型参数名、共享参数别名和实际消费的 checkpoint 张量名，可供现有 `tools/compare_hf.py` 核对。缺失的模型参数或 packed 分片、重复 checkpoint 名、未知张量、shape 不符及不一致的共享权重均直接报错；不会截取部分权重继续运行。
 - Qwen3 在启用 attention bias 时仍执行 Q/K norm；Qwen3/Llama 的 attention 输出投影跟随 attention bias。Llama attention 使用每个 rank 的局部 Q/KV 头数。
@@ -36,7 +39,15 @@ GPU 入口使用 `tests/tp_engine_helpers.py` 创建真实 tokenizer/checkpoint�
 
 同日 GPU0/1 的原 M4 插桩结果为：TP1/TP2 的三个 token 分别仍为 `[32, 33, 41]` / `[32, 33, 62]`，三个 rank 的加载权重均与对应 checkpoint 分片一致。首个观察到的精确差异位于第 0 层 `self_attn.o_proj` 输出，113/320 个元素不同，最大绝对差为 `0.000244140625`；这不能确定根因。该轮使用的是共享内存强制清理修复前的脚本，作为历史结果保留。后续 `p3a-gpu-bf16-04` 使用固定候选 `fb51c70bb4d0061a5b5b901d70ac44a4f79d2501`对原 M4 BF16 用例复跑，TP1/TP2 lane 均正常退出（exit 0），输出仍分别为 `[32, 33, 41]` / `[32, 33, 62]`，无 TERM/KILL 或存活进程组，TP2 通信共享内存记录为 `already_released`。该次正常 GPU 运行未触发异常或强杀清理，相关异常路径由 CPU 验证；原 strict greedy 仍为 FAIL，继续阻塞 TP2 验收。
 
-## 目标服务器复现模板
+## L40S 原严格失败的重放与修复
+
+新机器复现原输入、seed 和严格判定后仍得到 TP1 `[32,33,41]`、TP2 `[32,33,62]`；第三步 TP1 的 41/62 logits 均为 `0.34765625`。独立真实运行捕获确认首个 `layer0.o_proj` 的输入/权重分片精确一致，完整 BF16 GEMM 与分片 BF16 GEMM＋求和分别精确复现 TP1/TP2，全部 113/320 个差异及最大差 `0.000244140625` 相同。FP32 完整/分片结果转回 BF16 后一致；诊断干预也恢复原输出。
+
+生产实现因此保留 FP32 部分积和归约，避免先舍入各个 shard。未修改测试 seed、输入、容差或 greedy 要求。原 `tests/test_tp_gpu.py` 两种 dtype 实际为 2 passed（71.52 秒），BF16 TP2 对 HF max abs `0.0029296875`；14B 原六组均 16 输出一致。但 14B 最大同前缀差仍达 `9.671875`，并非所有 logits 误差都更小，不建立事后容差或完整质量结论。
+
+HTTP 原 `world_size==1` 检查在目标模型启动前拒绝 TP2。新增 `tests/test_server_tp_config.py` 先复现原失败，再开放共置入口到 TP1/TP2；实际 worker 组织与单 owner 线程不另起一套执行实现。原始失败、重放、修复及测量结果保存在租机数据盘任务目录的 `runs/acceptance-20261118`，其中 `tp2-fp32-partials.patch` 对应本节实现，修复前后文件分别保留。
+
+## 历史学校服务器复现模板
 
 以下命令沿用学校内网服务器环境，在服务器项目根目录执行，**尚未运行**。先固定经审核的候选 commit，并确认指定的两张 GPU 获准使用且空闲。该旧机器的新增文件、缓存和日志位于 `/Data2/zincion/ai-infra` 下；当前 L40S 租机的目录与入口见 [租机记录](server_hardware_l40s_2026-11-17.md)。`M4_DATA` 每轮使用新目录。示例依赖 M2 已保存的配置及捕获文件；如果路径不同，应先定位同一模型 revision、精度和输入，不重新生成假数据。
 

@@ -248,9 +248,18 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(slided_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        result = nn.functional.linear(x, self.weight, None)
+        fp32_partial = self.tp_size > 1 and x.is_cuda and x.dtype == torch.bfloat16
+        if fp32_partial:
+            # Round once after summing shard GEMMs, rather than rounding each
+            # partial to BF16 before all-reduce. Inputs and weights stay BF16.
+            result = torch.mm(x.reshape(-1, x.shape[-1]), self.weight.t(), out_dtype=torch.float32)
+            result = result.reshape(*x.shape[:-1], self.weight.shape[0])
+        else:
+            result = nn.functional.linear(x, self.weight, None)
         if self.tp_size > 1:
             dist.all_reduce(result, op=dist.ReduceOp.SUM)
+        if fp32_partial:
+            result = result.to(x.dtype)
         if self.bias is not None:
             result = result + self.bias
         return result

@@ -2,6 +2,8 @@
 
 本单元为引擎增加可选的 FP8 KV 存储、读取和 PD 传输。默认不启用；模型权重、activation 和 logits 的 dtype 仍由原有 `dtype` 配置决定。FP8 KV 是有损量化，不能把它与 BF16 KV 的输出差异当作无损传输误差。本机 tiny 模型的功能验证不能代替目标服务器、14B、长上下文质量或性能验收。
 
+当前交付按 [最小验收](../.codex/tasks/m8_acceptance.md) 做少量 Qwen3-14B 代表输入、资源与端到端记录；下文完整任务质量工具属于保留的扩展，不要求 Math500/NIAH 全量或两种 prefill 计算模式全排列。
+
 ## 配置与布局
 
 在模型 JSON 配置中设置：
@@ -25,7 +27,7 @@ Triton store 将对应 token/head 的数据及 scale 直接写入池；除法保
 
 可选配置 `fp8_prefill_compute_dtype` 只接受 `float32`（省略时的原路径）和 `query`。`query` 保留 Q 的 dtype；K/V 仍用原 token/head scale 在 FP32 反量化，再转成 Q dtype，softmax 和累加器使用 FP32，概率在与 V 相乘前转为 V dtype。这是有不同舍入的实验路径，不保证与 `float32` 结果一致；例如反量化值超出 FP16 范围时，转换可能产生 Inf 并进一步产生 NaN。该选项作用于整个 paged prefill batch，包含与 prefill 混排的 decode 行；独立 decode kernel 的计算未改变。单 token prompt 尾 chunk 若单独调度为 decode 则走独立 decode kernel，若与其他 prefill 混排则走 paged prefill。普通非 FP8 cache、量化与 data/scale 传输格式不变。同一 K/V 输入的存储字节不变，但完整模型后续层可能因前层舍入差异产生不同输入及 cache 内容，也可能改变 argmax 和输出质量。配置在 engine 入口校验，并在初始化时传给各 Attention 层。
 
-此机制借鉴 Apache-2.0 许可的 vLLM v0.15.0，commit `f176443446f659dbab5315e056e605d8984fd976`，`vllm/v1/attention/ops/triton_unified_attention.py` 的 FP8 K/V 反量化后转换 Q dtype 路径（源码 SHA256 `0dde242db3cd2bb4559b95d977cd169c8c704d15737bbd553919a2335f65f87a`）。本项目保留自己的 token/head scale 和缓存布局，不使用该源码的 layer scale。
+此机制借鉴 Apache-2.0 许可的 vLLM v0.15.0，commit `f176443446f659dbab5315e056e605d8984fd976`，`vllm/v1/attention/ops/triton_unified_attention.py` 的 FP8 K/V 反量化后转换 Q dtype 路径。本项目保留自己的 token/head scale 和缓存布局，不使用该源码的 layer scale。
 
 CUDA Graph 捕获和重放复用相同的 data/scale 池地址。slot 为 `-1` 的 padding 不写 cache，长度为零的 decode padding 不读取有效 KV；真实 batch 的 block 分配、释放和重用仍由原有 Scheduler 管理。
 
@@ -146,7 +148,7 @@ for mode in float32 query; do
 done
 ```
 
-## FP8 任务质量准备与比较
+## 可选扩展：FP8 任务质量准备与比较
 
 `tools/prepare_fp8_eval.py` 生成一组固定的单实例 BF16 配置：baseline 使用 `kv_cache_dtype=auto`，candidate 的 KV cache 使用 `float8_e4m3fn`，其余服务配置相同。质量客户端独立使用 evalscope `1.5.1`，不修改 serving 或 vLLM 环境。以下流程是源码核对后的准备方案，尚未安装 evalscope 或执行真实数据集评测。
 

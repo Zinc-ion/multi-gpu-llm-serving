@@ -58,7 +58,7 @@ CPU buffer 测试用设备执行替身验证真实 capture/replay 准备逻辑�
 2. 运行 GPU 回归测试，并在同一固定 prompt 集上用 `tools/compare_hf.py custom` 分别捕获 M2、M3 whole-prefill 和 M3 chunked 输出。比较 greedy token，按预先确认的阈值核对 logits，不能为了通过事后放宽。
 3. 用同一权重 revision 和 tokenizer 跑 Transformers 参照，复用 M2 的同前缀比较。CPU tiny 模型测试不能替代长上下文、14B BF16 验证。
 4. 重新保存启动日志中的容量、RoPE、warmup 与峰值显存记录，验证 1K/4K/16K 输入和固定输出。B1 的 chunk budget 扫描应与其他配置变化分开。
-5. 启动 B1 服务，复用 `tools/run_b0.py`（它只调用同一锁定 bench 客户端，可测任意兼容服务）和 `tools/analyze_bench.py`；保存到独立 B1 目录。输入文件、sha256、seed、输出长度、并发/到达速率、SLO 和 GPU/NUMA 绑定保持一致。
+5. 启动 B1 服务，复用 `tools/run_b0.py`（它只调用同一锁定 bench 客户端，可测任意兼容服务）和 `tools/analyze_bench.py`；保存到独立 B1 目录。请求列表、seed、输出长度、并发/到达速率、SLO 和 GPU/NUMA 绑定保持一致。
 6. 测同硬件 vLLM 参照，固定 vLLM 0.15.0、模型/tokenizer revision、BF16、greedy、ignore-eos 和请求列表。对比实际 KV token 容量；不按两边不同含义的 memory-utilization 参数宣称容量相等。vLLM 的 ITL 可能是合并 chunk 的间隔，继续单独核对。
 
 ## 服务器命令模板

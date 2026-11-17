@@ -8,7 +8,7 @@
 
 Python 3.11.16、PyTorch 2.9.1+cu128、Transformers 4.57.3、vLLM 0.15.0。`torch.cuda.nccl.version()` 为 2.27.5，NCCL INFO 构建版本为 `2.27.5+cuda12.9`。Python 和锁定依赖迁入独立目录 `/Data2/zincion/envs/m2`，在服务器重新安装 editable 项目并由 `uv sync --locked --offline --no-build-isolation --reinstall-package myvllm` 审计，没有升级包。`numactl` 来自解包到用户目录的 Ubuntu `2.0.14-3ubuntu2` 包。
 
-原始数据根目录为 `/Data2/zincion/ai-infra/experiments/m2/20261114/`，下文文件名均相对此目录。`versions.txt`、`topology.txt`、`numa.txt` 保存环境；`commands.txt`、`campaign-events.jsonl` 和 bench 的 `*.command.json` 保存命令与代码版本。驱动脚本及配置也在该目录，不代替仓库模型、Scheduler、BlockManager 或客户端。旧记录中的 `/Data2/zincion/experiments/` 对应当前 `/Data2/zincion/ai-infra/experiments/`；文件路径、SHA256 和 inode 清单见 `migration/manifest.json`，历史日志及命令保留原值。现有工作目录外的模型 snapshot 与 Python 环境仅读取，新的缓存和临时文件由 `env.sh` 指向工作目录内。
+原始数据根目录为 `/Data2/zincion/ai-infra/experiments/m2/20261114/`，下文文件名均相对此目录。`versions.txt`、`topology.txt`、`numa.txt` 保存环境；`commands.txt`、`campaign-events.jsonl` 和 bench 的 `*.command.json` 保存命令与代码版本。驱动脚本及配置也在该目录，不代替仓库模型、Scheduler、BlockManager 或客户端。旧记录中的 `/Data2/zincion/experiments/` 对应当前 `/Data2/zincion/ai-infra/experiments/`，迁移清单见 `migration/manifest.json`。现有工作目录外的模型 snapshot 与 Python 环境仅读取，新的缓存和临时文件由 `env.sh` 指向工作目录内。
 
 ```bash
 source /Data2/zincion/ai-infra/experiments/m2/20261114/env.sh
@@ -104,7 +104,7 @@ NCCL INFO 的数据通道为 `SHM/direct/direct`，同时出现的 `Using networ
 
 ## 请求列表与 B0 边界
 
-14B tokenizer 重新物化 ShareGPT 1000 请求、qasper 197 请求、三档 random 各 100 请求。固定 revision、过滤策略、seed、逐请求输出预算和 SHA256 均在 `workloads/` 的 manifest。
+14B tokenizer 重新物化 ShareGPT 1000 请求、qasper 197 请求、三档 random 各 100 请求。数据版本、过滤策略、seed 和逐请求输出预算见 `workloads/` 的 manifest。
 
 同一八请求列表、seed 7、1 request/s 泊松参数重复运行，detailed 结果均保存 `start_times`；实际相对发送时间不完全相等，本次最大差约 0.95 ms，见 `arrival-check-0.6b/comparison.json`。这不是时间戳回放。
 

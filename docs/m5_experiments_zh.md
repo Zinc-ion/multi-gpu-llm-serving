@@ -2,13 +2,15 @@
 
 本文只提供尚未在目标服务器执行的配置生成与实验命令；服务器 14B 正确性、异常回收、容量、跨 GPU/NUMA 和 B2 数据均待验收。本机 tiny 同卡 P/D 与 HTTP 功能检查不能代替这些验收。不要使用 M5 候选重新填报旧候选的 B0/B1；它们各自在固定 commit 上独立完成。
 
+本文保留旧服务器的完整实验模板；当前按 [最小验收](../.codex/tasks/m8_acceptance.md) 执行，优先双卡 1P1D 与固定负载，不要求跑完五组数据、速率扫描或四卡矩阵。
+
 ## 生成前提
 
 先确认获准 GPU 空闲，重新运行 `nvidia-smi topo -m`、`nvidia-smi topo -p2p r/w`、`numactl --hardware` 并核对 GPU 的 PCIe NUMA 节点。生成器假设 GPU0/1 在 NUMA 0，GPU3/4 在 NUMA 1；worker 的 `numactl --cpunodebind/--membind` 绑定到其 GPU 所在节点，网关和 bench 客户端绑定节点 0。若现场拓扑不同，不得沿用这组命令当成同/跨 NUMA 实验。每个 worker 使用 `CUDA_DEVICE_ORDER=PCI_BUS_ID` 和单个物理 GPU 的 `CUDA_VISIBLE_DEVICES`，进程内是逻辑 `cuda:0`、rank 0、TP=1；确认设备编号与 `nvidia-smi`/UUID 对应关系。
 
-选择已经固定的 M5 candidate commit 和 tag、其工作树、只读现有 Python 与固定 14B snapshot。tag 必须指向该 commit，运行脚本会检查工作树 HEAD 和 tag；生成的 manifest 与各角色 JSON 保存完整选择和配置。核对 HEAD 对应代码及工作树内容，无关修改不得混入实验。模型和 Python 可以只读使用工作目录外的现有文件，所有**新增**的配置、模型下载、缓存、临时文件、日志和结果必须在 `/Data2/zincion/ai-infra` 内。生成器会拒绝该根目录以外或根目录自身作为输出目录，并要求输出目录尚不存在。
+选择 M5 候选版本及工作树、只读现有 Python 与固定 14B snapshot。旧生成脚本会自动核对候选版本和标签，manifest 与各角色 JSON 保存实际配置。模型和 Python 可以只读使用工作目录外的现有文件，所有**新增**的配置、模型下载、缓存、临时文件、日志和结果必须在 `/Data2/zincion/ai-infra` 内。生成器会拒绝该根目录以外或根目录自身作为输出目录，并要求输出目录尚不存在。
 
-复用 M2 已物化的五个 JSONL 和同名 `.manifest.json`：random 的 1024/4096/16384 token 输入、ShareGPT 和 LongBench。以下五个变量必须指向实际保留的文件，不自动重新生成。先核对 manifest 的模型/tokenizer revision、`source.input_length`、输出预算、样本数和 SHA256，及其与比较用 B0/B1 的对应关系。`run_b0.py` 会再校验 JSONL 的 SHA256，禁止超过物化数量取样。
+复用 M2 已物化的五个 JSONL 和同名 `.manifest.json`：random 的 1024/4096/16384 token 输入、ShareGPT 和 LongBench。以下五个变量必须指向实际保留的文件，不自动重新生成。与 B0/B1 共用模型/tokenizer revision、请求列表和输出预算；`run_b0.py` 自动核对列表与 manifest 一致，并禁止超过物化数量取样。
 
 下面以 `2p2d` 为例；单独生成目录并把 `--topology` 改为 `same-numa`（P GPU0、D GPU1）或 `cross-numa`（P GPU0、D GPU3）用于 1P1D 功能和传输实验。这些 1P1D 数据使用两张卡，不能直接与四卡的 B0/B1 goodput 作公平比较。`2p2d` 固定 P GPU0/1、D GPU3/4，四个实例各 TP=1，使用固定 pair 轮询；与 B0/B1 比较必须使用同样四张卡和相同模型、精度、负载、请求列表及 SLO，不能凭生成的配置宣称容量相同。
 
@@ -24,7 +26,7 @@ export M5_REPO="$M5_ROOT/MinivLLM"             # 服务器上的实际固定候�
 export M5_PYTHON=/Data2/zincion/envs/m2/bin/python # 已有只读 Python 环境，按现场修正
 export M5_SNAPSHOT="$M5_ROOT/huggingface/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18"
 export M5_TAG=m5-candidate-XX                     # 替换为实际固定候选 tag
-export M5_COMMIT=REPLACE_WITH_FULL_CANDIDATE_SHA
+export M5_COMMIT=REPLACE_WITH_CANDIDATE_COMMIT
 export M5_L1_1K=REPLACE_WITH_EXISTING_RANDOM_1024_JSONL
 export M5_L1_4K=REPLACE_WITH_EXISTING_RANDOM_4096_JSONL
 export M5_L1_16K=REPLACE_WITH_EXISTING_RANDOM_16384_JSONL
@@ -51,9 +53,6 @@ mkdir -p "$PYTHONPYCACHEPREFIX" "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR" \
   "$VLLM_CACHE_ROOT" "$NUMBA_CACHE_DIR" "$TMPDIR"
 cd "$M5_REPO"
 export PYTHONPATH="$M5_REPO/src"
-test "$(git rev-parse HEAD)" = "$M5_COMMIT"
-test "$(git rev-parse "${M5_TAG}^{commit}")" = "$M5_COMMIT"
-
 M5_ARGS=(--output-dir "$M5_OUT" --topology 2p2d \
   --candidate-commit "$M5_COMMIT" --candidate-tag "$M5_TAG" \
   --repo-dir "$M5_REPO" --python "$M5_PYTHON" --model-path "$M5_SNAPSHOT" \
@@ -103,7 +102,7 @@ bash "$M5_OUT/ready.sh" > "$M5_OUT/ready-01.json"
 - `tools/compare_hf.py prepare` 输出包含模型/tokenizer revision 和 `cases` 的 JSON；每个 case 保存 `name`、`prompt`、`input_ids`。M2 已保存的输入可直接复用，不必重新下载或重新采样。
 - `tools/compare_hf.py custom --config <配置> --prompts <输入JSON> --max-tokens <数量> --output <输出PT>` 在**共置** `LLMEngine` 的 LM head 上注册 hook，输出 `{"metadata": ..., "cases": [...]}`；各 case 的 `input_ids`、`token_ids` 和逐输出位置的二维 `logits` 可作为共置参照。`tools/compare_runs.py --baseline <PT> --candidate <PT> --output <JSON>` 接受这种结构，只比较首次 token 分歧及之前的同前缀 logits，报告 `logits_gate=null`，不会替用户决定正式阈值。
 - `tests/pd_gpu_helpers.py::CaptureEngine` 及 `tests/test_pd_gpu.py::test_real_socket_pd_matches_colocated_gpu` 是现有 tiny P/D 测试 hook：通过测试进程注入真实引擎，分别保存共置、P、D 的 PT；其结构为 `requests[request_id].events` 中的 token/logits，以及 blocks、KV、step 信息，与 `compare_hf.py custom` 输出格式不同。该测试还把 P 首 token 和 D 后续事件拼接，在相同前缀比较 logits 和有效 KV。它的 tiny checkpoint、固定小 payload 上限和本机容差不能直接作为 14B 验收。
-- `tools/compare_pd.py capture` 提供独立 reference、P、D 的 TP1 捕获，按 case 输出可直接交给 `compare_runs.py` 的 PT；使用方法及来源、进程和 KV 边界见 [M8 runtime](m8_runtime_zh.md#独立-pd-数值捕获)。原始 `input_ids` 是模型输入的权威来源；prepare 截断多字节字符时，`prompt` 可以是有损解码表示，捕获器记录 lossy/nonroundtrip 观测，不重新编码替换 ID。它也可显式选择 M5 的 bulk 接口；pipeline 要求引擎支持该接口。捕获 hook 会把 logits/KV 搬到 CPU，只适用于正确性诊断，不应开启后拿来衡量生产延迟。正式 14B logits 门槛和目标部署的验证仍须另行完成。
+- `tools/compare_pd.py capture` 提供独立 reference/P/D 捕获：reference 和 D 为 TP1，bulk P 可为 TP1 或 TP2；TP2 不能使用 `--raw-kv`。按 case 输出可直接交给 `compare_runs.py` 的 PT；使用方法及来源、进程和 KV 边界见 [M8 runtime](m8_runtime_zh.md#独立-pd-数值捕获)。原始 `input_ids` 是模型输入的权威来源；prepare 截断多字节字符时，`prompt` 可以是有损解码表示，捕获器记录 lossy/nonroundtrip 观测，不重新编码替换 ID。它也可显式选择 M5 的 bulk 接口；pipeline 要求引擎支持该接口。捕获 hook 会把 logits/KV 搬到 CPU，只适用于正确性诊断，不应开启后拿来衡量生产延迟。正式 14B logits 门槛和目标部署的验证仍须另行完成。
 
 ## L1/L2 与客户端分析
 

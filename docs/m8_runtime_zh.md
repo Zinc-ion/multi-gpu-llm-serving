@@ -2,6 +2,8 @@
 
 本节描述 PD worker 和可选负载路由；TP2 bulk 的目标 GPU 正确性及 M8 阶段验收尚未完成。固定 P/D 路径与协议版本 2、3、4、5 继续可用；完整交接及部署约束见 [M5](m5_runtime_zh.md)、[M6](m6_runtime_zh.md) 和 [M7](m7_runtime_zh.md)。
 
+当前项目按 [最小验收](../.codex/tasks/m8_acceptance.md) 分别验证 TP2、双卡 bulk PD 与 FP8 KV，并做小规模测量和一段短 profile；不要求本页的四卡全比较、L3、弹性调度或正式 SLO/probe/审批文件链。下文保留工具实际契约，使用这些扩展工具时才适用，不作为本轮前置条件。
+
 ## TP 命令与生命周期
 
 多 rank 引擎在 Linux 上用匿名 `memfd` 和共享映射保存至多 1 MiB 的单槽命令描述符；KV 数据不经过该槽。spawn 时通过标准库的 FD reduction 为每个 rank 传递句柄，不创建命名共享内存或命名信号量。每个 worker 的单向 pipe 只承载空的 ready 和 consumed 通知，rank 0 等所有 rank 消费旧槽后才能重用；worker 完成反序列化后、进入可能的 collective 前发送 consumed。超长描述符在写槽前拒绝，命令 ACK 和退出等待均有期限。消费确认和有限关闭借鉴 vLLM 0.15.0 的 `f176443446f659dbab5315e056e605d8984fd976`：`distributed/device_communicators/shm_broadcast.py:439–563` 与 `v1/executor/multiproc_executor.py:376–405`。
@@ -132,7 +134,7 @@ load 模式按实际 JSON/UTF-8 编码检查选路时已知的请求字段和控
 
 `tools/analyze_pd.py` 的 `outcome` 是网关生成结果，`frontend_outcome` 是网关前端观察到的完成或关闭；`worker_outcomes` 按提供的 P/D 记录分别归纳，缺少记录时为 unknown。它不凭网关记录推断客户端实际接收结果，`client_outcome` 为 null，应与独立客户端结果另行关联。local 和首 token 已结束的 bulk 请求实际传输字节为零；其余远端请求未观测到传输完成时保留未知。流水的 `payload_bytes` 是已确认字节；存在部分 sendall 未知、未确认的已提交字节或缺少发送端终态时，汇总的 `unknown_payload_requests` 包含该请求，不能把已确认字节当作完整传输量。
 
-## 同候选四卡配置
+## 可选扩展：同候选四卡配置
 
 `tools/prepare_pd.py --m8-comparison` 以 `--physical-gpus P0 P1 D0 D1` 明确指定同一组四张卡；GPU2 如使用，只能替换原四卡中的一张。除负载轮询、弹性策略和 `--chunk-tokens` 外，需显式提供 `--pipeline-min-tokens` 和 `--pipeline-frame-bytes`，以准备 bulk/pipeline 消融；这些值须先按目标硬件校准。
 

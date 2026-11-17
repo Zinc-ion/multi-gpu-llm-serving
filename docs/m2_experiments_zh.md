@@ -143,7 +143,7 @@ done
 
 ShareGPT 取首个 human/gpt 消息对，默认按首个 gpt 回复的 token 数设置每条 `output_tokens`，保留输出长度分布；这只是生成预算，不要求模型复现原回复。原始 prompt/reply 长度采用 vLLM 0.15.0 `ShareGPTDataset.sample` / `is_valid_sequence` 的过滤值：输入和回复至少 4 token、输入至多 1024、合计至多 2048。可显式 `--output-tokens` 覆盖为受控固定长度，此时与 vLLM 一样跳过回复最小长度筛选。之后本项目还会套 chat template 并按真实输入加输出预算是否超过 `max_model_length` 过滤，因此不是与 vLLM 原生 ShareGPT 完全相同的请求列表。跨框架对比必须共用本项目物化的 custom 列表。
 
-LongBench 使用固定输出 128（可覆盖），不套 ShareGPT 的短输入过滤。两个真实数据集不截断原样本，固定 seed 打乱后取样；显式请求数不足会报错，不复制补齐。qasper 原始子集只有 200 条，长度过滤后可能更少；manifest 保存最终数量。random 输入验证 tokenizer round trip 后的准确长度。输出为 custom JSONL，旁边的 manifest 记录 revision、长度策略、seed、过滤数、SHA256 和 bench 参数。
+LongBench 使用固定输出 128（可覆盖），不套 ShareGPT 的短输入过滤。两个真实数据集不截断原样本，固定 seed 打乱后取样；显式请求数不足会报错，不复制补齐。qasper 原始子集只有 200 条，长度过滤后可能更少；manifest 保存最终数量。random 输入验证 tokenizer round trip 后的准确长度。输出为 custom JSONL，旁边的 manifest 记录数据版本、长度策略、seed、过滤数和 bench 参数。
 
 当前 random 请求共用同一个合成 prompt；prefix 复用禁用时适合 L1 长度控制。M3 如开启 prefix 复用，应先生成独立前缀的新列表，并用同一新列表重跑所有对照方案，不能直接沿用本列表解释 prefill 的优化收益。
 
@@ -179,7 +179,7 @@ wrapper 使用未修改的 vLLM 0.15.0 CLI 模块，统一传 `--temperature 0 -
 
 wrapper 默认另发 8 次 warmup，可显式覆盖 `--num-warmups`。这只是固定的实验控制值；应从日志/trace 确认正式测量期间是否仍发生编译，不能把预热充分当成已验证事实。
 
-wrapper 默认使用完整物化列表，校验 SHA256，并禁止请求数超出列表或由 bench 过采样。L1 默认运行一次，L2 每个速率默认运行五次，到达 seed 依次为 `seed + 0..4`，物化列表保持不变。文件名和 request id 前缀带 `-rep0` 等后缀，防止不同重复覆盖。比较方案使用同一组 seed，复跑时另建输出目录。可显式 `--repetitions 1` 做连通性检查，但不能将小样本 smoke test 当作尾延迟结论。
+wrapper 默认使用完整物化列表，自动核对列表与 manifest 一致，并禁止请求数超出列表或由 bench 过采样。L1 默认运行一次，L2 每个速率默认运行五次，到达 seed 依次为 `seed + 0..4`，物化列表保持不变。文件名和 request id 前缀带 `-rep0` 等后缀，防止不同重复覆盖。比较方案使用同一组 seed，复跑时另建输出目录。可显式 `--repetitions 1` 做连通性检查，但不能将小样本 smoke test 当作尾延迟结论。
 
 ShareGPT 默认每次 1000 请求增加了尾部样本，但不保证 P99 已稳定；应同时报告各次结果、样本数、失败数和运行间波动。LongBench 使用全部有效样本加多次到达，五次运行不会增加独立文本数；200 样本的一次 P99 仍接近最高两三个值。不要平均五个 P99 后称为一个统计稳定的 P99；需要时保留逐请求数据做合并描述，同时注明文本复用和到达重复，或在比较前固定更大的子集集合。
 

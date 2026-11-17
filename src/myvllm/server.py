@@ -16,11 +16,13 @@ import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
 import uvicorn
 
 from myvllm.config import load_config
 from myvllm.engine.llm_engine import LLMEngine
 from myvllm.engine.sequence import Sequence
+from myvllm.pd.http import GatewayError, PrefetchResponse, read_json_limited
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.utils.timing import write_record
 
@@ -233,28 +235,45 @@ def tokenize_request(tokenizer, body, chat):
     return tokenizer.encode(prompt)
 
 
-def create_app(config, model_name=None, engine_factory=LLMEngine):
+def create_app(config, model_name=None, engine_factory=LLMEngine, pd_worker=None):
     if config["world_size"] != 1:
         raise ValueError("HTTP serving requires world_size == 1")
     model_name = model_name or config["model_name_or_path"]
-    worker = EngineThread(config, engine_factory)
+    worker = pd_worker if pd_worker is not None else EngineThread(config, engine_factory)
 
     @asynccontextmanager
     async def lifespan(app):
-        worker.start()
-        await asyncio.to_thread(worker.ready.wait)
+        if pd_worker is not None:
+            await worker.start()
+        else:
+            worker.start()
+            await asyncio.to_thread(worker.ready.wait)
         try:
             yield
         finally:
-            await asyncio.to_thread(worker.close)
+            if pd_worker is not None:
+                await worker.close()
+            else:
+                await asyncio.to_thread(worker.close)
 
     app = FastAPI(lifespan=lifespan)
     app.state.worker = worker
 
     async def completion(request, chat):
         arrival = time.perf_counter()
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+
+        def record_admission_failure(status, reason):
+            try:
+                worker.record_admission_failure(request_id, arrival, status=status, reason=reason)
+            except GatewayError as exc:
+                raise HTTPException(exc.status, str(exc)) from exc
+
+        if pd_worker is not None and not worker.claim():
+            record_admission_failure(503, "PD gateway request capacity exhausted")
+            raise HTTPException(503, "PD gateway request capacity exhausted")
         try:
-            body = await request.json()
+            body = await read_json_limited(request, worker.max_request_bytes) if pd_worker is not None else await request.json()
             validate_request(body, model_name, chat)
             params = SamplingParams(
                 temperature=body.get("temperature", 1.0),
@@ -263,19 +282,50 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
                 max_model_length=config["max_model_length"],
             )
             token_ids = await asyncio.to_thread(tokenize_request, worker.engine.tokenizer, body, chat)
+        except GatewayError as exc:
+            if pd_worker is not None:
+                worker.unclaim()
+                record_admission_failure(exc.status, str(exc))
+            raise HTTPException(exc.status, str(exc)) from exc
         except ValueError as exc:
+            if pd_worker is not None:
+                worker.unclaim()
+                record_admission_failure(400, str(exc))
             raise HTTPException(400, str(exc)) from exc
-        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        except BaseException as exc:
+            if pd_worker is not None:
+                worker.unclaim()
+                cancelled = isinstance(exc, (asyncio.CancelledError, ClientDisconnect))
+                try:
+                    worker.record_admission_failure(
+                        request_id, arrival, status=None if cancelled else 500,
+                        reason=str(exc) or type(exc).__name__, cancelled=cancelled)
+                except GatewayError:
+                    logger.exception("PD gateway admission timing failed")
+            raise
         loop = asyncio.get_running_loop()
         pending = PendingRequest(
             request_id, token_ids, params,
             arrival, loop, loop.create_future(), asyncio.Queue(),
         )
-        worker.commands.put(("add", pending))
         try:
-            seq = await pending.admitted
+            if pd_worker is not None:
+                seq = worker.submit(pending)
+            else:
+                worker.commands.put(("add", pending))
+                seq = await pending.admitted
+        except GatewayError as exc:
+            if pd_worker is not None:
+                worker.unclaim()
+            raise HTTPException(exc.status, str(exc)) from exc
         except ValueError as exc:
+            if pd_worker is not None:
+                worker.unclaim()
             raise HTTPException(400, str(exc)) from exc
+        except BaseException:
+            if pd_worker is not None:
+                worker.unclaim()
+            raise
 
         async def events():
             decoder = IncrementalDecoder(worker.engine.tokenizer)
@@ -286,7 +336,10 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
             created = int(time.time())
             try:
                 while not completed:
-                    token, completed, reason = await pending.tokens.get()
+                    item = await pending.tokens.get()
+                    if isinstance(item, GatewayError):
+                        raise item
+                    token, completed, reason = item
                     emitted_tokens += 1
                     decode_start = time.perf_counter()
                     text = decoder.push(token, completed)
@@ -313,9 +366,18 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
                             "detokenize_ms": decode_ms, "send_ms": (sent - send_start) * 1000,
                             "completion_tokens": emitted_tokens,
                         }
+                        if pd_worker is not None:
+                            record.update(worker.timing_ids(seq.seq_id))
                         logger.info(json.dumps(record))
                         if config.get("timing_path"):
-                            write_record(config["timing_path"], record)
+                            try:
+                                write_record(config["timing_path"], record)
+                            except OSError as exc:
+                                if pd_worker is None:
+                                    raise
+                                first = False
+                                completed = False
+                                raise GatewayError(500, f"PD timing write failed: {exc}") from exc
                     first = False
                 if (body.get("stream_options") or {}).get("include_usage", False):
                     yield "data: " + json.dumps({
@@ -328,12 +390,18 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
                         },
                     }) + "\n\n"
                 yield "data: [DONE]\n\n"
+            except GatewayError as exc:
+                if first:
+                    raise
+                yield "data: " + json.dumps(exc.body()) + "\n\n"
             finally:
-                if not completed:
+                if pd_worker is not None:
+                    worker.finish(seq.seq_id, completed)
+                elif not completed:
                     worker.commands.put(("cancel", seq.seq_id))
 
         if body.get("stream", False):
-            return StreamingResponse(
+            return (PrefetchResponse if pd_worker is not None else StreamingResponse)(
                 events(), media_type="text/event-stream",
                 headers={"x-request-id": request_id, "cache-control": "no-cache"},
             )
@@ -344,7 +412,10 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
             completed = False
             try:
                 while not completed:
-                    token, completed, reason = await pending.tokens.get()
+                    item = await pending.tokens.get()
+                    if isinstance(item, GatewayError):
+                        raise item
+                    token, completed, reason = item
                     parts.append(decoder.push(token, completed))
                 choice = {"index": 0, "finish_reason": reason}
                 if chat:
@@ -358,11 +429,13 @@ def create_app(config, model_name=None, engine_factory=LLMEngine):
                               "completion_tokens": seq.num_completion_tokens, "total_tokens": seq.num_tokens},
                 })
             finally:
-                if not completed:
+                if pd_worker is not None:
+                    worker.finish(seq.seq_id, completed)
+                elif not completed:
                     worker.commands.put(("cancel", seq.seq_id))
 
         # A single JSON body also gets StreamingResponse's disconnect cancellation.
-        return StreamingResponse(
+        return (PrefetchResponse if pd_worker is not None else StreamingResponse)(
             whole_response(), media_type="application/json", headers={"x-request-id": request_id}
         )
 

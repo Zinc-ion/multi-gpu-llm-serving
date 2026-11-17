@@ -18,7 +18,7 @@ M0/M1 改动以最小 diff 方式叠加在上游基线之上，保留上游注�
 - `configs/qwen3_0_6b.json`
 - `configs/llama3_2_1b.json`
 
-每个配置固定模型和 tokenizer 的 Hub commit SHA、dtype、随机种子、采样参数、测试 prompt、并行规模、block 大小和 KV cache 容量上限。运行时会先按显存 profiling 计算可用 block，再取配置上限；实际容量可能小于配置值。实际运行时可通过 `--config` 选择配置；配置加载器会拒绝未固定的 revision。
+每个配置固定模型和 tokenizer revision、dtype、随机种子、采样参数、测试 prompt、并行规模、block 大小和 KV cache 容量上限。运行时会先按显存 profiling 计算可用 block，再取配置上限；实际容量可能小于配置值。实际运行时可通过 `--config` 选择配置；配置加载器会拒绝未固定的 revision。
 
 固定 seed 可复现同一软件/硬件环境中的随机数流，不代表不同 GPU、驱动或 kernel 版本之间逐位一致。
 

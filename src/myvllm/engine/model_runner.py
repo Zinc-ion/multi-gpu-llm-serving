@@ -1,37 +1,87 @@
 import math
 import json
 import torch
-import pickle
 import torch.distributed as dist
+from datetime import timedelta
 from pathlib import Path
+from multiprocessing import parent_process
 from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
 
 from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
+from myvllm.layers.attention import Attention
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.input_batch import build_prefill_batch
+from myvllm.engine.ipc import read_command, write_command, wait_for_consumption
 from myvllm.utils import *
-from myvllm.config import resolve_dtype, seed_everything
+from myvllm.config import resolve_dtype, resolve_fp8_prefill_compute_dtype, resolve_kv_cache_dtype, seed_everything
+from myvllm.pd.tp import export_tp_kv
 from myvllm.utils.timing import StepTimings
 
 class ModelRunner:
+    tp_command_timeout_s = 30
+    _worker_processes = ()
+
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
+        self._standalone_store = None
+        self.shm = None
+        had_process_group = dist.is_initialized()
+        try:
+            self._initialize(config, rank, event)
+        except BaseException:
+            try:
+                try:
+                    if self.shm is not None:
+                        self.shm.close()
+                finally:
+                    if not had_process_group and dist.is_initialized():
+                        dist.destroy_process_group()
+            finally:
+                self._standalone_store = None
+            raise
+
+    def _initialize(self, config: dict, rank: int, event: Event | list[Event]):
+        if config.get("_instance_resources") is None:
+            config["fp8_prefill_compute_dtype"] = resolve_fp8_prefill_compute_dtype(
+                config.get("fp8_prefill_compute_dtype", "float32"))
         self.config = config
         self.event = event
         self.timings = None
+        self._exited = False
+        self.tp_export_group = None
 
         # set distributed config
         self.block_size = config['block_size']
         self.world_size = config['world_size']
+        self.tp_command_timeout_s = config.get("tp_command_timeout_s", 30)
         self.enforce_eager = config.get('enforce_eager', False)
+        self.fp8_prefill_compute_dtype = config["fp8_prefill_compute_dtype"]
 
         self.rank = rank
         seed_everything(config.get('seed', 0))
-        torch.set_default_dtype(resolve_dtype(config.get('dtype', 'float32')))
-        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
+        model_dtype = resolve_dtype(config.get('dtype', 'float32'))
+        self.kv_cache_dtype = resolve_kv_cache_dtype(config.get('kv_cache_dtype', 'auto'), model_dtype)
+        torch.set_default_dtype(model_dtype)
+        resources = config.get("_instance_resources")
+        distributed_timeout = (
+            {"timeout": timedelta(seconds=self.tp_command_timeout_s)}
+            if self.world_size > 1 else {}
+        )
+        if resources is None:
+            if self.world_size != 1:
+                raise ValueError("Multi-rank ModelRunner requires engine instance resources")
+            self._standalone_store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)
+            # A failed process-group initialization may retain its store in the traceback.
+            store = dist.TCPStore("127.0.0.1", self._standalone_store.port, is_master=False)
+            shm = None
+        else:
+            port, shm = resources
+            store = dist.TCPStore("127.0.0.1", port, is_master=False, **distributed_timeout)
+        dist.init_process_group('nccl', store=store, world_size=config['world_size'], rank=rank, **distributed_timeout)
         torch.cuda.set_device(rank)
+        if config.get("_pd_tp_bulk"):
+            self.tp_export_group = dist.new_group(backend='gloo', timeout=timedelta(seconds=self.tp_command_timeout_s))
 
         # set model
         path_str = self.config['model_name_or_path']
@@ -75,6 +125,10 @@ class ModelRunner:
             case _:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                module.fp8_prefill_compute_dtype = self.fp8_prefill_compute_dtype
+
         # Load weights in GPU (model moved to GPU before loading weights)
         self.model = self.model.cuda(rank)
 
@@ -109,65 +163,60 @@ class ModelRunner:
         if config.get("timing_path") and self.rank == 0:
             self.timings = StepTimings()
 
-        # IMPORTANT: Set up shared memory and barrier AFTER all model initialization
+        # IMPORTANT: Enable shared memory and barrier AFTER all model initialization
         # This ensures both ranks complete warmup/allocation before rank 1 enters its event loop
         if self.world_size > 1:
-            # Synchronize before setting up shared memory
+            # Synchronize before using shared memory
             dist.barrier()
-            if self.rank == 0:
-                # Try to clean up existing shared memory first
-                try:
-                    old_shm = SharedMemory(name='myvllm')
-                    old_shm.close()
-                    old_shm.unlink()
-                except FileNotFoundError:
-                    pass  # Doesn't exist, which is fine
-                self.shm = SharedMemory(name='myvllm', create=True, size=2**20)
-                # Barrier to ensure rank 1 waits until shared memory is created
-                dist.barrier()
-            else:
-                # Wait for rank 0 to create shared memory
-                dist.barrier()
-                self.shm = SharedMemory(name='myvllm')
-                # Don't call self.loop() here - let the spawning code handle it
-                # Otherwise we'll be stuck in an infinite loop during __init__
+            self.shm = shm
+            # Wait until all ranks are ready before issuing calls.
+            dist.barrier()
+            # Don't call self.loop() here - let the spawning code handle it
+            # Otherwise we'll be stuck in an infinite loop during __init__
 
     # only use read when rank != 0
     def read_shm(self):
         assert self.world_size > 1 and self.rank != 0, "read_shm can only be called when world_size > 1 and rank != 0"
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[:4], 'little') # read length
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
-        return method_name, args
+        return read_command(self.shm, self.event, self.tp_command_timeout_s)
 
     # only use write when rank == 0
     def write_shm(self, method_name: str, args: tuple):
         assert self.world_size > 1 and self.rank == 0, "write_shm can only be called when world_size > 1 and rank == 0"
         # encode the length first
         # Flatten: (method_name, args) where args is a tuple -> (method_name, *args)
-        data = pickle.dumps((method_name, *args))
-        n = len(data)
-        self.shm.buf[:4] = n.to_bytes(4, 'little')
-        self.shm.buf[4:n+4] = data
-        for event in self.event:
-            event.set()
+        write_command(self.shm, self.event, method_name, args,
+                      self.tp_command_timeout_s, self._worker_processes)
 
     # close shared memory, destroy process group, delete graphs
     def exit(self):
-        if self.world_size > 1:
-            self.shm.close()
-            if self.rank == 0:
-                self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs
-            del self.graph_vars
-        torch.cuda.synchronize()
-        if self.timings:
-            self.timings.flush()
-        # Check if process group exists before destroying
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        if self._exited:
+            return
+        self._exited = True
+        try:
+            if self.world_size > 1:
+                self.shm.close()
+            if not self.enforce_eager:
+                del self.graphs
+                del self.graph_vars
+            torch.cuda.synchronize()
+            if self.timings:
+                self.timings.flush()
+        finally:
+            try:
+                try:
+                    if self.tp_export_group is not None:
+                        dist.destroy_process_group(self.tp_export_group)
+                        self.tp_export_group = None
+                finally:
+                    # Check if process group exists before destroying
+                    if dist.is_initialized():
+                        dist.destroy_process_group()
+            finally:
+                self._standalone_store = None
+
+    def export_pd_tp_kv(self, block_table, cached_tokens, spec):
+        return export_tp_kv(self.kv_cache, self.kv_cache_scales, block_table,
+                            cached_tokens, spec, self.rank, self.tp_export_group)
     
     # wait to read method and args from shared memory
     # execute the method with args
@@ -175,10 +224,15 @@ class ModelRunner:
     def loop(self):
         assert self.world_size > 1 and self.rank != 0, "loop can only be called when world_size > 1 and rank != 0"
         while True:
-            method_name, args = self.read_shm()
+            try:
+                method_name, args = self.read_shm()
+            except TimeoutError:
+                parent = parent_process()
+                if parent is not None and not parent.is_alive():
+                    raise RuntimeError("TP engine parent exited")
+                continue
             self.call(method_name, *args) # Unpack args when calling
             if method_name == 'exit':
-                self.exit()
                 break
 
     # will be called by both rank == 0 and rank != 0
@@ -187,6 +241,8 @@ class ModelRunner:
     def call(self, method_name: str, *args: dict):
         if self.world_size > 1 and self.rank == 0: # will be called in main engine
             self.write_shm(method_name, args)
+            wait_for_consumption(self.event, self.tp_command_timeout_s,
+                                 self._worker_processes, exiting=method_name == "exit")
         method = getattr(self, method_name, None)
         if method:
             return method(*args)
@@ -224,7 +280,10 @@ class ModelRunner:
 
         # check whether the current free memory can hold at least one block
         # compute the actual byte required of each block
-        block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
+        block_elements = self.block_size * 2 * num_layers * num_kv_heads
+        data_block_bytes = block_elements * head_dim * self.kv_cache_dtype.itemsize
+        scale_block_bytes = block_elements * torch.float32.itemsize if self.kv_cache_dtype == torch.float8_e4m3fn else 0
+        block_bytes = data_block_bytes + scale_block_bytes
         num_available_kv_blocks = min(int(available_mem // block_bytes), self.config['max_cached_blocks'])
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
         
@@ -266,6 +325,9 @@ class ModelRunner:
                 "warmup_peak_allocated_bytes": peak_mem_usage,
                 "current_allocated_bytes": current_mem_usage,
                 "warmup_extra_bytes": peak_mem_usage - current_mem_usage,
+                "model_dtype": str(self.default_dtype).removeprefix("torch."),
+                "kv_cache_dtype": str(self.kv_cache_dtype).removeprefix("torch."),
+                "data_block_bytes": data_block_bytes, "scale_block_bytes": scale_block_bytes,
                 "block_bytes": block_bytes, "block_count": self.config['max_cached_blocks'],
                 "kv_token_capacity": self.config['max_cached_blocks'] * self.block_size,
             }), flush=True)
@@ -273,12 +335,19 @@ class ModelRunner:
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, dtype=self.kv_cache_dtype, device=f'cuda:{self.rank}')
+        self.kv_cache = allocated_kv_cache
+        self.kv_cache_scales = None
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
+            self.kv_cache_scales = torch.ones(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, dtype=torch.float32, device=f'cuda:{self.rank}')
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
                 module.k_cache = allocated_kv_cache[0, layer_id]
                 module.v_cache = allocated_kv_cache[1, layer_id]
+                if self.kv_cache_scales is not None:
+                    module.k_scale_cache = self.kv_cache_scales[0, layer_id]
+                    module.v_scale_cache = self.kv_cache_scales[1, layer_id]
                 layer_id += 1
 
     # given seqs
@@ -389,6 +458,7 @@ class ModelRunner:
     # run model
     # sample logits
     # reset context
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if self.timings:
             self.timings.prepare()
@@ -399,7 +469,24 @@ class ModelRunner:
         if self.timings:
             self.timings.end_gpu("h2d")
             self.timings.start_gpu("forward")
-        logits = self.run_model(input_ids, is_prefill)
+        transfers = getattr(self, "layer_transfers", None)
+        active_transfers = [transfers[seq.seq_id] for seq in seqs if seq.seq_id in transfers] if transfers else []
+        hooks = []
+        if active_transfers:
+            for layer_id, layer in enumerate(self.model.model.layers):
+                def layer_ready(module, args, output, layer_id=layer_id):
+                    for transfer in active_transfers:
+                        transfer.on_layer(layer_id)
+                hooks.append(layer.register_forward_hook(layer_ready))
+        try:
+            logits = self.run_model(input_ids, is_prefill)
+        finally:
+            for hook in hooks:
+                hook.remove()
+            # postprocess may release the source blocks for a terminal first token.
+            # Socket sends only retain host slots after these D2H reads complete.
+            for transfer in active_transfers:
+                transfer.drain_copies()
         if self.timings:
             self.timings.end_gpu("forward")
         # only sample when rank == 0

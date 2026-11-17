@@ -38,6 +38,12 @@ def resolve_kv_cache_dtype(name: str, model_dtype: torch.dtype) -> torch.dtype:
     raise ValueError(f"Unsupported kv_cache_dtype: {name}")
 
 
+def resolve_fp8_prefill_compute_dtype(name: str) -> str:
+    if name not in ("float32", "query"):
+        raise ValueError(f"Unsupported fp8_prefill_compute_dtype: {name}")
+    return name
+
+
 def load_config(path: str | Path) -> dict:
     with Path(path).expanduser().open(encoding="utf-8") as file_handle:
         config = json.load(file_handle)

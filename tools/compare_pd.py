@@ -145,9 +145,13 @@ def cache_format(runner, config):
             raise ValueError("Requested FP8 KV cache was not allocated with matching FP32 scales")
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {requested}")
+    prefill_mode = getattr(runner, "fp8_prefill_compute_dtype", "float32")
+    if requested == "float8_e4m3fn" and prefill_mode != config.get("fp8_prefill_compute_dtype", "float32"):
+        raise ValueError("Actual FP8 prefill compute dtype does not match configuration")
     return {"requested": requested, "dtype": str(cache.dtype), "pool_shape": list(cache.shape),
             "device": str(cache.device), "scale_dtype": str(scales.dtype) if scales is not None else None,
-            "scale_pool_shape": list(scales.shape) if scales is not None else None}
+            "scale_pool_shape": list(scales.shape) if scales is not None else None,
+            "fp8_prefill_compute_dtype": prefill_mode}
 
 
 def snapshot_kv(runner, seq, valid_tokens):
@@ -341,6 +345,10 @@ def read_inputs(args):
             raise ValueError(f"Different {field} in capture configs")
     if len({config.get("kv_cache_dtype", "auto") for config in configs.values()}) != 1:
         raise ValueError("Reference/P/D must request the same KV format")
+    if configs["reference"].get("kv_cache_dtype", "auto") == "float8_e4m3fn":
+        modes = [config.get("fp8_prefill_compute_dtype", "float32") for config in configs.values()]
+        if any(mode not in ("float32", "query") for mode in modes) or len(set(modes)) != 1:
+            raise ValueError("Reference/P/D must use the same FP8 prefill compute dtype")
     manifest = json.loads(Path(args.prompts).read_text())
     for field in ("model_revision", "tokenizer_revision"):
         if manifest[field] != configs["reference"][field]:
@@ -628,6 +636,10 @@ def compare_role_metadata(root):
         for field in ("requested", "dtype", "scale_dtype"):
             if info[role]["cache"][field] != info["reference"]["cache"][field]:
                 raise ValueError(f"Actual KV cache {field} differs for {role}")
+        if (info["reference"]["cache"]["requested"] == "float8_e4m3fn"
+                and info[role]["cache"].get("fp8_prefill_compute_dtype", "float32")
+                != info["reference"]["cache"].get("fp8_prefill_compute_dtype", "float32")):
+            raise ValueError(f"Actual FP8 prefill compute dtype differs for {role}")
     return info
 
 
@@ -650,6 +662,10 @@ async def run_requests(args, root, cases, config, endpoints, info, roles, manife
         raise ValueError("Worker connection limits do not match the case-count budget")
     if pi["role"] != "prefill" or di["role"] != "decode" or pi["model"] != di["model"]:
         raise ValueError("P/D worker roles or model specifications differ")
+    if info["reference"]["cache"]["requested"] == "float8_e4m3fn":
+        expected_mode = info["reference"]["cache"].get("fp8_prefill_compute_dtype", "float32")
+        if any(worker.get("fp8_prefill_compute_dtype", "float32") != expected_mode for worker in (pi, di)):
+            raise ValueError("Worker FP8 prefill compute dtype differs from reference")
     for index, case in enumerate(cases):
         p = d = None
         params = SamplingParams(temperature=0, max_tokens=args.max_tokens,
@@ -743,6 +759,7 @@ def capture(args):
     })
     roles = {}
     manifest = {"status": "running", "completed_cases": [], "error": None, "cleanup_errors": [],
+                "fp8_prefill_compute_dtype": configs["reference"].get("fp8_prefill_compute_dtype", "float32"),
                 "limitations": ["capture only; no approved gate implied", "unflushed data and power-fail durability are not guaranteed",
                                 "controller SIGKILL or host failure can leave its processes running"]}
     update_manifest(root, manifest, roles)
@@ -788,6 +805,8 @@ def capture(args):
         update_manifest(root, manifest, roles)
         wait_for_file(root / "prefill.ready.json", roles["prefill"], args.startup_timeout)
         info = compare_role_metadata(root)
+        manifest["actual_fp8_prefill_compute_dtype"] = info["reference"]["cache"].get(
+            "fp8_prefill_compute_dtype", "float32")
         endpoints = {role: tuple(json.loads((root / f"{role}.ready.json").read_text())["endpoint"])
                      for role in ("prefill", "decode")}
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -843,6 +862,20 @@ def analyze_data(baseline, candidate, freeze):
             raise ValueError(f"Different {field}")
     if baseline["metadata"]["config"].get("kv_cache_dtype", "auto") != candidate["metadata"]["config"].get("kv_cache_dtype", "auto"):
         raise ValueError("Different KV cache formats")
+    if baseline["metadata"]["config"].get("kv_cache_dtype", "auto") == "float8_e4m3fn":
+        modes = [run["metadata"]["config"].get("fp8_prefill_compute_dtype", "float32")
+                 for run in (baseline, candidate)]
+        if any(mode not in ("float32", "query") for mode in modes) or modes[0] != modes[1]:
+            raise ValueError("Different FP8 prefill compute dtypes")
+        for run in (baseline, candidate):
+            if (modes[0] == "query" and
+                    (run["metadata"].get("cache") is None or
+                     run["metadata"].get("role") == "prefill+decode" and
+                     run["metadata"].get("decode_cache") is None)):
+                raise ValueError("Query FP8 comparison requires actual prefill compute metadata")
+            for cache in (run["metadata"].get("cache"), run["metadata"].get("decode_cache")):
+                if cache is not None and cache.get("fp8_prefill_compute_dtype", "float32") != modes[0]:
+                    raise ValueError("Actual FP8 prefill compute dtype differs from configuration")
     if baseline["metadata"].get("sampling") != candidate["metadata"].get("sampling"):
         raise ValueError("Different sampling settings")
     reference_cache = baseline["metadata"].get("cache")

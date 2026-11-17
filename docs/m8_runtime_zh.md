@@ -124,7 +124,7 @@ finally:
 
 网关在每次选择前使用最近的 P、D owner 统计。统计请求有 `poll_timeout_s`，年龄从请求发出时开始保守计算，包含往返；查询失败会移除该样本，缺失或超过 `max_sample_age_s` 的 worker 暂不参与选路，没有合格路径时返回 503，不自动重试。P 按未计算 prompt token 和已接纳请求数排序；D 按完整输出预算的逻辑 block、resident 和连接上限筛选，再按 block 和 resident 排序。远端请求还检查两端现有传输预留加本请求按 block 填充的 KV payload 是否在各自上限内；单 token 终态路径不需要 KV 交接。
 
-load 模式按实际 JSON/UTF-8 编码检查选路时已知的请求字段和控制帧长度下界，最终发送时再次检查所选 worker 的 `max_header_bytes`。实际 lifetime、P 序号和首 token 在选路时尚未确定，因此 header 余量极小时，最终帧仍可能超限，即使另一条 edge 有足够空间；此时不会自动迁移请求。部署时需为控制帧留出足够余量。
+load 模式按实际 JSON/UTF-8 编码检查选路时已知的请求字段和控制帧长度下界：P open/prepare 请求受 P 入站 `max_header_bytes` 限制，P metadata 响应受客户端 1 MiB 上限限制，D reserve/commit 请求受 D 入站上限限制。worker 的正常及错误响应使用 1 MiB 公共上限，入站请求仍受其配置上限限制。info 缺少 `fp8_prefill_compute_dtype` 的旧 worker 可能同时用入站上限限制响应，选路对它的 P metadata 响应保守使用该较小上限；带字段的 worker 按公共响应上限估算。该字段本身并非响应能力声明，带字段但仍使用旧响应上限的未接收试验版本不应混用。最终发送时再次检查所选 worker 的入站上限。实际 lifetime、P 序号和首 token 在选路时尚未确定，因此 header 余量极小时，最终帧仍可能超限，即使另一条 edge 有足够空间；此时不会自动迁移请求。部署时需为控制帧留出足够余量。
 
 请求提交时同步预订 P token、D 逻辑 block/resident、两端传输字节及连接槽，且受网关活动请求数限制。每次成功采样只撤销该次轮询发出前已由 owner 接纳的对应 booking，之后的 booking 与样本相加；采样在途期间可能暂时重复计数，因此可能保守拒绝请求，后续样本会消除已覆盖的重复。外部客户端在采样后的新请求仍可能使估计落后；最终 block、连接和传输 admission 由 worker owner 决定，拒绝不会自动迁移。取消、失败或关闭时尚未消账的 booking 会释放。
 
@@ -208,6 +208,8 @@ uv run python tools/analyze_trace.py --plan "$PLAN_JSONL" --run-dir "$RUN_DIR" -
 `tools/compare_pd.py` 供正确性诊断，reference 和 D 要求 `world_size=1`，bulk P 可为 TP1 或 TP2；TP2 P 的 `--prefill-gpu` 显式传两个不同的物理 GPU index（如 `0,1`）或两个 UUID，且不能使用 `--raw-kv`。TP2 的 rank 0 cache 快照仅包含局部 head，不作为全局 KV；全头字节通过上述交接测试单独核对。实际 engine 从指定 Git checkout 导入并核对完整 SHA，每个模型进程分别记录导入路径、被跟踪源码哈希、源码状态、实际 KV/scale 格式和输入及运行时配置。harness 的路径和哈希另记。三个实例必须使用相同模型、架构、精度、EOS 和总长度。各模型 step 显式在 `torch.inference_mode()` 下执行，采样保持 greedy。reference 每例完成后保存，且进程已退出后才启动 D、P。
 
 捕获按 case 串行，reference 直接运行而不是 worker；P 和 D worker 各使用 `max(1, case 数)` 的有限连接预算。旧 M5 的 close ACK 可能早于网络 session 计数释放；最多每例各创建一个 session，case 数预算允许先前 session 尚未释放，不增加并行模型请求。捕获目录的 `worker-info.json` 原子保存实际查询到的两端 info、预算和原因；这只用于诊断兼容，不修补旧 M5、证明其资源验收或补填 B0/B1/B2 性能数据。
+
+FP8 的 `fp8_prefill_compute_dtype` 默认为 `float32`，可显式设置 `query`，计算和舍入差异见 [M7 runtime](m7_runtime_zh.md)。`tools/prepare_pd.py` 从 base config 传播该选项到 P、D、gateway model 和 whole/chunk control 配置，并记录到 manifest；worker info 报告实际 engine 配置。固定和负载路由启动及 ready 检查拒绝同一 FP8 部署的模式不一致；旧 info 缺字段视为 `float32`。直接 bulk 和 early 交接也在 D 预留前按 model spec 核对计算策略。`query` 影响 paged prefill batch 的所有行，包括混排的 decode；独立 decode kernel 不受该选项影响。独立 PD capture/analyze 同样要求 FP8 reference、P、D 模式一致，记录实际 runner 与 worker 模式；配置为 `query` 但旧 engine 没有实现该模式时不能当作 query 路径。`float32` 和 `query` 的独立算术比较应分开标记，不能称为同模式的 PD 无损验收。
 
 每例保留原始 `prompt` 和 `input_ids`，模型输入始终以原 ID 为准（token IDs authoritative），不重新编码替换。三方实际 tokenizer 的身份、`encode(prompt)` 和 `decode(input_ids)` 观测必须一致。若 `encode(prompt)==input_ids`，正常接受；否则仅当 `decode(input_ids)==prompt` 时允许，适配 `compare_hf.py prepare` 先截断 ID、再解码文本的表示。截断多字节字符可生成 `�`，使文本无法重新编码回原 ID；各角色 `*.engine.json` 的 `tokenizer` 记录 `input_decodings`、两种关系的布尔值及 `lossy_nonroundtrip=true`。该标记表示文本相对原 ID 的非往返表示，不改变实际模型输入。编码和解码关系均不匹配时拒绝；这项边界不构成模型数值一致性结论。
 

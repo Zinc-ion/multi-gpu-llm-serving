@@ -27,8 +27,11 @@ def cache_spec(config):
     dtype = resolve_kv_cache_dtype(config.get("kv_cache_dtype", "auto"),
                                    resolve_dtype(config.get("dtype", "float32")))
     if dtype == torch.float8_e4m3fn:
-        return {"dtype": "float8_e4m3fn", "scale_dtype": "float32",
+        spec = {"dtype": "float8_e4m3fn", "scale_dtype": "float32",
                 "scale_granularity": "token_head"}
+        if config.get("fp8_prefill_compute_dtype", "float32") == "query":
+            spec["fp8_prefill_compute_dtype"] = "query"
+        return spec
     return None
 
 

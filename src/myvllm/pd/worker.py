@@ -191,6 +191,7 @@ class _Owner:
             "enable_chunked_prefill": scheduler.enable_chunked_prefill,
             "local_prefill_enabled": self.worker.role == "decode" and scheduler.enable_chunked_prefill,
             "enforce_eager": self.engine.config.get("enforce_eager", False),
+            "fp8_prefill_compute_dtype": self.engine.config.get("fp8_prefill_compute_dtype", "float32"),
             "world_size": self.engine.config["world_size"],
             "max_socket_connections": self.worker.max_socket_connections,
             "pipeline_frame_bytes": self.worker.pipeline_frame_bytes,
@@ -732,7 +733,7 @@ class PDWorker:
             completed = False
             try:
                 await write_frame(writer, {"op": "claim", "session_id": session_id})
-                response, size = await read_header(reader, self.max_header_bytes, 0)
+                response, size = await read_header(reader, DEFAULT_HEADER_LIMIT, 0)
                 if size or response.get("ok") is not True or response.get("value") is not True:
                     raise ProtocolError("Decode session claim rejected")
                 completed = True
@@ -903,8 +904,7 @@ class PDWorker:
                         self.sessions -= 1
                         session = False
                     try:
-                        await write_frame(writer, {"ok": True, "value": value}, output,
-                                          max_header_bytes=self.max_header_bytes)
+                        await write_frame(writer, {"ok": True, "value": value}, output)
                     finally:
                         output = None
                     if ctx.response_done is not None:
@@ -916,8 +916,7 @@ class PDWorker:
             cleanup_reason = str(exc)
             if not writer.is_closing():
                 try:
-                    await write_frame(writer, {"ok": False, "error": type(exc).__name__, "message": str(exc)},
-                                      max_header_bytes=self.max_header_bytes)
+                    await write_frame(writer, {"ok": False, "error": type(exc).__name__, "message": str(exc)})
                     graceful = True
                 except (ConnectionError, OSError):
                     pass

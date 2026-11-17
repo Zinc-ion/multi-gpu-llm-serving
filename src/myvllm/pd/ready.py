@@ -7,7 +7,7 @@ import json
 import httpx
 
 from myvllm.pd.client import PDClient
-from myvllm.pd.gateway import PDGateway, _validate_load_edge, _validate_load_worker, _validate_worker_role, _worker_payload_limit
+from myvllm.pd.gateway import PDGateway, _validate_fp8_prefill_mode, _validate_load_edge, _validate_load_worker, _validate_worker_role, _worker_payload_limit
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT
 
 
@@ -26,6 +26,7 @@ async def check(settings, base_url):
             role = "prefill" if endpoint in prefills else "decode"
             info = inventory[endpoint]
             _validate_load_worker(info, role, settings["request_timeout"], settings["max_payload_bytes"])
+            _validate_fp8_prefill_mode(info, infos[0].get("fp8_prefill_compute_dtype", "float32"))
             if (info["model"] != infos[0]["model"]
                     or info["max_model_length"] != infos[0]["max_model_length"]):
                 raise ValueError("Incompatible model or length in worker inventory")
@@ -46,13 +47,17 @@ async def check(settings, base_url):
         pairs = [{"prefill": inventory[tuple(pair["prefill"])],
                   "decode": inventory[tuple(pair["decode"])]} for pair in settings["pairs"]]
     else:
+        prefill_mode = None
         for pair in settings["pairs"]:
             p, d = await asyncio.gather(PDClient.info(tuple(pair["prefill"])),
                                         PDClient.info(tuple(pair["decode"])))
+            if prefill_mode is None:
+                prefill_mode = p.get("fp8_prefill_compute_dtype", "float32")
             if p["role"] != "prefill" or d["role"] != "decode" or p["decode_endpoint"] != pair["decode"]:
                 raise ValueError("Worker role or fixed pair does not match configuration")
             for info, role in ((p, "prefill"), (d, "decode")):
                 _validate_worker_role(info, role, legacy_fixed=True)
+                _validate_fp8_prefill_mode(info, prefill_mode)
                 if _worker_payload_limit(info) > settings["max_payload_bytes"]:
                     raise ValueError(f"{role} worker body limit exceeds gateway payload limit")
             pairs.append({"prefill": p, "decode": d})

@@ -10,11 +10,12 @@ from multiprocessing.synchronize import Event
 from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
+from myvllm.layers.attention import Attention
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.input_batch import build_prefill_batch
 from myvllm.engine.ipc import read_command, write_command, wait_for_consumption
 from myvllm.utils import *
-from myvllm.config import resolve_dtype, resolve_kv_cache_dtype, seed_everything
+from myvllm.config import resolve_dtype, resolve_fp8_prefill_compute_dtype, resolve_kv_cache_dtype, seed_everything
 from myvllm.pd.tp import export_tp_kv
 from myvllm.utils.timing import StepTimings
 
@@ -41,6 +42,9 @@ class ModelRunner:
             raise
 
     def _initialize(self, config: dict, rank: int, event: Event | list[Event]):
+        if config.get("_instance_resources") is None:
+            config["fp8_prefill_compute_dtype"] = resolve_fp8_prefill_compute_dtype(
+                config.get("fp8_prefill_compute_dtype", "float32"))
         self.config = config
         self.event = event
         self.timings = None
@@ -52,6 +56,7 @@ class ModelRunner:
         self.world_size = config['world_size']
         self.tp_command_timeout_s = config.get("tp_command_timeout_s", 30)
         self.enforce_eager = config.get('enforce_eager', False)
+        self.fp8_prefill_compute_dtype = config["fp8_prefill_compute_dtype"]
 
         self.rank = rank
         seed_everything(config.get('seed', 0))
@@ -119,6 +124,10 @@ class ModelRunner:
                 )
             case _:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
+
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                module.fp8_prefill_compute_dtype = self.fp8_prefill_compute_dtype
 
         # Load weights in GPU (model moved to GPU before loading weights)
         self.model = self.model.cuda(rank)

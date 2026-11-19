@@ -109,6 +109,8 @@ finally:
   "poll_interval_s": 0.1,
   "poll_timeout_s": 1,
   "max_sample_age_s": 2,
+  "route_queue_size": 4,
+  "route_wait_timeout_s": 15,
   "elastic": {
     "enabled": true,
     "prefill_backlog_tokens": 1024,
@@ -124,7 +126,9 @@ finally:
 
 启动时网关逐个核对实际 worker 的角色、模型及 KV 格式、长度、TP、超时、连接数与协议限制，并对每条允许的 edge 检查 P/D 实际采样种子不能相等。load 模式不要求固定 pair 的 XOR 关系。worker 的 `info` 目前没有独立协议版本字段；上述检查依赖同一候选的 worker 实现，D 在实际 reserve 时仍校验 metadata 版本和格式，不能用此启动检查证明任意不同版本二进制兼容。`myvllm.pd.ready --workers-only` 对 load inventory 和所有允许的 edge 使用相同的 worker/edge 条件，但没有网关模型配置，不能替代网关自身的模型核对。
 
-网关在每次选择前使用最近的 P、D owner 统计。统计请求有 `poll_timeout_s`，年龄从请求发出时开始保守计算，包含往返；查询失败会移除该样本，缺失或超过 `max_sample_age_s` 的 worker 暂不参与选路，没有合格路径时返回 503，不自动重试。P 按未计算 prompt token 和已接纳请求数排序；D 按完整输出预算的逻辑 block、resident 和连接上限筛选，再按 block 和 resident 排序。远端请求还检查两端现有传输预留加本请求按 block 填充的 KV payload 是否在各自上限内；单 token 终态路径不需要 KV 交接。
+网关在每次选择前使用最近的 P、D owner 统计。统计请求有 `poll_timeout_s`，年龄从请求发出时开始保守计算，包含往返；查询失败会移除该样本，缺失或超过 `max_sample_age_s` 的 worker 暂不参与选路。P 按未计算 prompt token 和已接纳请求数排序；D 按完整输出预算的逻辑 block、resident 和连接上限筛选，再按 block 和 resident 排序。远端请求还检查两端现有传输预留加本请求按 block 填充的 KV payload 是否在各自上限内；单 token 终态路径不需要 KV 交接。
+
+load 模式可设置 `route_queue_size` 开启按到达顺序的有界等待，默认为 0。暂时没有合格路径时，队首在 worker 统计刷新或网关释放预留后重新选路。排队期间占用 `max_active_requests` 的入口名额。已知单条请求放不下、等待队列已满或超过 `route_wait_timeout_s`（默认同 `request_timeout`）时返回 503。客户端断开会释放排队位置。阶段日志中 `pd_gateway_queued` 表示开始等待，`pd_gateway_assigned.route_wait_ms` 表示成功选路前的等待时间，客户端 TTFT 包含这个区间。此处沿用 [vLLM V1 调度器](https://github.com/vllm-project/vllm/blob/v0.15.0/vllm/v1/core/sched/scheduler.py#L496-L520) 暂时缺少资源时保留请求的语义，并将跨 P/D 的等待放在选路网关。
 
 load 模式按实际 JSON/UTF-8 编码检查选路时已知的请求字段和控制帧长度下界：P open/prepare 请求受 P 入站 `max_header_bytes` 限制，P metadata 响应受客户端 1 MiB 上限限制，D reserve/commit 请求受 D 入站上限限制。worker 的正常及错误响应使用 1 MiB 公共上限，入站请求仍受其配置上限限制。info 缺少 `fp8_prefill_compute_dtype` 的旧 worker 可能同时用入站上限限制响应，选路对它的 P metadata 响应保守使用该较小上限；带字段的 worker 按公共响应上限估算。该字段本身并非响应能力声明，带字段但仍使用旧响应上限的未接收试验版本不应混用。最终发送时再次检查所选 worker 的入站上限。实际 lifetime、P 序号和首 token 在选路时尚未确定，因此 header 余量极小时，最终帧仍可能超限，即使另一条 edge 有足够空间；此时不会自动迁移请求。部署时需为控制帧留出足够余量。
 

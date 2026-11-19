@@ -19,6 +19,37 @@ SHAREGPT_REVISION = "192ab2185289094fc556ec8ce5ce1e8e587154ca"
 LONGBENCH_REVISION = "5e628be450b7e67fb7ae6e201bd6d8f7056f7672"
 
 
+def random_examples(tokenizer, rng, input_length, num_requests):
+    # Use seeded vocabulary offsets as in vLLM 0.15.0 RandomDataset. Match
+    # the serving tokenizer after decoding, since text can merge BPE tokens.
+    specials = set(tokenizer.all_special_ids)
+    allowed = [token for token in range(tokenizer.vocab_size) if token not in specials]
+    if not allowed or input_length <= 0:
+        raise ValueError("Random inputs require a positive length and non-special vocabulary tokens")
+    seen = set()
+    examples = []
+    for index in range(num_requests):
+        offset = rng.randrange(len(allowed)) + index
+        ids = [allowed[(offset + step) % len(allowed)] for step in range(input_length)]
+        for _ in range(11):
+            prompt = tokenizer.decode(ids, clean_up_tokenization_spaces=False)
+            encoded = tokenizer.encode(prompt)
+            key = tuple(encoded)
+            has_special = not specials.isdisjoint(encoded)
+            if len(encoded) == input_length and not has_special and key not in seen:
+                seen.add(key)
+                examples.append((prompt, None))
+                break
+            if key in seen or has_special:
+                ids = rng.choices(allowed, k=input_length)
+            else:
+                ids = encoded[:input_length]
+                ids.extend(rng.choices(allowed, k=input_length - len(ids)))
+        else:
+            raise ValueError(f"Could not generate distinct random prompt {index + 1} with {input_length} tokens")
+    return examples
+
+
 def materialize(args):
     if args.output_tokens is not None and args.output_tokens <= 0:
         raise ValueError("output_tokens must be positive")
@@ -58,15 +89,10 @@ def materialize(args):
         examples = [(row["context"] + "\n\n" + row["input"], None) for row in rows]
         source.update(revision=LONGBENCH_REVISION, file=path, subset=args.subset)
     else:
-        # Byte-level tokenization of this fixed motif gives an exact token-count check.
-        ids = tokenizer.encode("Measurements of inference systems require reproducible inputs. " * (args.input_length // 6 + 1))
-        if len(ids) < args.input_length:
-            raise ValueError("Synthetic motif is shorter than requested input")
-        prompt = tokenizer.decode(ids[:args.input_length], clean_up_tokenization_spaces=False)
-        if len(tokenizer.encode(prompt)) != args.input_length:
-            raise ValueError("Synthetic prompt failed exact token-length round trip")
-        examples = [(prompt, None)] * num_requests
-        source["input_length"] = args.input_length
+        if args.input_length + (args.output_tokens or 128) > config["max_model_length"]:
+            raise ValueError("Random input and output lengths exceed max_model_length")
+        examples = random_examples(tokenizer, rng, args.input_length, num_requests)
+        source.update(input_length=args.input_length, generator="token_offsets")
     rng.shuffle(examples)
     selected = []
     rejected = 0

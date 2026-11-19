@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from collections import deque
 from dataclasses import asdict
 import json
 import logging
@@ -10,6 +11,7 @@ import time
 import uuid
 from types import SimpleNamespace
 
+from starlette.requests import ClientDisconnect
 from transformers import AutoTokenizer
 import uvicorn
 
@@ -23,6 +25,11 @@ from myvllm.utils.timing import write_record
 
 
 logger = logging.getLogger("myvllm.pd.gateway")
+
+
+class _RouteUnavailable(GatewayError):
+    def __init__(self):
+        super().__init__(503, "No fresh PD route with estimated capacity")
 
 
 def _endpoint(value):
@@ -217,6 +224,16 @@ class PDGateway:
         if (type(self.request_timeout) not in (int, float) or not math.isfinite(self.request_timeout)
                 or self.request_timeout <= 0):
             raise ValueError("request_timeout must be a positive finite number")
+        self.route_queue_size = settings.get("route_queue_size", 0)
+        if type(self.route_queue_size) is not int or self.route_queue_size < 0:
+            raise ValueError("route_queue_size must be a nonnegative integer")
+        if self.route_queue_size and self.routing_mode != "load":
+            raise ValueError("route_queue_size requires load routing")
+        self.route_wait_timeout_s = settings.get("route_wait_timeout_s", self.request_timeout)
+        if (type(self.route_wait_timeout_s) not in (int, float) or not math.isfinite(self.route_wait_timeout_s)
+                or self.route_wait_timeout_s <= 0):
+            raise ValueError("route_wait_timeout_s must be a positive finite number")
+        self.route_waiters = deque()
         self.requests = {}
         self.claimed = 0
         self.staging_bytes = 0
@@ -318,6 +335,7 @@ class PDGateway:
                     self._release_booking(entry, role + "_connection")
 
         await asyncio.gather(*(sample(endpoint) for endpoint in self.prefills + self.decodes))
+        self._wake_route_waiter()
 
     async def _poll(self):
         while True:
@@ -330,13 +348,58 @@ class PDGateway:
             return None
         return sample
 
-    def _select_load(self, pending, pipeline):
-        now = time.monotonic()
+    def _route_requirements(self, pending):
         limit = pending.params.max_model_length or self.config["max_model_length"]
         blocks = math.ceil(min(len(pending.token_ids) + pending.params.max_tokens, limit)
                            / self.config["block_size"])
         transfer_bytes = (payload_nbytes(self.infos[self.prefills[0]]["model"], len(pending.token_ids))
                           if pending.params.max_tokens > 1 and len(pending.token_ids) + 1 < limit else 0)
+        return limit, blocks, transfer_bytes
+
+    def _remote_limits_fit(self, pending, pipeline, pe, de, sampling, transfer_bytes, pmeta, dmeta):
+        pi, di = self.infos[pe], self.infos[de]
+        popen = _header_bytes({
+            "op": "prepare_p" if pipeline else "open_p", "lifetime": .1,
+            "session_id": "0" * 32, "request_id": pending.request_id,
+            "token_ids": pending.token_ids, "sampling": sampling, "decode_endpoint": de,
+        })
+        p_response_limit = (DEFAULT_HEADER_LIMIT if "fp8_prefill_compute_dtype" in pi
+                            else min(pi["max_header_bytes"], DEFAULT_HEADER_LIMIT))
+        p_payload_limit = pi.get("max_payload_bytes", pi["max_transfer_bytes"])
+        d_payload_limit = di.get("max_payload_bytes", di["max_transfer_bytes"])
+        return (transfer_bytes <= min(p_payload_limit, d_payload_limit, self.max_payload_bytes)
+                and popen <= min(pi["max_header_bytes"], DEFAULT_HEADER_LIMIT)
+                and pmeta <= p_response_limit
+                and dmeta <= min(di["max_header_bytes"], DEFAULT_HEADER_LIMIT))
+
+    def _fits_idle_route(self, pending, pipeline):
+        limit, blocks, transfer_bytes = self._route_requirements(pending)
+        sampling = asdict(pending.params)
+        prompt_blocks = math.ceil(len(pending.token_ids) / self.config["block_size"])
+        local_header = _header_bytes({
+            "op": "open_local", "lifetime": .1, "request_id": pending.request_id,
+            "token_ids": pending.token_ids, "sampling": sampling,
+        }) if self.elastic["enabled"] else 0
+        for pe, decodes in self.edges.items():
+            psample = self.samples.get(pe)
+            pmeta, dmeta = (_metadata_header_bounds(pending, self.infos[pe], limit, pipeline)
+                            if transfer_bytes else (0, 0))
+            for de in decodes:
+                dsample = self.samples.get(de)
+                if dsample is not None and blocks > dsample[0]["total_blocks"]:
+                    continue
+                di = self.infos[de]
+                if (self.elastic["enabled"] and di["local_prefill_enabled"]
+                        and local_header <= min(di["max_header_bytes"], DEFAULT_HEADER_LIMIT)):
+                    return True
+                if (psample is None or prompt_blocks <= psample[0]["total_blocks"]) and self._remote_limits_fit(
+                        pending, pipeline, pe, de, sampling, transfer_bytes, pmeta, dmeta):
+                    return True
+        return False
+
+    def _select_load(self, pending, pipeline):
+        now = time.monotonic()
+        limit, blocks, transfer_bytes = self._route_requirements(pending)
         prompt_blocks = math.ceil(len(pending.token_ids) / self.config["block_size"])
         sampling = asdict(pending.params)
         local_header = _header_bytes({
@@ -374,25 +437,12 @@ class PDGateway:
                         or dscore[1] + 1 > dstats["resident_limit"]
                         or dconnections + 1 > self.infos[de]["max_connections"]):
                     continue
-                popen = _header_bytes({
-                    "op": "prepare_p" if pipeline else "open_p", "lifetime": .1,
-                    "session_id": "0" * 32, "request_id": pending.request_id,
-                    "token_ids": pending.token_ids, "sampling": sampling, "decode_endpoint": de,
-                })
-                p_response_limit = (DEFAULT_HEADER_LIMIT if "fp8_prefill_compute_dtype" in self.infos[pe]
-                                    else min(self.infos[pe]["max_header_bytes"], DEFAULT_HEADER_LIMIT))
                 can_transfer = (pbytes + transfer_bytes <= self.infos[pe]["max_transfer_bytes"]
                                 and dbytes + transfer_bytes <= self.infos[de]["max_transfer_bytes"]
-                                and transfer_bytes <= self.infos[pe].get("max_payload_bytes",
-                                                                          self.infos[pe]["max_transfer_bytes"])
-                                and transfer_bytes <= self.infos[de].get("max_payload_bytes",
-                                                                          self.infos[de]["max_transfer_bytes"])
-                                and transfer_bytes <= self.max_payload_bytes
                                 and pconnections + 1 <= self.infos[pe]["max_connections"]
                                 and pcapacity
-                                and popen <= min(self.infos[pe]["max_header_bytes"], DEFAULT_HEADER_LIMIT)
-                                and pmeta <= p_response_limit
-                                and dmeta <= min(self.infos[de]["max_header_bytes"], DEFAULT_HEADER_LIMIT))
+                                and self._remote_limits_fit(
+                                    pending, pipeline, pe, de, sampling, transfer_bytes, pmeta, dmeta))
                 decodes.append((de, dstats, dtime, dscore, can_transfer, dconnections, dbytes))
             if decodes:
                 choices.append((pe, ptime, pscore, pblocks, pconnections, pbytes, decodes))
@@ -426,7 +476,7 @@ class PDGateway:
                 route = "remote"
                 break
         else:
-            raise GatewayError(503, "No fresh PD route with estimated capacity")
+            raise _RouteUnavailable()
         decision = {
             "prefill_pending_tokens": pscore[0], "prefill_requests": pscore[1],
             "prefill_prompt_blocks": pblocks, "request_prompt_blocks": prompt_blocks,
@@ -494,7 +544,7 @@ class PDGateway:
         self._record(entry, "pd_gateway_cancelled" if cancelled else "pd_gateway_failed",
                      phase="admission", route="unassigned", status=status, reason=reason)
 
-    def submit(self, pending):
+    def _prepare_submission(self, pending):
         if self.closing:
             self.record_admission_failure(pending.request_id, pending.arrival, status=503,
                                           reason="PD gateway is shutting down")
@@ -507,27 +557,101 @@ class PDGateway:
             self.record_admission_failure(pending.request_id, pending.arrival, status=400,
                                           reason="Prompt must leave room for completion")
             raise ValueError("Prompt must leave room for completion")
-        seq = Sequence(pending.token_ids, self.config["block_size"], pending.params)
-        limit = min(pending.params.max_tokens, self.config["max_model_length"] - len(pending.token_ids))
-        pending.tokens = asyncio.Queue(maxsize=limit + 1)
         total_limit = pending.params.max_model_length or self.config["max_model_length"]
-        pipeline = (self.pipeline_min_tokens > 0
-                    and len(pending.token_ids) >= self.pipeline_min_tokens
-                    and pending.params.max_tokens > 1 and len(pending.token_ids) + 1 < total_limit)
-        gateway_id = uuid.uuid4().hex
-        if self.routing_mode == "load":
+        return (self.pipeline_min_tokens > 0 and len(pending.token_ids) >= self.pipeline_min_tokens
+                and pending.params.max_tokens > 1 and len(pending.token_ids) + 1 < total_limit)
+
+    def _wake_route_waiter(self):
+        if self.route_waiters and not self.route_waiters[0].ready.done():
+            self.route_waiters[0].ready.set_result(None)
+
+    def _record_routing_failure(self, request, exc):
+        self._record(request, "pd_gateway_failed", phase="routing", route="unassigned",
+                     status=exc.status, reason=str(exc))
+
+    def submit(self, pending):
+        pipeline = self._prepare_submission(pending)
+        request = SimpleNamespace(pending=pending, gateway_id=uuid.uuid4().hex,
+                                  session_id=None, transaction_id=None)
+        try:
+            return self._dispatch(pending, pipeline, request.gateway_id)
+        except _RouteUnavailable as exc:
+            self._record_routing_failure(request, exc)
+            raise
+
+    async def submit_or_wait(self, pending, receive):
+        if not self.route_queue_size:
+            return self.submit(pending)
+        pipeline = self._prepare_submission(pending)
+        request = SimpleNamespace(pending=pending, gateway_id=uuid.uuid4().hex,
+                                  session_id=None, transaction_id=None)
+        if not self.route_waiters:
             try:
-                pair, route, blocks, decision = self._select_load(pending, pipeline)
-            except GatewayError as exc:
-                failed = SimpleNamespace(pending=pending, gateway_id=gateway_id,
-                                         session_id=None, transaction_id=None)
-                self._record(failed, "pd_gateway_failed", phase="routing", route="unassigned",
-                             status=exc.status, reason=str(exc))
-                raise
+                return self._dispatch(pending, pipeline, request.gateway_id)
+            except _RouteUnavailable:
+                pass
+        try:
+            if not self._fits_idle_route(pending, pipeline):
+                raise GatewayError(503, "PD request exceeds all compatible routes' capacity")
+            if len(self.route_waiters) >= self.route_queue_size:
+                raise GatewayError(503, "PD route queue is full")
+            return await self._wait_for_route(request, pipeline, receive)
+        except GatewayError as exc:
+            if exc.status == 503:
+                self._record_routing_failure(request, exc)
+            raise
+        except (ClientDisconnect, asyncio.CancelledError):
+            try:
+                self._record(request, "pd_gateway_cancelled", phase="route_wait", route="unassigned")
+            except GatewayError:
+                logger.exception("PD gateway route wait cancellation timing failed")
+            raise
+
+    async def _wait_for_route(self, request, pipeline, receive):
+        loop = asyncio.get_running_loop()
+        queued_at = time.perf_counter()
+        waiter = SimpleNamespace(ready=loop.create_future())
+        # The body has been consumed. Watch for disconnects until the response
+        # stream takes over; queued requests do not yet have a stream watcher.
+        disconnect = asyncio.create_task(receive())
+        self.route_waiters.append(waiter)
+        try:
+            self._record(request, "pd_gateway_queued", queue_depth=len(self.route_waiters))
+            async with asyncio.timeout(self.route_wait_timeout_s):
+                while True:
+                    if self.closing:
+                        raise GatewayError(503, "PD gateway is shutting down")
+                    if disconnect.done():
+                        disconnect.result()
+                        raise ClientDisconnect()
+                    if self.route_waiters[0] is waiter:
+                        try:
+                            return self._dispatch(request.pending, pipeline, request.gateway_id,
+                                                  route_wait_ms=(time.perf_counter() - queued_at) * 1000)
+                        except _RouteUnavailable:
+                            pass
+                    await asyncio.wait((waiter.ready, disconnect), return_when=asyncio.FIRST_COMPLETED)
+                    if waiter.ready.done():
+                        waiter.ready = loop.create_future()
+        except TimeoutError as exc:
+            raise GatewayError(503, "PD route wait timed out") from exc
+        finally:
+            was_head = self.route_waiters[0] is waiter
+            self.route_waiters.remove(waiter)
+            if was_head:
+                self._wake_route_waiter()
+            disconnect.cancel()
+
+    def _dispatch(self, pending, pipeline, gateway_id, *, route_wait_ms=None):
+        if self.routing_mode == "load":
+            pair, route, blocks, decision = self._select_load(pending, pipeline)
         else:
             pair = self.pairs[self.next_pair]
             self.next_pair = (self.next_pair + 1) % len(self.pairs)
             route, blocks, decision = "remote", 0, {}
+        seq = Sequence(pending.token_ids, self.config["block_size"], pending.params)
+        limit = min(pending.params.max_tokens, self.config["max_model_length"] - len(pending.token_ids))
+        pending.tokens = asyncio.Queue(maxsize=limit + 1)
         entry = SimpleNamespace(
             seq=seq, pending=pending, pair=pair, gateway_id=gateway_id,
             session_id=None, transaction_id=None, frontend_done=False, remote_done=False,
@@ -557,6 +681,8 @@ class PDGateway:
             fields = {"prefill": list(pair[0]) if route == "remote" else None, "decode": list(pair[1])}
             if self.routing_mode == "load":
                 fields.update(route=route, considered_prefill=list(pair[0]), decision=decision)
+            if route_wait_ms is not None:
+                fields["route_wait_ms"] = route_wait_ms
             self._record(entry, "pd_gateway_assigned", **fields)
             self.requests[seq.seq_id] = entry
             entry.task = asyncio.create_task(self._run(entry))
@@ -591,6 +717,7 @@ class PDGateway:
                 entry.pending.tokens.put_nowait(_request_error(error, "cleanup"))
             entry.remote_done = True
             self._release_if_done(entry)
+        self._wake_route_waiter()
 
     def timing_ids(self, seq_id):
         entry = self.requests.get(seq_id)
@@ -798,6 +925,7 @@ class PDGateway:
 
     async def close(self):
         self.closing = True
+        self._wake_route_waiter()
         if self.routing_mode == "load" and self.poll_task is not None:
             self.poll_task.cancel()
             await asyncio.gather(self.poll_task, return_exceptions=True)

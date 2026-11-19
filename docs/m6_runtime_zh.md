@@ -8,6 +8,8 @@ M6 新增 opt-in 的 TP=1 逐层交接。P 在实际 decoder layer 返回、KV �
 
 P、D 启动时都显式增加 `--pipeline-frame-bytes F`，默认为 0（禁用）。F 不超过 worker 的 `max-transfer-bytes`，且须至少装下一个 token 的 K 和 V，即 `2 × kv_heads × head_dim × dtype_bytes`。P 的 F 不得超过 D 的上限。两个角色仍使用各自的进程、监听地址与原有模型配置。数据连接复用 D 的监听端口，独立于各自的串行控制连接。
 
+可选的同机 Mooncake 后端使用 `mooncake-transfer-engine==0.3.14`。安装 Python wheel 及其动态库后，沿用原启动命令，在 P 和每个 D 都加 `--pipeline-backend mooncake_tcp`，PD 端点使用 `127.0.0.1`。默认 `--pipeline-backend socket`。Mooncake 使用经典主存 TCP 和 `P2PHANDSHAKE`。每个事务持有私有 engine。P 注册原有两个 pinned 发送槽，D 额外注册一个帧大小的普通主存接收缓冲。收到原生 TCP 写完成后，P 通过现有连接发送帧元信息。D 将注册缓冲复制到原 pinned 槽并提交 H2D，末帧 ACK 等待 H2D 完成。取消时保留源槽直到写入 ticket 完成，保留 D 注册缓冲直到引擎关闭。
+
 ```python
 decode = await PDClient.open_d(decode_endpoint, lifetime=60)
 prefill = None

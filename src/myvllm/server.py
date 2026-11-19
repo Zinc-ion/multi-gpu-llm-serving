@@ -310,7 +310,7 @@ def create_app(config, model_name=None, engine_factory=LLMEngine, pd_worker=None
         )
         try:
             if pd_worker is not None:
-                seq = worker.submit(pending)
+                seq = await worker.submit_or_wait(pending, request.receive)
             else:
                 worker.commands.put(("add", pending))
                 seq = await pending.admitted

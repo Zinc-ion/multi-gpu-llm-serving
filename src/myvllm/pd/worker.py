@@ -17,6 +17,7 @@ import traceback
 from myvllm.config import load_config
 from myvllm.engine.llm_engine import LLMEngine
 from myvllm.pd import CapacityError, DecodeCore, PrefillCore
+from myvllm.pd import mooncake_tcp
 from myvllm.pd.pipeline import LayerSender, PipelineTimingError
 from myvllm.pd.protocol import descriptor_components, finite_number, token_byte_counts
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError, close_writer, read_body, read_header, write_frame
@@ -195,6 +196,7 @@ class _Owner:
             "world_size": self.engine.config["world_size"],
             "max_socket_connections": self.worker.max_socket_connections,
             "pipeline_frame_bytes": self.worker.pipeline_frame_bytes,
+            "pipeline_backend": self.worker.pipeline_backend,
         }
 
     def _stats(self):
@@ -207,7 +209,9 @@ class _Owner:
                 "pipeline_pinned_bytes": sum(s["pinned_bytes"] for s in staging),
                 "pipeline_busy_slots": sum(s["busy_slots"] for s in staging),
                 "pipeline_slots": sum(s["slot_count"] for s in staging),
-                "pipeline_staging_limit_bytes": 2 * self.worker.max_connections * self.worker.pipeline_frame_bytes,
+                "pipeline_registered_bytes": sum(s["registered_bytes"] for s in staging),
+                "pipeline_registered_buffers": sum(s["registered_buffers"] for s in staging),
+                "pipeline_staging_limit_bytes": self.worker.pipeline_staging_limit_bytes,
                 "pipeline_slot_limit": 2 * self.worker.max_connections if self.worker.pipeline_frame_bytes else 0}
         if self.worker.role == "decode":
             sample = max(self.decode_step_samples, default=None)
@@ -345,6 +349,7 @@ class _Owner:
         elif op == "attach_data" and self.worker.role == "decode":
             if (not self.worker.pipeline_frame_bytes or type(fields["frame_bytes"]) is not int
                     or not 0 < fields["frame_bytes"] <= self.worker.pipeline_frame_bytes
+                    or fields.get("backend", "socket") != self.worker.pipeline_backend
                     or not isinstance(fields["session_id"], str)
                     or not isinstance(fields["transaction_id"], str)):
                 raise ValueError("Invalid pipeline channel binding or frame limit")
@@ -354,11 +359,12 @@ class _Owner:
                     or target.handle.transaction_id != fields["transaction_id"]
                     or time.monotonic() >= target.deadline):
                 raise ValueError("Pipeline channel does not match a live reservation")
-            self.core.attach_receiver(target.handle, fields["frame_bytes"],
-                                      self.worker.config.get("timing_path"))
+            receiver = self.core.attach_receiver(target.handle, fields["frame_bytes"],
+                                                 self.worker.config.get("timing_path"),
+                                                 mooncake_binding=self.worker.mooncake_binding)
             target.data_writer = ctx.writer
             ctx.data_target = target
-            result = target
+            result = target, receiver.mooncake.destination() if receiver.mooncake is not None else True
         elif op in ("open_p", "open_d", "prepare_p", "open_local"):
             result = self._open(ctx, op, fields)
         else:
@@ -388,7 +394,8 @@ class _Owner:
                 scales = self.engine.model_runner.kv_cache_scales if "kv_cache" in self.core.spec else None
                 ctx.sender = LayerSender(self.engine.model_runner.kv_cache, handle.sequence,
                                          ctx.decode_endpoint, self.worker.pipeline_frame_bytes,
-                                         identity, handle.deadline, self.worker.config.get("timing_path"), scales)
+                                         identity, handle.deadline, self.worker.config.get("timing_path"), scales,
+                                         mooncake_binding=self.worker.mooncake_binding)
                 result = ctx.sender
             elif op == "start" and self.worker.role == "prefill":
                 if ctx.sender is None or not ctx.sender.ready.done() or ctx.sender.ready.exception() is not None:
@@ -411,6 +418,11 @@ class _Owner:
                     self._record("pd_reserved", ctx, payload_bytes=metadata["kv"]["nbytes"],
                                  stats=self.core.stats(), **descriptor_components(metadata["kv"]))
             elif op == "region" and self.worker.role == "decode":
+                if self.worker.mooncake_binding is not None:
+                    receiver = handle._receiver
+                    if receiver is None:
+                        raise ValueError("Mooncake receiver is no longer registered")
+                    payload = memoryview(receiver.incoming.numpy())[:fields["payload_bytes"]]
                 self.core.restore_region(handle, fields["layer"], fields["start"], fields["end"], payload)
                 result = {"copies_done": handle._next_layer == self.core.spec["architecture"]["num_layers"],
                           "payload_bytes": len(payload)}
@@ -458,6 +470,7 @@ class _Owner:
             elif op == "cancel":
                 if ctx.sender is not None:
                     ctx.sender.abort(ConnectionError("PD request cancelled"))
+                    ctx.sender.drain_copies()
                 queued = bool(ctx.events)
                 ctx.events.clear()
                 ctx.cancelled = True
@@ -473,6 +486,7 @@ class _Owner:
         return True
 
     def _poll(self):
+        now = time.monotonic()
         if self.worker.pipeline_frame_bytes and self.worker.role == "prefill":
             for ctx in list(self.contexts.values()):
                 if ctx.sender is not None and isinstance(ctx.sender.error, PipelineTimingError):
@@ -482,6 +496,7 @@ class _Owner:
                     raise ctx.sender.error
                 if ctx.sender is not None and ctx.sender.error is not None and not ctx.cancelled:
                     ctx.cancelled = True
+                    ctx.sender.drain_copies()
                     self.core.cancel(ctx.handle)
                     ctx.events.clear()
                     self._record("pd_failed", ctx, reason=str(ctx.sender.error), stats=self.core.stats())
@@ -489,7 +504,10 @@ class _Owner:
                         ctx.pending.set_exception(ctx.sender.error)
                         ctx.pending = None
                     self.worker.loop.call_soon_threadsafe(ctx.writer.close)
-        for handle in self.core.expire():
+                elif ctx.sender is not None and not ctx.cancelled and now >= ctx.deadline:
+                    ctx.sender.abort(TimeoutError("PD request expired"))
+                    ctx.sender.drain_copies()
+        for handle in self.core.expire(now):
             ctx = self.contexts[handle]
             self._record("pd_failed", ctx, reason="timeout", stats=self.core.stats())
             if ctx.pending is not None:
@@ -628,7 +646,8 @@ class PDWorker:
     def __init__(self, role, config, *, max_connections, max_transfer_bytes,
                  request_timeout, max_header_bytes=DEFAULT_HEADER_LIMIT,
                  decode_endpoint=None, allowed_decode_endpoints=None,
-                 engine_factory=LLMEngine, pipeline_frame_bytes=0, max_payload_bytes=None):
+                 engine_factory=LLMEngine, pipeline_frame_bytes=0, max_payload_bytes=None,
+                 pipeline_backend="socket"):
         if role not in ("prefill", "decode"):
             raise ValueError("role must be prefill or decode")
         world_size = config["world_size"]
@@ -666,6 +685,9 @@ class PDWorker:
             raise ValueError("request_timeout must be a positive finite number")
         if type(pipeline_frame_bytes) is not int or not 0 <= pipeline_frame_bytes <= max_payload_bytes:
             raise ValueError("pipeline_frame_bytes must be between 0 and max_payload_bytes")
+        if pipeline_backend not in ("socket", "mooncake_tcp") or (pipeline_backend == "mooncake_tcp"
+                                                                 and not pipeline_frame_bytes):
+            raise ValueError("Mooncake TCP requires an enabled layer pipeline")
         if pipeline_frame_bytes and role == "prefill":
             if not config.get("enforce_eager", False) or config.get("enable_chunked_prefill", False):
                 raise ValueError("Pipeline requires TP1 whole eager prefill")
@@ -678,6 +700,10 @@ class PDWorker:
         self.decode_endpoint = decode_endpoint
         self.allowed_decode_endpoints = allowed_decode_endpoints
         self.pipeline_frame_bytes = pipeline_frame_bytes
+        self.pipeline_backend = pipeline_backend
+        self.mooncake_binding = None
+        host_slots = 3 if pipeline_backend == "mooncake_tcp" and role == "decode" else 2
+        self.pipeline_staging_limit_bytes = host_slots * max_connections * pipeline_frame_bytes
         self.max_socket_connections = max_connections * (
             (3 if pipeline_frame_bytes else 2) if role == "decode" else 1) + 1
         self.request_timeout = request_timeout
@@ -688,6 +714,10 @@ class PDWorker:
         self.sessions = 0
 
     async def start(self, host, port):
+        if self.pipeline_backend == "mooncake_tcp":
+            if host != mooncake_tcp.HOST or any(h != mooncake_tcp.HOST for h, _ in self.allowed_decode_endpoints or ()):
+                raise ValueError("Mooncake TCP requires same-host loopback PD endpoints")
+            self.mooncake_binding = mooncake_tcp.configure()
         self.loop = asyncio.get_running_loop()
         self.failed = asyncio.Event()
         self._starting = asyncio.Event()
@@ -759,21 +789,30 @@ class PDWorker:
             await asyncio.gather(disconnect, claim, return_exceptions=True)
 
     async def _data_connection(self, reader, writer, ctx, header, size):
-        if size or set(header) != {"op", "session_id", "transaction_id", "frame_bytes"}:
+        binding_fields = {"op", "session_id", "transaction_id", "frame_bytes"}
+        region_fields = {"op", "layer", "start", "end"}
+        mooncake = self.mooncake_binding is not None
+        if mooncake:
+            binding_fields.add("backend")
+            region_fields.add("payload_bytes")
+        if size or set(header) != binding_fields:
             raise ProtocolError("Invalid pipeline channel header")
         future = self.owner.submit(ctx, "attach_data", {k: v for k, v in header.items() if k != "op"})
-        target, _ = await self._await_owner(reader, future)
+        (target, destination), _ = await self._await_owner(reader, future)
         frame_bytes = header["frame_bytes"]
         sock = writer.get_extra_info("socket")
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, frame_bytes)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, frame_bytes)
         writer.transport.set_write_buffer_limits(high=frame_bytes, low=0)
         async with asyncio.timeout_at(target.deadline):
-            await write_frame(writer, {"ok": True, "value": True})
+            await write_frame(writer, {"ok": True, "value": destination})
             while True:
-                region, length = await read_header(reader, self.max_header_bytes, frame_bytes)
-                if set(region) != {"op", "layer", "start", "end"} or region["op"] != "region":
+                region, length = await read_header(reader, self.max_header_bytes, 0 if mooncake else frame_bytes)
+                if set(region) != region_fields or region["op"] != "region":
                     raise ProtocolError("Invalid pipeline region header")
+                if mooncake and (type(region["payload_bytes"]) is not int
+                                 or not 0 < region["payload_bytes"] <= frame_bytes):
+                    raise ProtocolError("Invalid Mooncake region byte count")
                 payload = await read_body(reader, length)
                 try:
                     future = self.owner.submit(target, "region",
@@ -997,7 +1036,7 @@ async def _serve(args):
                       max_payload_bytes=args.max_payload_bytes,
                       request_timeout=args.request_timeout, max_header_bytes=args.max_header_bytes,
                       decode_endpoint=decode_endpoint, allowed_decode_endpoints=args.allowed_decode_endpoints,
-                      pipeline_frame_bytes=args.pipeline_frame_bytes)
+                      pipeline_frame_bytes=args.pipeline_frame_bytes, pipeline_backend=args.pipeline_backend)
     address = await worker.start(args.host, args.port)
     logger.info("PD %s listening on %s:%s", args.role, *address)
     stopped = asyncio.Event()
@@ -1029,6 +1068,7 @@ def main():
     parser.add_argument("--decode-port", type=int)
     parser.add_argument("--allowed-decode-endpoints", type=json.loads)
     parser.add_argument("--pipeline-frame-bytes", type=int, default=0)
+    parser.add_argument("--pipeline-backend", choices=("socket", "mooncake_tcp"), default="socket")
     logging.basicConfig(level=logging.INFO)
     asyncio.run(_serve(parser.parse_args()))
 

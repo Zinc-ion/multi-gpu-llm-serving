@@ -68,7 +68,9 @@ def test_actual_runner_layer_hooks_preserve_kv_logits_and_default_path(cpu_model
             first = await p.next_token()
             expected = {"payload_bytes": 320, "frames": 6} if dtype == "float32" else {
                 "payload_bytes": 160, "frames": 4}
-            assert (await p.wait_pipeline()) == expected
+            copied = await p.wait_pipeline()
+            assert copied.pop("setup")["data_backend"] == "socket"
+            assert copied == expected
             metadata = await p.describe()
             await d.commit_early(metadata)
             ph = next(iter(pw.owner.core._handles.values()))

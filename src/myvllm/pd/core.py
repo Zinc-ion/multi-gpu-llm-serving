@@ -550,7 +550,7 @@ class DecodeCore(_Core):
         handle.state = "early_reserved"
         return True
 
-    def attach_receiver(self, handle, frame_bytes, timing_path=None):
+    def attach_receiver(self, handle, frame_bytes, timing_path=None, *, mooncake_binding=None):
         self._check(handle)
         if handle.state != "early_reserved" or handle._receiver is not None:
             raise StateError("D handle cannot attach another data channel")
@@ -558,7 +558,7 @@ class DecodeCore(_Core):
                     "request_id": handle.request_id, "role": "decode"}
         scales = self.engine.model_runner.kv_cache_scales if "kv_cache" in self.spec else None
         handle._receiver = LayerReceiver(self.engine.model_runner.kv_cache, frame_bytes,
-                                         identity, timing_path, scales)
+                                         identity, timing_path, scales, mooncake_binding=mooncake_binding)
         return handle._receiver
 
     def restore_region(self, handle, layer, start, end, payload):
@@ -577,7 +577,8 @@ class DecodeCore(_Core):
                 raise ValueError("Invalid or duplicate KV region")
             data_per_token, scale_per_token = token_byte_counts(self.spec)
             nbytes = (end - start) * (data_per_token + scale_per_token)
-            if type(payload) is not bytes or len(payload) != nbytes:
+            host_payload = type(payload) is bytes or (handle._receiver is not None and isinstance(payload, memoryview))
+            if not host_payload or len(payload) != nbytes:
                 raise ValueError("Invalid KV region byte count")
             if handle._receiver is not None:
                 if nbytes > handle._receiver.frame_bytes:

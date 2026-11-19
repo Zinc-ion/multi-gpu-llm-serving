@@ -10,6 +10,7 @@ import time
 import numpy as np
 import torch
 
+from myvllm.pd.mooncake_tcp import HOST, RegisteredSlots
 from myvllm.pd.protocol import cache_token_byte_counts
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError, _PREFIX
 from myvllm.utils.timing import write_record
@@ -127,7 +128,8 @@ class _Staging:
 class LayerSender(_Staging):
     """The model owner produces; this request's socket thread drains two slots."""
 
-    def __init__(self, cache, sequence, endpoint, frame_bytes, identity, deadline, timing_path=None, scales=None):
+    def __init__(self, cache, sequence, endpoint, frame_bytes, identity, deadline, timing_path=None, scales=None,
+                 *, mooncake_binding=None):
         super().__init__(cache, frame_bytes, identity, timing_path, scales)
         self.sequence = sequence
         self.endpoint = endpoint
@@ -142,6 +144,7 @@ class LayerSender(_Staging):
         self.sent_bytes = 0
         self.partial_send_unknown = False
         self.peak_slots = 0
+        self.mooncake = RegisteredSlots(mooncake_binding, self.slots) if mooncake_binding else None
         self.thread = threading.Thread(target=self._run, name="pd-layer-sender")
         self.thread.start()
 
@@ -244,15 +247,29 @@ class LayerSender(_Staging):
                     self.socket = sock
                     if self.error is not None:
                         return
+                started = time.perf_counter()
                 sock.connect(self.endpoint)
+                setup = {"data_backend": "socket", "control_connect_ms": (time.perf_counter() - started) * 1000}
                 self._record("pd_pipeline_connected",
                              socket_send_buffer=sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF),
                              socket_receive_buffer=sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF),
                              **self.stats())
-                _send(sock, {"op": "pipeline", "session_id": self.identity["session_id"],
-                             "transaction_id": self.identity["transaction_id"],
-                             "frame_bytes": self.frame_bytes})
-                if _response(sock) is not True:
+                binding = {"op": "pipeline", "session_id": self.identity["session_id"],
+                           "transaction_id": self.identity["transaction_id"], "frame_bytes": self.frame_bytes}
+                if self.mooncake is not None:
+                    binding["backend"] = "mooncake_tcp"
+                started = time.perf_counter()
+                _send(sock, binding)
+                peer = _response(sock)
+                setup["peer_attach_ms"] = (time.perf_counter() - started) * 1000
+                if self.mooncake is not None:
+                    if (not isinstance(peer, dict) or peer["capacity"] != self.frame_bytes
+                            or not peer["segment"].startswith(f"{HOST}:")):
+                        raise ProtocolError("Invalid Mooncake target buffer")
+                    setup.update(data_backend="mooncake_tcp", sender_engine_ms=self.mooncake.engine_ms,
+                                 sender_register_ms=self.mooncake.register_ms, receiver_engine_ms=peer["engine_ms"],
+                                 receiver_register_ms=peer["register_ms"])
+                elif peer is not True:
                     raise ProtocolError("Pipeline channel was not made ready")
                 with self.condition:
                     if self.error is not None:
@@ -281,14 +298,23 @@ class LayerSender(_Staging):
                     sent = time.perf_counter()
                     self._record("pd_region_send_start", layer=layer, start=start, end=end,
                                  payload_bytes=size, **self.byte_counts(size))
-                    body = memoryview(self.slots[index].numpy())[:size]
-                    self.partial_send_unknown = True
-                    _send(sock, {"op": "region", "layer": layer, "start": start, "end": end}, body)
-                    self.partial_send_unknown = False
-                    del body
-                    self.sent_bytes += size
-                    self._record("pd_region_socket_done", layer=layer, start=start, end=end,
-                                 payload_bytes=size, **self.byte_counts(size))
+                    region = {"op": "region", "layer": layer, "start": start, "end": end}
+                    if self.mooncake is None:
+                        self.partial_send_unknown = True
+                        _send(sock, region, memoryview(self.slots[index].numpy())[:size])
+                        self.partial_send_unknown = False
+                        self.sent_bytes += size
+                        self._record("pd_region_socket_done", layer=layer, start=start, end=end,
+                                     payload_bytes=size, **self.byte_counts(size))
+                    else:
+                        self._record("pd_mooncake_write_start", layer=layer, start=start, end=end, payload_bytes=size)
+                        started = time.perf_counter()
+                        self.mooncake.write(index, peer, size)
+                        if self.frames == 0:
+                            setup["first_native_write_ms"] = (time.perf_counter() - started) * 1000
+                        self._record("pd_mooncake_write_done", layer=layer, start=start, end=end, payload_bytes=size)
+                        # The TCP v2 completion confirms D's host memory has been written.
+                        _send(sock, {**region, "payload_bytes": size})
                     value = _response(sock)
                     last = layer + 1 == self.cache.shape[1] and end == self.sequence.num_prompt_tokens
                     if value != {"copies_done": last, "payload_bytes": size}:
@@ -302,9 +328,12 @@ class LayerSender(_Staging):
                         self.free.append(index)
                         self.condition.notify_all()
                         if last:
-                            self.done.set_result(({"payload_bytes": self.payload_bytes,
-                                                   "frames": self.frames,
-                                                   **self.byte_counts(self.payload_bytes)}, b""))
+                            if self.error is None:
+                                if self.mooncake is not None:
+                                    setup["native_completed_frames"] = self.frames
+                                self.done.set_result(({"payload_bytes": self.payload_bytes,
+                                                       "frames": self.frames, "setup": setup,
+                                                       **self.byte_counts(self.payload_bytes)}, b""))
                             return
         except Exception as exc:
             self.abort(exc)
@@ -323,6 +352,9 @@ class LayerSender(_Staging):
         try:
             self._record("pd_pipeline_sender_closed", **self.stats())
         finally:
+            if self.mooncake is not None:
+                self.mooncake.close()
+                self.mooncake = None
             self.pending.clear()
             self.slots.clear()
 
@@ -330,16 +362,20 @@ class LayerSender(_Staging):
         with self.condition:
             return {**super().stats(), "busy_slots": 2 - len(self.free) if self.slots else 0,
                     "peak_slots": self.peak_slots, "socket_submitted_bytes": self.sent_bytes,
+                    "registered_bytes": 2 * self.frame_bytes if self.mooncake is not None else 0,
+                    "registered_buffers": 2 if self.mooncake is not None else 0,
                     "partial_send_unknown": self.partial_send_unknown}
 
 
 class LayerReceiver(_Staging):
     """The D owner restores into its own table; a slot lives until H2D completes."""
 
-    def __init__(self, cache, frame_bytes, identity, timing_path=None, scales=None):
+    def __init__(self, cache, frame_bytes, identity, timing_path=None, scales=None, *, mooncake_binding=None):
         super().__init__(cache, frame_bytes, identity, timing_path, scales)
         self.events = [None, None]
         self.next_slot = 0
+        self.incoming = torch.empty(frame_bytes, dtype=torch.uint8, device="cpu") if mooncake_binding else None
+        self.mooncake = RegisteredSlots(mooncake_binding, (self.incoming,)) if mooncake_binding else None
 
     def _wait_slot(self, index):
         item = self.events[index]
@@ -407,13 +443,17 @@ class LayerReceiver(_Staging):
     def close(self):
         try:
             self.finish()
-        except PipelineTimingError:
-            self.slots.clear()
-            raise
-        try:
             self._record("pd_pipeline_receiver_closed", **self.stats())
         finally:
+            if self.mooncake is not None:
+                self.mooncake.close()
+                self.mooncake = None
+                self.incoming = None
             self.slots.clear()
 
     def stats(self):
-        return {**super().stats(), "busy_slots": sum(event is not None for event in self.events)}
+        info = super().stats()
+        registered_bytes = self.frame_bytes if self.mooncake is not None else 0
+        return {**info, "busy_slots": sum(event is not None for event in self.events),
+                "staging_bytes": info["staging_bytes"] + registered_bytes, "registered_bytes": registered_bytes,
+                "registered_buffers": int(self.mooncake is not None)}

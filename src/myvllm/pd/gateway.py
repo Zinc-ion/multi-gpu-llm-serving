@@ -18,7 +18,7 @@ import uvicorn
 from myvllm.config import load_config, resolve_dtype
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.pd.client import PDClient, PDHeaderLimitError, PDRemoteError, PDTimingError
-from myvllm.pd.http import GatewayError
+from myvllm.pd.http import GatewayError, read_json_limited
 from myvllm.pd.protocol import _ARCHITECTURE_FIELDS, cache_spec, make_early_metadata, make_metadata, payload_nbytes, token_byte_counts, validate_metadata
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError
 from myvllm.utils.timing import write_record
@@ -233,6 +233,14 @@ class PDGateway:
         if (type(self.route_wait_timeout_s) not in (int, float) or not math.isfinite(self.route_wait_timeout_s)
                 or self.route_wait_timeout_s <= 0):
             raise ValueError("route_wait_timeout_s must be a positive finite number")
+        self.admission_queue_size = settings.get("admission_queue_size", 0)
+        if type(self.admission_queue_size) is not int or self.admission_queue_size < 0:
+            raise ValueError("admission_queue_size must be a nonnegative integer")
+        self.admission_wait_timeout_s = settings.get("admission_wait_timeout_s", self.request_timeout)
+        if (type(self.admission_wait_timeout_s) not in (int, float)
+                or not math.isfinite(self.admission_wait_timeout_s) or self.admission_wait_timeout_s <= 0):
+            raise ValueError("admission_wait_timeout_s must be a positive finite number")
+        self.admission_waiters = deque()
         self.route_waiters = deque()
         self.requests = {}
         self.claimed = 0
@@ -534,8 +542,60 @@ class PDGateway:
         self.claimed += 1
         return True
 
+    def _wake_admission_head(self):
+        if self.admission_waiters and self.claimed < self.max_active_requests:
+            self.admission_waiters[0].set()
+
+    async def admit_body(self, request, request_id, arrival):
+        if self.closing:
+            raise GatewayError(503, "PD gateway is shutting down")
+        if not self.admission_waiters and self.claim():
+            try:
+                return await read_json_limited(request, self.max_request_bytes)
+            except BaseException:
+                self.unclaim()
+                raise
+        if not self.admission_queue_size:
+            raise GatewayError(503, "PD gateway request capacity exhausted")
+        if len(self.admission_waiters) >= self.admission_queue_size:
+            raise GatewayError(503, "PD admission queue is full")
+
+        ready = asyncio.Event()
+        self.admission_waiters.append(ready)
+        queued_at = time.perf_counter()
+        entry = SimpleNamespace(pending=SimpleNamespace(request_id=request_id, arrival=arrival),
+                                gateway_id=None, session_id=None, transaction_id=None)
+        try:
+            self._record(entry, "pd_admission_queued", queue_depth=len(self.admission_waiters))
+            async with asyncio.timeout(self.admission_wait_timeout_s):
+                # Reserve FIFO position before reading. Only one coroutine consumes ASGI events at a time.
+                body = await read_json_limited(request, self.max_request_bytes)
+                disconnect = asyncio.create_task(request.receive())
+                wake = asyncio.create_task(ready.wait())
+                try:
+                    await asyncio.wait((wake, disconnect), return_when=asyncio.FIRST_COMPLETED)
+                    if disconnect.done():
+                        disconnect.result()
+                        raise ClientDisconnect()
+                finally:
+                    for task in (wake, disconnect):
+                        task.cancel()
+                    await asyncio.gather(wake, disconnect, return_exceptions=True)
+                if self.closing:
+                    raise GatewayError(503, "PD gateway is shutting down")
+                self._record(entry, "pd_admission_granted", wait_ms=(time.perf_counter() - queued_at) * 1000)
+                assert self.admission_waiters[0] is ready and self.claimed < self.max_active_requests
+                self.claimed += 1
+                return body
+        except TimeoutError as exc:
+            raise GatewayError(503, "PD admission wait timed out") from exc
+        finally:
+            self.admission_waiters.remove(ready)
+            self._wake_admission_head()
+
     def unclaim(self):
         self.claimed -= 1
+        self._wake_admission_head()
 
     def record_admission_failure(self, request_id, arrival, *, status, reason, cancelled=False):
         pending = SimpleNamespace(request_id=request_id, arrival=arrival)
@@ -925,6 +985,8 @@ class PDGateway:
 
     async def close(self):
         self.closing = True
+        for waiter in self.admission_waiters:
+            waiter.set()
         self._wake_route_waiter()
         if self.routing_mode == "load" and self.poll_task is not None:
             self.poll_task.cancel()

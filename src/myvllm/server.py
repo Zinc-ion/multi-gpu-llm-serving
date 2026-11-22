@@ -22,7 +22,7 @@ import uvicorn
 from myvllm.config import load_config
 from myvllm.engine.llm_engine import LLMEngine
 from myvllm.engine.sequence import Sequence
-from myvllm.pd.http import GatewayError, PrefetchResponse, read_json_limited
+from myvllm.pd.http import GatewayError, PrefetchResponse
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.utils.timing import write_record
 
@@ -269,11 +269,13 @@ def create_app(config, model_name=None, engine_factory=LLMEngine, pd_worker=None
             except GatewayError as exc:
                 raise HTTPException(exc.status, str(exc)) from exc
 
-        if pd_worker is not None and not worker.claim():
-            record_admission_failure(503, "PD gateway request capacity exhausted")
-            raise HTTPException(503, "PD gateway request capacity exhausted")
+        claimed = False
         try:
-            body = await read_json_limited(request, worker.max_request_bytes) if pd_worker is not None else await request.json()
+            if pd_worker is not None:
+                body = await worker.admit_body(request, request_id, arrival)
+                claimed = True
+            else:
+                body = await request.json()
             validate_request(body, model_name, chat)
             params = SamplingParams(
                 temperature=body.get("temperature", 1.0),
@@ -284,17 +286,20 @@ def create_app(config, model_name=None, engine_factory=LLMEngine, pd_worker=None
             token_ids = await asyncio.to_thread(tokenize_request, worker.engine.tokenizer, body, chat)
         except GatewayError as exc:
             if pd_worker is not None:
-                worker.unclaim()
+                if claimed:
+                    worker.unclaim()
                 record_admission_failure(exc.status, str(exc))
             raise HTTPException(exc.status, str(exc)) from exc
         except ValueError as exc:
             if pd_worker is not None:
-                worker.unclaim()
+                if claimed:
+                    worker.unclaim()
                 record_admission_failure(400, str(exc))
             raise HTTPException(400, str(exc)) from exc
         except BaseException as exc:
             if pd_worker is not None:
-                worker.unclaim()
+                if claimed:
+                    worker.unclaim()
                 cancelled = isinstance(exc, (asyncio.CancelledError, ClientDisconnect))
                 try:
                     worker.record_admission_failure(

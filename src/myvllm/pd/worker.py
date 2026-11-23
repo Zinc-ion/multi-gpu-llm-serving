@@ -20,6 +20,7 @@ from myvllm.pd import CapacityError, DecodeCore, PrefillCore
 from myvllm.pd import mooncake_tcp
 from myvllm.pd.pipeline import LayerSender, PipelineTimingError
 from myvllm.pd.protocol import descriptor_components, finite_number, token_byte_counts
+from myvllm.pd.rpc_timing import TRACE_OPS, record_rpc
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError, close_writer, read_body, read_header, write_frame
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.utils.timing import write_record
@@ -119,6 +120,8 @@ class _Owner:
             elif op not in _OWNER_CLEANUP_COMMANDS and not self._command_slots.acquire(blocking=False):
                 error = CapacityError("PD owner command capacity exhausted")
             else:
+                if op in TRACE_OPS:
+                    future.queued_ns = time.monotonic_ns()
                 self.commands.put_nowait((ctx, op, fields or {}, payload, future))
                 if op == "shutdown":
                     self._shutdown_future = future
@@ -313,6 +316,8 @@ class _Owner:
                 "max_payload_bytes": self.worker.max_payload_bytes}
 
     def _command(self, ctx, op, fields, payload, future):
+        if op in TRACE_OPS:
+            future.started_ns = time.monotonic_ns()
         if op == "shutdown":
             self._resolve(future, (True, b""))
             return False
@@ -482,6 +487,8 @@ class _Owner:
                 result = True
             else:
                 raise ValueError("Unsupported operation for worker role")
+        if op in TRACE_OPS:
+            future.finished_ns = time.monotonic_ns()
         self._resolve(future, (result, b""))
         return True
 
@@ -929,6 +936,9 @@ class PDWorker:
                                 await self._await_owner(reader, sender.ready)
                             future = self.owner.submit(ctx, op, {k: v for k, v in header.items() if k != "op"}, body)
                             value, output = await self._await_owner(reader, future)
+                            if op in TRACE_OPS:
+                                times = dict(queued_ns=future.queued_ns, started_ns=future.started_ns,
+                                             finished_ns=future.finished_ns)
                     finally:
                         if op in ("info", "stats") and future is not None:
                             future.cancel()
@@ -943,7 +953,11 @@ class PDWorker:
                         self.sessions -= 1
                         session = False
                     try:
+                        if op in TRACE_OPS:
+                            times["reply_ns"] = time.monotonic_ns()
                         await write_frame(writer, {"ok": True, "value": value}, output)
+                        if op in TRACE_OPS:
+                            record_rpc(self.role, ctx.handle.session_id, op, **times)
                     finally:
                         output = None
                     if ctx.response_done is not None:

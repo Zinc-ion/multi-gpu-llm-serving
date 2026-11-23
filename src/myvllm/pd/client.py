@@ -5,6 +5,7 @@ from dataclasses import asdict
 import time
 
 from myvllm.pd.protocol import descriptor_components
+from myvllm.pd.rpc_timing import TRACE_OPS, record_rpc
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError, close_writer, read_body, read_header, write_frame
 from myvllm.utils.timing import write_record
 
@@ -42,6 +43,8 @@ class PDConnection:
                     if self.session_id is not None and len(body) > self._max_body_bytes:
                         raise ProtocolError("Body exceeds transfer limit")
                     try:
+                        if op in TRACE_OPS:
+                            sent_ns = time.monotonic_ns()
                         await write_frame(self._writer, {"op": op, **fields}, body,
                                           max_header_bytes=self._max_header_bytes)
                     except ProtocolError as exc:
@@ -59,6 +62,8 @@ class PDConnection:
                     if expected_body_bytes is not None and size != expected_body_bytes:
                         raise ProtocolError("Unexpected response body size")
                     data = await read_body(self._reader, size)
+                if op in TRACE_OPS:
+                    record_rpc("gateway", self.session_id, op, sent_ns=sent_ns, received_ns=time.monotonic_ns())
                 return header["value"], data
             except BaseException:
                 self._writer.transport.abort()

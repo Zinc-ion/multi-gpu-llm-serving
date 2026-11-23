@@ -569,11 +569,14 @@ class DecodeCore(_Core):
             raise StateError("D handle has no early transfer in progress")
         prompt_length = handle._early_metadata["prompt_length"]
         arch = self.spec["architecture"]
+        width = self.engine.config.get("pipeline_chunk_tokens", prompt_length)
+        base = handle._next_offset // width * width
+        boundary = min(base + width, prompt_length)
         try:
             if (type(layer) is not int or layer != handle._next_layer
                     or not 0 <= layer < arch["num_layers"]
                     or type(start) is not int or type(end) is not int
-                    or start != handle._next_offset or not start < end <= prompt_length):
+                    or start != handle._next_offset or not start < end <= boundary):
                 raise ValueError("Invalid or duplicate KV region")
             data_per_token, scale_per_token = token_byte_counts(self.spec)
             nbytes = (end - start) * (data_per_token + scale_per_token)
@@ -611,9 +614,12 @@ class DecodeCore(_Core):
         except Exception:
             self._cancel(handle, "failed")
             raise
-        if end == prompt_length:
+        if end == boundary:
             handle._next_layer += 1
-            handle._next_offset = 0
+            handle._next_offset = base
+            if handle._next_layer == arch["num_layers"] and end < prompt_length:
+                handle._next_layer = 0
+                handle._next_offset = end
         else:
             handle._next_offset = end
         self._finish_early_restore(handle)

@@ -13,8 +13,9 @@ from test_pd_model_cpu import model_engine
 from myvllm.engine.sequence import Sequence
 
 
+@pytest.mark.parametrize("release", [None, "early", "last"])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_actual_runner_layer_hooks_preserve_kv_logits_and_default_path(cpu_model_backend, dtype):
+def test_actual_runner_layer_hooks_preserve_kv_logits_and_default_path(cpu_model_backend, dtype, release):
     torch.manual_seed(20261115)
     previous = torch.get_default_dtype()
     try:
@@ -34,7 +35,8 @@ def test_actual_runner_layer_hooks_preserve_kv_logits_and_default_path(cpu_model
 
     def factory(role):
         def create(config):
-            engine = model_engine(model, dtype)
+            engine = model_engine(model, dtype, chunked=bool(release) and role != "decode")
+            engine.config.update(config)
             engine.config["enforce_eager"] = True
             engine.step = torch.inference_mode()(engine.step)
             hooks.append(engine.model_runner.model.lm_head.register_forward_hook(
@@ -53,10 +55,15 @@ def test_actual_runner_layer_hooks_preserve_kv_logits_and_default_path(cpu_model
 
     async def run():
         config = {"world_size": 1, "enforce_eager": True}
+        if release:
+            config["pipeline_chunk_tokens"] = 3
         settings = {"max_connections": 4, "max_transfer_bytes": 1_000_000,
                     "request_timeout": 10, "pipeline_frame_bytes": 64}
         dw = PDWorker("decode", config, engine_factory=factory("decode"), **settings)
         de = await dw.start("127.0.0.1", 0)
+        if release:
+            config = {**config, "pipeline_chunk_release": release, "enable_chunked_prefill": True,
+                      "max_num_batched_tokens": 3}
         pw = PDWorker("prefill", config, engine_factory=factory("prefill"),
                       decode_endpoint=de, **settings)
         pe = await pw.start("127.0.0.1", 0)

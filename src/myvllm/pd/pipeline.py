@@ -141,6 +141,7 @@ class LayerSender(_Staging):
         self.free = deque(range(2))
         self.pending = deque()
         self.socket = None
+        self.slot_wait_ns = 0
         self.sent_bytes = 0
         self.partial_send_unknown = False
         self.peak_slots = 0
@@ -166,7 +167,7 @@ class LayerSender(_Staging):
             except OSError:
                 pass
 
-    def on_layer(self, layer):
+    def on_layer(self, layer, first=0, stop=None):
         if self.error is not None:
             return
         ready = None
@@ -180,14 +181,16 @@ class LayerSender(_Staging):
             return
         seq = self.sequence
         for start, end, physical in contiguous_regions(
-                seq.block_table, 0, seq.num_prompt_tokens, seq.block_size,
+                seq.block_table, first, seq.num_prompt_tokens if stop is None else stop, seq.block_size,
                 self.frame_bytes // self.token_bytes):
             with self.condition:
                 while not self.free and self.error is None:
                     remaining = self.deadline - time.monotonic()
                     if remaining <= 0:
                         break
+                    wait_start = time.monotonic_ns()
                     self.condition.wait(remaining)
+                    self.slot_wait_ns += time.monotonic_ns() - wait_start
                 if self.error is not None:
                     return
                 if not self.free:
@@ -298,6 +301,8 @@ class LayerSender(_Staging):
                     sent = time.perf_counter()
                     self._record("pd_region_send_start", layer=layer, start=start, end=end,
                                  payload_bytes=size, **self.byte_counts(size))
+                    if self.frames == 0:
+                        setup["first_send_ns"] = time.monotonic_ns()
                     region = {"op": "region", "layer": layer, "start": start, "end": end}
                     if self.mooncake is None:
                         self.partial_send_unknown = True
@@ -331,6 +336,7 @@ class LayerSender(_Staging):
                             if self.error is None:
                                 if self.mooncake is not None:
                                     setup["native_completed_frames"] = self.frames
+                                setup.update(last_ack_ns=time.monotonic_ns(), slot_wait_ns=self.slot_wait_ns)
                                 self.done.set_result(({"payload_bytes": self.payload_bytes,
                                                        "frames": self.frames, "setup": setup,
                                                        **self.byte_counts(self.payload_bytes)}, b""))

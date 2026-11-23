@@ -17,6 +17,7 @@ from test_pd_core import first_token, make_engine, start
 def model_engine(model, dtype, *, chunked=False):
     engine = make_engine(dtype=dtype, chunked=chunked, budget=3 if chunked else 16)
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = engine.config
     runner.model = deepcopy(model)
     runner.rank, runner.block_size, runner.world_size = 0, 4, 1
     runner.sampler, runner.timings, runner.enforce_eager = SamplerLayer(), None, True

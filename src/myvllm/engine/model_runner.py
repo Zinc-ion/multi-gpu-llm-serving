@@ -470,19 +470,36 @@ class ModelRunner:
             self.timings.end_gpu("h2d")
             self.timings.start_gpu("forward")
         transfers = getattr(self, "layer_transfers", None)
-        # The receiver expects each entire layer in order. Only the final
-        # prefill chunk makes all prompt positions in that layer readable.
-        active_transfers = [
-            transfers[seq.seq_id] for seq in seqs
-            if seq.seq_id in transfers
-            and seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_prompt_tokens
-        ] if transfers else []
+        active_transfers = []
+        if transfers:
+            release = self.config.get("pipeline_chunk_release")
+            for seq in seqs:
+                if seq.seq_id not in transfers:
+                    continue
+                transfer = transfers[seq.seq_id]
+                start = seq.num_cached_tokens
+                end = start + seq.num_scheduled_tokens
+                final = end == seq.num_prompt_tokens
+                if release:
+                    width = self.config["pipeline_chunk_tokens"]
+                    if start % width or end != min(start + width, seq.num_prompt_tokens):
+                        raise ValueError("Chunk transfer requires one aligned scheduled chunk per step")
+                    if release == "last" and not final:
+                        continue
+                    # Release the backlog in chunk-major order at the last step's start.
+                    if release == "last":
+                        for offset in range(0, start, width):
+                            for layer_id in range(len(self.model.model.layers)):
+                                transfer.on_layer(layer_id, offset, offset + width)
+                    active_transfers.append((transfer, start, end))
+                elif final:
+                    active_transfers.append((transfer, 0, seq.num_prompt_tokens))
         hooks = []
         if active_transfers:
             for layer_id, layer in enumerate(self.model.model.layers):
                 def layer_ready(module, args, output, layer_id=layer_id):
-                    for transfer in active_transfers:
-                        transfer.on_layer(layer_id)
+                    for transfer, start, end in active_transfers:
+                        transfer.on_layer(layer_id, start, end)
                 hooks.append(layer.register_forward_hook(layer_ready))
         try:
             logits = self.run_model(input_ids, is_prefill)
@@ -491,8 +508,9 @@ class ModelRunner:
                 hook.remove()
             # postprocess may release the source blocks for a terminal first token.
             # Socket sends only retain host slots after these D2H reads complete.
-            for transfer in active_transfers:
-                transfer.drain_copies()
+            for transfer, _, end in active_transfers:
+                if end == transfer.sequence.num_prompt_tokens:
+                    transfer.drain_copies()
         if self.timings:
             self.timings.end_gpu("forward")
         # only sample when rank == 0

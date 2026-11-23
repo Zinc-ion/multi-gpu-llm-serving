@@ -704,6 +704,15 @@ class PDWorker:
         if pipeline_backend not in ("socket", "mooncake_tcp") or (pipeline_backend == "mooncake_tcp"
                                                                  and not pipeline_frame_bytes):
             raise ValueError("Mooncake TCP requires an enabled layer pipeline")
+        if "pipeline_chunk_tokens" in config:
+            width = config["pipeline_chunk_tokens"]
+            if type(width) is not int or width <= 0 or not pipeline_frame_bytes:
+                raise ValueError("Chunk transfer requires a positive chunk width and layer pipeline")
+            if role == "prefill" and (config.get("pipeline_chunk_release") not in ("early", "last")
+                    or not config.get("enable_chunked_prefill") or config["max_num_batched_tokens"] != width):
+                raise ValueError("Chunk release requires aligned chunked prefill with early or last release")
+        elif "pipeline_chunk_release" in config:
+            raise ValueError("Chunk release requires pipeline_chunk_tokens")
         if pipeline_frame_bytes and role == "prefill":
             if not config.get("enforce_eager", False):
                 raise ValueError("Pipeline requires TP1 eager prefill")

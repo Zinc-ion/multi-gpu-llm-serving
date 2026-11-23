@@ -98,6 +98,8 @@ def _validate_load_edge(pi, di, pipeline_min_tokens):
     _validate_fp8_prefill_mode(pi, di.get("fp8_prefill_compute_dtype", "float32"))
     if pi["sampling_seed"] == di["sampling_seed"]:
         raise ValueError("P/D sampling seed collision on allowed edge")
+    if pipeline_min_tokens and pi.get("pipeline_window", 1) != di.get("pipeline_window", 1):
+        raise ValueError("Incompatible P/D pipeline windows on allowed edge")
     if pipeline_min_tokens and (
             not pi["pipeline_frame_bytes"] or
             pi["pipeline_frame_bytes"] > di["pipeline_frame_bytes"] or
@@ -273,6 +275,8 @@ class PDGateway:
                 raise ValueError("Prefill worker's fixed decode endpoint does not match pair")
             if di["sampling_seed"] != pi["sampling_seed"] ^ 0x80000000 or pi["sampling_seed"] in seeds:
                 raise ValueError("P/D seed mismatch or repeated pair seed")
+            if self.pipeline_min_tokens and pi.get("pipeline_window", 1) != di.get("pipeline_window", 1):
+                raise ValueError("Incompatible P/D pipeline windows")
             if self.pipeline_min_tokens and (
                     not pi.get("pipeline_frame_bytes") or
                     pi["pipeline_frame_bytes"] > di.get("pipeline_frame_bytes", 0)):

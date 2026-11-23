@@ -201,6 +201,7 @@ class _Owner:
             "max_socket_connections": self.worker.max_socket_connections,
             "pipeline_frame_bytes": self.worker.pipeline_frame_bytes,
             "pipeline_backend": self.worker.pipeline_backend,
+            "pipeline_window": self.worker.pipeline_window,
         }
 
     def _stats(self):
@@ -216,7 +217,7 @@ class _Owner:
                 "pipeline_registered_bytes": sum(s["registered_bytes"] for s in staging),
                 "pipeline_registered_buffers": sum(s["registered_buffers"] for s in staging),
                 "pipeline_staging_limit_bytes": self.worker.pipeline_staging_limit_bytes,
-                "pipeline_slot_limit": 2 * self.worker.max_connections if self.worker.pipeline_frame_bytes else 0}
+                "pipeline_slot_limit": self.worker.pipeline_slot_limit}
         if self.worker.role == "decode":
             sample = max(self.decode_step_samples, default=None)
             result.update(
@@ -740,7 +741,9 @@ class PDWorker:
         self.pipeline_frame_bytes = pipeline_frame_bytes
         self.pipeline_backend = pipeline_backend
         self.mooncake_binding = None
-        host_slots = 3 if pipeline_backend == "mooncake_tcp" and role == "decode" else 2
+        transfer_slots = 2 * self.pipeline_window if role == "prefill" else 2
+        self.pipeline_slot_limit = transfer_slots * max_connections if pipeline_frame_bytes else 0
+        host_slots = transfer_slots + int(role == "decode" and pipeline_backend == "mooncake_tcp")
         self.pipeline_staging_limit_bytes = host_slots * max_connections * pipeline_frame_bytes
         self.max_socket_connections = max_connections * (
             (3 if pipeline_frame_bytes else 2) if role == "decode" else 1) + 1

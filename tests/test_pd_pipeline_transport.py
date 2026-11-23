@@ -254,10 +254,10 @@ def test_two_slot_backpressure_wakes_without_owner_queue(interrupt):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("chunked,eager", [(True, True), (False, False)])
-def test_optimized_worker_rejects_graph_or_chunked_p(chunked, eager):
-    with pytest.raises(ValueError, match="whole eager"):
-        PDWorker("prefill", {"world_size": 1, "enforce_eager": eager,
+@pytest.mark.parametrize("chunked", [False, True])
+def test_optimized_worker_requires_eager_prefill(chunked):
+    with pytest.raises(ValueError, match="eager prefill"):
+        PDWorker("prefill", {"world_size": 1, "enforce_eager": False,
                             "enable_chunked_prefill": chunked},
                  max_connections=1, max_transfer_bytes=1000, request_timeout=5,
                  pipeline_frame_bytes=64, decode_endpoint=("127.0.0.1", 1))

@@ -265,13 +265,13 @@ def test_known_terminal_first_uses_bulk_path():
         d.shutdown()
 
 
-@pytest.mark.parametrize("chunked,eager", [(True, True), (False, False)])
-def test_early_prepare_rejects_unsupported_prefill_config(chunked, eager):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_early_prepare_requires_eager_prefill(chunked):
     engine = make_engine(chunked=chunked)
-    engine.config["enforce_eager"] = eager
+    engine.config["enforce_eager"] = False
     p = PrefillCore(engine, 8, 1_000_000)
     try:
-        with pytest.raises(ValueError, match="whole eager"):
+        with pytest.raises(ValueError, match="eager prefill"):
             p.prepare("session", "request", [1, 2], SamplingParams(max_tokens=3))
         assert p.stats()["open_handles"] == p.stats()["reserved_transfer_bytes"] == 0
     finally:

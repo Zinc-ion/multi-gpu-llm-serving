@@ -470,7 +470,13 @@ class ModelRunner:
             self.timings.end_gpu("h2d")
             self.timings.start_gpu("forward")
         transfers = getattr(self, "layer_transfers", None)
-        active_transfers = [transfers[seq.seq_id] for seq in seqs if seq.seq_id in transfers] if transfers else []
+        # The receiver expects each entire layer in order. Only the final
+        # prefill chunk makes all prompt positions in that layer readable.
+        active_transfers = [
+            transfers[seq.seq_id] for seq in seqs
+            if seq.seq_id in transfers
+            and seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_prompt_tokens
+        ] if transfers else []
         hooks = []
         if active_transfers:
             for layer_id, layer in enumerate(self.model.model.layers):

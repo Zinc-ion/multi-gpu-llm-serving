@@ -705,8 +705,8 @@ class PDWorker:
                                                                  and not pipeline_frame_bytes):
             raise ValueError("Mooncake TCP requires an enabled layer pipeline")
         if pipeline_frame_bytes and role == "prefill":
-            if not config.get("enforce_eager", False) or config.get("enable_chunked_prefill", False):
-                raise ValueError("Pipeline requires TP1 whole eager prefill")
+            if not config.get("enforce_eager", False):
+                raise ValueError("Pipeline requires TP1 eager prefill")
         self.role = role
         self.config = {**config, "_pd_tp_bulk": True} if world_size == 2 else config
         self.max_connections = max_connections

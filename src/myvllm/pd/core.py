@@ -216,8 +216,8 @@ class PrefillCore(_Core):
     def prepare(self, session_id, request_id, prompt_token_ids, params, deadline=None):
         if self.engine.config["world_size"] != 1:
             raise ValueError("Early transfer requires TP1 prefill")
-        if self.scheduler.enable_chunked_prefill or not self.engine.config.get("enforce_eager", False):
-            raise ValueError("Early transfer requires whole eager prefill")
+        if not self.engine.config.get("enforce_eager", False):
+            raise ValueError("Early transfer requires eager prefill")
         return self._open_request(session_id, request_id, prompt_token_ids, params, deadline, early=True)
 
     def _open_request(self, session_id, request_id, prompt_token_ids, params, deadline, early):

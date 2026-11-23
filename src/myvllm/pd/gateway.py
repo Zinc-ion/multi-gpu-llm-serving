@@ -101,7 +101,7 @@ def _validate_load_edge(pi, di, pipeline_min_tokens):
     if pipeline_min_tokens and (
             not pi["pipeline_frame_bytes"] or
             pi["pipeline_frame_bytes"] > di["pipeline_frame_bytes"] or
-            not pi["enforce_eager"] or pi["enable_chunked_prefill"]):
+            not pi["enforce_eager"]):
         raise ValueError("Pipeline requires enabled workers with a compatible frame limit on allowed edge")
 
 

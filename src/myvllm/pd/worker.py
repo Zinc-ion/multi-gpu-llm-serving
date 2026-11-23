@@ -20,7 +20,7 @@ from myvllm.pd import CapacityError, DecodeCore, PrefillCore
 from myvllm.pd import mooncake_tcp
 from myvllm.pd.pipeline import LayerSender, PipelineTimingError
 from myvllm.pd.protocol import descriptor_components, finite_number, token_byte_counts
-from myvllm.pd.rpc_timing import TRACE_OPS, record_rpc
+from myvllm.pd.rpc_timing import TRACE_OPS, record_prefill_step, record_rpc
 from myvllm.pd.wire import DEFAULT_HEADER_LIMIT, ProtocolError, close_writer, read_body, read_header, write_frame
 from myvllm.sampling_parameters import SamplingParams
 from myvllm.utils.timing import write_record
@@ -108,6 +108,7 @@ class _Owner:
         self.decode_sessions = {}
         self.core = None
         self.engine = None
+        self.trace_prefill = bool(TRACE_OPS) and worker.role == "prefill"
         self.decode_step_samples = deque(maxlen=32)
 
     def submit(self, ctx, op, fields=None, payload=b""):
@@ -524,6 +525,8 @@ class _Owner:
             self.worker.loop.call_soon_threadsafe(ctx.writer.close)
 
     def _step(self):
+        if self.trace_prefill:
+            step_start_ns = time.monotonic_ns()
         started = time.perf_counter()
         events = self.core.step()
         finished = time.perf_counter()
@@ -548,6 +551,10 @@ class _Owner:
             else:
                 assert len(ctx.events) < ctx.event_limit
                 ctx.events.append(item)
+        if self.trace_prefill and self.engine._trace_prefill_batch:
+            batch = self.engine._trace_prefill_batch
+            record_prefill_step(step_start_ns, time.monotonic_ns(), batch)
+            batch.clear()
         return bool(events)
 
     def run(self):
@@ -555,6 +562,8 @@ class _Owner:
         timing_response = None
         try:
             self.engine = self.engine_factory(self.worker.config)
+            if self.trace_prefill:
+                self.engine._trace_prefill_batch = []
             core_type = PrefillCore if self.worker.role == "prefill" else DecodeCore
             self.core = core_type(self.engine, self.worker.max_connections,
                                   self.worker.max_transfer_bytes, self.worker.max_payload_bytes)

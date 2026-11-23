@@ -231,6 +231,11 @@ class LLMEngine:
         if not scheduled_sequences:
             return [], num_processed_tokens, is_prefill
         token_count = sum(seq.num_scheduled_tokens for seq in scheduled_sequences)
+        trace_batch = getattr(self, "_trace_prefill_batch", None)
+        if trace_batch is not None and is_prefill:
+            trace_batch.extend({"request_id": self.request_ids[seq.seq_id],
+                                "tokens": seq.num_scheduled_tokens}
+                               for seq in scheduled_sequences)
         sampled_sequences = [
             seq for seq in scheduled_sequences
             if seq.num_cached_tokens + seq.num_scheduled_tokens == len(seq)

@@ -67,7 +67,7 @@ def _send(sock, header, body=b""):
 
 
 class _Staging:
-    def __init__(self, cache, frame_bytes, identity, timing_path, scales=None):
+    def __init__(self, cache, frame_bytes, identity, timing_path, scales=None, *, slots=2):
         self.cache = cache
         self.scales = scales
         self.frame_bytes = frame_bytes
@@ -82,7 +82,7 @@ class _Staging:
         if type(frame_bytes) is not int or frame_bytes < self.token_bytes:
             raise ValueError("Pipeline frame must hold at least one K/V token")
         self.slots = [torch.empty(frame_bytes, dtype=torch.uint8, device="cpu",
-                                  pin_memory=self.cuda) for _ in range(2)]
+                                  pin_memory=self.cuda) for _ in range(slots)]
         self.stream = torch.cuda.Stream(device=self.device) if self.cuda else None
         self.origin = None
         if self.cuda:
@@ -126,11 +126,12 @@ class _Staging:
 
 
 class LayerSender(_Staging):
-    """The model owner produces; this request's socket thread drains two slots."""
+    """The model owner stages regions; the socket thread validates ordered ACKs."""
 
     def __init__(self, cache, sequence, endpoint, frame_bytes, identity, deadline, timing_path=None, scales=None,
-                 *, mooncake_binding=None):
-        super().__init__(cache, frame_bytes, identity, timing_path, scales)
+                 *, mooncake_binding=None, window=1):
+        super().__init__(cache, frame_bytes, identity, timing_path, scales, slots=2 * window)
+        self.window = window
         self.sequence = sequence
         self.endpoint = endpoint
         self.deadline = deadline
@@ -138,7 +139,7 @@ class LayerSender(_Staging):
         self.done = Future()
         self.error = None
         self.condition = threading.Condition()
-        self.free = deque(range(2))
+        self.free = deque(range(len(self.slots)))
         self.pending = deque()
         self.socket = None
         self.slot_wait_ns = 0
@@ -198,7 +199,7 @@ class LayerSender(_Staging):
                 else:
                     timed_out = False
                     index = self.free.popleft()
-                    self.peak_slots = max(self.peak_slots, 2 - len(self.free))
+                    self.peak_slots = max(self.peak_slots, len(self.slots) - len(self.free))
             if timed_out:
                 self.abort(TimeoutError("Pipeline slot deadline expired"))
                 return
@@ -259,6 +260,8 @@ class LayerSender(_Staging):
                              **self.stats())
                 binding = {"op": "pipeline", "session_id": self.identity["session_id"],
                            "transaction_id": self.identity["transaction_id"], "frame_bytes": self.frame_bytes}
+                if self.window > 1:
+                    binding["window"] = self.window
                 if self.mooncake is not None:
                     binding["backend"] = "mooncake_tcp"
                 started = time.perf_counter()
@@ -278,6 +281,8 @@ class LayerSender(_Staging):
                     if self.error is not None:
                         return
                     self.ready.set_result((True, b""))
+                outstanding = []
+                windows = 0
                 while True:
                     with self.condition:
                         while not self.pending and self.error is None:
@@ -301,9 +306,12 @@ class LayerSender(_Staging):
                     sent = time.perf_counter()
                     self._record("pd_region_send_start", layer=layer, start=start, end=end,
                                  payload_bytes=size, **self.byte_counts(size))
-                    if self.frames == 0:
+                    if self.frames == 0 and not outstanding:
                         setup["first_send_ns"] = time.monotonic_ns()
                     region = {"op": "region", "layer": layer, "start": start, "end": end}
+                    last = layer + 1 == self.cache.shape[1] and end == self.sequence.num_prompt_tokens
+                    if self.window > 1:
+                        region["last"] = last
                     if self.mooncake is None:
                         self.partial_send_unknown = True
                         _send(sock, region, memoryview(self.slots[index].numpy())[:size])
@@ -320,27 +328,34 @@ class LayerSender(_Staging):
                         self._record("pd_mooncake_write_done", layer=layer, start=start, end=end, payload_bytes=size)
                         # The TCP v2 completion confirms D's host memory has been written.
                         _send(sock, {**region, "payload_bytes": size})
-                    value = _response(sock)
-                    last = layer + 1 == self.cache.shape[1] and end == self.sequence.num_prompt_tokens
-                    if value != {"copies_done": last, "payload_bytes": size}:
-                        raise ProtocolError("Invalid region completion ACK")
-                    self.frames += 1
-                    self.payload_bytes += size
-                    self._record("pd_region_sent", layer=layer, start=start, end=end,
-                                 payload_bytes=size, socket_ms=(time.perf_counter() - sent) * 1000,
-                                 **self.byte_counts(size))
-                    with self.condition:
-                        self.free.append(index)
-                        self.condition.notify_all()
-                        if last:
-                            if self.error is None:
-                                if self.mooncake is not None:
-                                    setup["native_completed_frames"] = self.frames
-                                setup.update(last_ack_ns=time.monotonic_ns(), slot_wait_ns=self.slot_wait_ns)
-                                self.done.set_result(({"payload_bytes": self.payload_bytes,
-                                                       "frames": self.frames, "setup": setup,
-                                                       **self.byte_counts(self.payload_bytes)}, b""))
-                            return
+                    outstanding.append((index, layer, start, end, size, sent, last))
+                    if len(outstanding) < self.window and not last:
+                        continue
+                    windows += 1
+                    for index, layer, start, end, size, sent, last in outstanding:
+                        value = _response(sock)
+                        if value != {"copies_done": last, "payload_bytes": size}:
+                            raise ProtocolError("Invalid region completion ACK")
+                        self.frames += 1
+                        self.payload_bytes += size
+                        self._record("pd_region_sent", layer=layer, start=start, end=end,
+                                     payload_bytes=size, socket_ms=(time.perf_counter() - sent) * 1000,
+                                     **self.byte_counts(size))
+                        with self.condition:
+                            self.free.append(index)
+                            self.condition.notify_all()
+                            if last:
+                                if self.error is None:
+                                    if self.mooncake is not None:
+                                        setup["native_completed_frames"] = self.frames
+                                    if self.window > 1:
+                                        setup.update(window=self.window, ack_groups=windows)
+                                    setup.update(last_ack_ns=time.monotonic_ns(), slot_wait_ns=self.slot_wait_ns)
+                                    self.done.set_result(({"payload_bytes": self.payload_bytes,
+                                                           "frames": self.frames, "setup": setup,
+                                                           **self.byte_counts(self.payload_bytes)}, b""))
+                                return
+                    outstanding.clear()
         except Exception as exc:
             self.abort(exc)
         finally:
@@ -366,7 +381,7 @@ class LayerSender(_Staging):
 
     def stats(self):
         with self.condition:
-            return {**super().stats(), "busy_slots": 2 - len(self.free) if self.slots else 0,
+            return {**super().stats(), "busy_slots": len(self.slots) - len(self.free) if self.slots else 0,
                     "peak_slots": self.peak_slots, "socket_submitted_bytes": self.sent_bytes,
                     "registered_bytes": 2 * self.frame_bytes if self.mooncake is not None else 0,
                     "registered_buffers": 2 if self.mooncake is not None else 0,

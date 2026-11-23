@@ -13,9 +13,10 @@ from test_pd_model_cpu import model_engine
 from myvllm.engine.sequence import Sequence
 
 
+@pytest.mark.parametrize("window", [1, 4])
 @pytest.mark.parametrize("release", [None, "early", "last"])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_actual_runner_layer_hooks_preserve_kv_logits_and_default_path(cpu_model_backend, dtype, release):
+def test_actual_runner_layer_hooks_preserve_kv_logits_and_default_path(cpu_model_backend, dtype, release, window):
     torch.manual_seed(20261115)
     previous = torch.get_default_dtype()
     try:
@@ -54,7 +55,7 @@ def test_actual_runner_layer_hooks_preserve_kv_logits_and_default_path(cpu_model
             reference.step()
 
     async def run():
-        config = {"world_size": 1, "enforce_eager": True}
+        config = {"world_size": 1, "enforce_eager": True, "pipeline_window": window}
         if release:
             config["pipeline_chunk_tokens"] = 3
         settings = {"max_connections": 4, "max_transfer_bytes": 1_000_000,
@@ -76,7 +77,10 @@ def test_actual_runner_layer_hooks_preserve_kv_logits_and_default_path(cpu_model
             expected = {"payload_bytes": 320, "frames": 6} if dtype == "float32" else {
                 "payload_bytes": 160, "frames": 4}
             copied = await p.wait_pipeline()
-            assert copied.pop("setup")["data_backend"] == "socket"
+            setup = copied.pop("setup")
+            assert setup["data_backend"] == "socket"
+            if window == 4:
+                assert setup["ack_groups"] == (expected["frames"] + 3) // 4
             assert copied == expected
             metadata = await p.describe()
             await d.commit_early(metadata)

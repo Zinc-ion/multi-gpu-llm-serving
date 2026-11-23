@@ -401,7 +401,7 @@ class _Owner:
                 ctx.sender = LayerSender(self.engine.model_runner.kv_cache, handle.sequence,
                                          ctx.decode_endpoint, self.worker.pipeline_frame_bytes,
                                          identity, handle.deadline, self.worker.config.get("timing_path"), scales,
-                                         mooncake_binding=self.worker.mooncake_binding)
+                                         mooncake_binding=self.worker.mooncake_binding, window=self.worker.pipeline_window)
                 result = ctx.sender
             elif op == "start" and self.worker.role == "prefill":
                 if ctx.sender is None or not ctx.sender.ready.done() or ctx.sender.ready.exception() is not None:
@@ -432,6 +432,14 @@ class _Owner:
                 self.core.restore_region(handle, fields["layer"], fields["start"], fields["end"], payload)
                 result = {"copies_done": handle._next_layer == self.core.spec["architecture"]["num_layers"],
                           "payload_bytes": len(payload)}
+            elif op == "restore_window" and self.worker.role == "decode":
+                result = []
+                for header, body in payload:
+                    self.core.restore_region(handle, header["layer"], header["start"], header["end"], body)
+                    done = handle._next_layer == self.core.spec["architecture"]["num_layers"]
+                    if done != header["last"]:
+                        raise ValueError("Windowed region final marker disagrees with restore progress")
+                    result.append({"copies_done": done, "payload_bytes": len(body)})
             elif op == "commit_early" and self.worker.role == "decode":
                 result = self.core.commit_early(handle, fields["metadata"])
             elif op == "export" and self.worker.role == "prefill":
@@ -704,6 +712,11 @@ class PDWorker:
         if pipeline_backend not in ("socket", "mooncake_tcp") or (pipeline_backend == "mooncake_tcp"
                                                                  and not pipeline_frame_bytes):
             raise ValueError("Mooncake TCP requires an enabled layer pipeline")
+        self.pipeline_window = config.get("pipeline_window", 1)
+        if type(self.pipeline_window) is not int or self.pipeline_window not in (1, 4):
+            raise ValueError("pipeline_window must be 1 or 4")
+        if self.pipeline_window == 4 and (pipeline_backend != "socket" or not pipeline_frame_bytes):
+            raise ValueError("Windowed transfer requires an enabled socket pipeline")
         if "pipeline_chunk_tokens" in config:
             width = config["pipeline_chunk_tokens"]
             if type(width) is not int or width <= 0 or not pipeline_frame_bytes:
@@ -817,6 +830,10 @@ class PDWorker:
         binding_fields = {"op", "session_id", "transaction_id", "frame_bytes"}
         region_fields = {"op", "layer", "start", "end"}
         mooncake = self.mooncake_binding is not None
+        if self.pipeline_window > 1:
+            binding_fields.add("window")
+            if type(header.get("window")) is not int or header["window"] != self.pipeline_window:
+                raise ProtocolError("Incompatible pipeline window")
         if mooncake:
             binding_fields.add("backend")
             region_fields.add("payload_bytes")
@@ -831,6 +848,11 @@ class PDWorker:
         writer.transport.set_write_buffer_limits(high=frame_bytes, low=0)
         async with asyncio.timeout_at(target.deadline):
             await write_frame(writer, {"ok": True, "value": destination})
+            if self.pipeline_window > 1:
+                await self._receive_windows(reader, writer, target, frame_bytes)
+                ctx.data_target = None
+                target.data_writer = None
+                return
             while True:
                 region, length = await read_header(reader, self.max_header_bytes, 0 if mooncake else frame_bytes)
                 if set(region) != region_fields or region["op"] != "region":
@@ -851,6 +873,25 @@ class PDWorker:
                     ctx.data_target = None
                     target.data_writer = None
                     return
+
+    async def _receive_windows(self, reader, writer, target, frame_bytes):
+        while True:
+            regions = []
+            for _ in range(self.pipeline_window):
+                header, length = await read_header(reader, self.max_header_bytes, frame_bytes)
+                if (set(header) != {"op", "layer", "start", "end", "last"}
+                        or header["op"] != "region" or type(header["last"]) is not bool):
+                    raise ProtocolError("Invalid windowed region header")
+                regions.append((header, await read_body(reader, length)))
+                if header["last"]:
+                    break
+            # One owner command keeps decode steps outside this group of restores.
+            future = self.owner.submit(target, "restore_window", payload=regions)
+            replies, _ = await self._await_owner(reader, future)
+            for reply in replies:
+                await write_frame(writer, {"ok": True, "value": reply})
+            if replies[-1]["copies_done"]:
+                return
 
     def _defer_timing_failure(self, ctx, response_done, failed):
         async def finish():
